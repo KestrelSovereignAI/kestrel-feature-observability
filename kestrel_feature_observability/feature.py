@@ -4,6 +4,9 @@ Kestrel Observability Feature - Always-on lifecycle event observability.
 Auto-discovers via the feature system, registers the ObservabilityHook
 to log all lifecycle events to ObservabilityStore, and exposes tool
 commands for querying observability data at runtime.
+
+@tool methods return ``kestrel_sdk.tools.result.ToolResult`` per the
+kestrel-sovereign #1042 narration-honesty contract (v0.2.0).
 """
 
 import logging
@@ -13,6 +16,7 @@ from kestrel_sdk.features.base import Feature, tool
 from kestrel_feature_observability.hook import ObservabilityHook
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -57,41 +61,64 @@ class ObservabilityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!obs",
     )
-    async def obs_status(self) -> Dict[str, Any]:
+    async def obs_status(self) -> ToolResult:
         """Show observability summary: event counts by type, recent errors."""
         store = getattr(self.agent, "observability_store", None)
         if not store:
-            return {"error": "ObservabilityStore not available"}
+            return ToolResult.failed(
+                "ObservabilityStore not available",
+                data={"reason": "agent has no observability_store attribute"},
+            )
 
         from datetime import datetime, timedelta, timezone
 
         since = datetime.now(timezone.utc) - timedelta(hours=1)
-        events = await store.query_events(event_type="metric", since=since, limit=1000)
-
-        # Count by hook event type
+        # Cover BOTH the queries AND the serialization loops in the
+        # same try/except — schema drift on event records (missing
+        # .metadata, etc.) would otherwise raise out of the loops
+        # and escape the @tool envelope.
         counts: Dict[str, int] = {}
-        for e in events:
-            hook_event = e.metadata.get("hook_event", "unknown") if e.metadata else "unknown"
-            metric_name = e.metadata.get("metric_name", "") if e.metadata else ""
-            if metric_name.startswith("hook."):
-                counts[hook_event] = counts.get(hook_event, 0) + 1
-
-        # Recent errors
-        error_events = await store.query_events(event_type="error", since=since, limit=10)
         recent_errors: List[Dict[str, Any]] = []
-        for e in error_events:
-            recent_errors.append({
-                "timestamp": str(e.timestamp),
-                "error_message": e.error_message,
-                "metadata": e.metadata,
-            })
+        try:
+            events = await store.query_events(
+                event_type="metric", since=since, limit=1000
+            )
+            error_events = await store.query_events(
+                event_type="error", since=since, limit=10
+            )
+            for e in events:
+                hook_event = (
+                    e.metadata.get("hook_event", "unknown")
+                    if e.metadata else "unknown"
+                )
+                metric_name = (
+                    e.metadata.get("metric_name", "") if e.metadata else ""
+                )
+                if metric_name.startswith("hook."):
+                    counts[hook_event] = counts.get(hook_event, 0) + 1
+            for e in error_events:
+                recent_errors.append({
+                    "timestamp": str(e.timestamp),
+                    "error_message": e.error_message,
+                    "metadata": e.metadata,
+                })
+        except Exception as e:
+            return ToolResult.failed(str(e), data={"window": "last 1 hour"})
 
-        return {
-            "time_window": "last 1 hour",
-            "hook_event_counts": counts,
-            "total_hook_events": sum(counts.values()),
-            "recent_errors": recent_errors,
-        }
+        total_hook_events = sum(counts.values())
+        return ToolResult.ok(
+            confirmation=(
+                f"Observability summary for last 1 hour: "
+                f"{total_hook_events} hook event(s), "
+                f"{len(recent_errors)} recent error(s)"
+            ),
+            data={
+                "time_window": "last 1 hour",
+                "hook_event_counts": counts,
+                "total_hook_events": total_hook_events,
+                "recent_errors": recent_errors,
+            },
+        )
 
     @tool(
         "obs_events",
@@ -99,37 +126,63 @@ class ObservabilityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!obs-events",
     )
-    async def obs_events(self, event_type: str = "", limit: int = 20) -> Dict[str, Any]:
+    async def obs_events(self, event_type: str = "", limit: int = 20) -> ToolResult:
         """Query recent events, optionally filtered by type.
 
         Args:
             event_type: Filter by event type (e.g., 'metric', 'error', 'tool_call')
-            limit: Maximum events to return
+            limit: Maximum events to return (the tail REQUEST — actual
+                   count returned may be lower if fewer events exist).
         """
         store = getattr(self.agent, "observability_store", None)
         if not store:
-            return {"error": "ObservabilityStore not available"}
+            return ToolResult.failed(
+                "ObservabilityStore not available",
+                data={"reason": "agent has no observability_store attribute"},
+            )
 
-        events = await store.query_events(
-            event_type=event_type if event_type else None,
-            limit=limit,
-        )
-
+        # Cover both the query AND the serialization loop — schema
+        # drift on event records would otherwise raise AttributeError
+        # out of the loop and escape the envelope.
         event_dicts: List[Dict[str, Any]] = []
-        for e in events:
-            event_dicts.append({
-                "event_id": e.event_id,
-                "timestamp": str(e.timestamp),
-                "agent_name": e.agent_name,
-                "event_type": e.event_type,
-                "tool_name": e.tool_name,
-                "duration_ms": e.duration_ms,
-                "success": e.success,
-                "error_message": e.error_message,
-                "metadata": e.metadata,
-            })
+        try:
+            events = await store.query_events(
+                event_type=event_type if event_type else None,
+                limit=limit,
+            )
+            for e in events:
+                event_dicts.append({
+                    "event_id": e.event_id,
+                    "timestamp": str(e.timestamp),
+                    "agent_name": e.agent_name,
+                    "event_type": e.event_type,
+                    "tool_name": e.tool_name,
+                    "duration_ms": e.duration_ms,
+                    "success": e.success,
+                    "error_message": e.error_message,
+                    "metadata": e.metadata,
+                })
+        except Exception as e:
+            return ToolResult.failed(
+                str(e),
+                data={"event_type": event_type or None, "limit_requested": limit},
+            )
 
-        return {
-            "events": event_dicts,
-            "count": len(event_dicts),
-        }
+        # Honesty: phrase the confirmation as the REQUEST + the
+        # actual count (#1042 #1042 — never claim "Retrieved N" when
+        # fewer came back).
+        filter_clause = (
+            f" of type '{event_type}'" if event_type else ""
+        )
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved {len(event_dicts)} event(s){filter_clause} "
+                f"(limit requested: {limit})"
+            ),
+            data={
+                "events": event_dicts,
+                "count": len(event_dicts),
+                "limit_requested": limit,
+                "event_type": event_type or None,
+            },
+        )
