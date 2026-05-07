@@ -121,6 +121,42 @@ async def test_obs_events_query_failure_returns_failed():
     assert "backend down" in result.error
 
 
+@pytest.mark.asyncio
+async def test_obs_events_no_store_returns_failed():
+    """Claude review #5 test gap: obs_events no-store guard had no
+    test coverage (only obs_status did)."""
+    feat = ObservabilityFeature(agent=_agent_no_store())
+    result = await feat.obs_events(event_type="metric", limit=10)
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "ObservabilityStore not available" in result.error
+
+
+@pytest.mark.asyncio
+async def test_obs_status_serialization_attribute_error_returns_failed():
+    """Claude review #1: schema drift on event records would
+    AttributeError out of the iteration loop. Pin envelope
+    coverage."""
+    bad_event = SimpleNamespace()  # no metadata attribute at all
+    bad_event.metadata = None  # ensure first access path
+    # Make accessing .metadata raise.
+    class _RaisingEvent:
+        @property
+        def metadata(self):
+            raise AttributeError("schema drift: metadata column gone")
+
+    store = SimpleNamespace(
+        query_events=AsyncMock(side_effect=[[_RaisingEvent()], []]),
+    )
+    feat = ObservabilityFeature(agent=SimpleNamespace(observability_store=store))
+
+    result = await feat.obs_status()
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "schema drift" in result.error
+
+
 # ---------------------------------------------------------------------------
 # WellnessFeature
 # ---------------------------------------------------------------------------
@@ -310,3 +346,151 @@ async def test_wellness_export_query_failure_returns_failed():
     assert isinstance(result, ToolResult)
     assert result.status is ToolResultStatus.ERROR
     assert "disk failed" in result.error
+    # Claude review #3: failure path now includes data= context.
+    assert result.data["agent_id"] == "did:test:agent-1"
+
+
+@pytest.mark.asyncio
+async def test_wellness_export_happy_path_with_rows():
+    """Claude review #6: export happy-path with rows was uncovered
+    — the row index mapping (id, agent_id, score, json, created_at)
+    is exactly the kind of thing that breaks silently on schema
+    drift."""
+    rows = [
+        ("c1", "did:test:agent-1", 0.85,
+         json.dumps({"constitutional_friction": {"friction_rate": 0.1}}),
+         "2026-05-07T12:00:00"),
+        ("c2", "did:test:agent-1", 0.90, json.dumps({}),
+         "2026-05-07T13:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_export()
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["count"] == 2
+    assert result.data["export_format"] == "v1"
+    assert result.data["agent_id"] == "did:test:agent-1"
+    # Verify row[index] mapping is correct:
+    cps = result.data["checkpoints"]
+    assert cps[0]["id"] == "c1"
+    assert cps[0]["agent_id"] == "did:test:agent-1"
+    assert cps[0]["overall_score"] == 0.85
+    assert cps[0]["dimensions"] == {
+        "constitutional_friction": {"friction_rate": 0.1}
+    }
+    assert cps[0]["created_at"] == "2026-05-07T12:00:00"
+
+
+@pytest.mark.asyncio
+async def test_wellness_history_trend_improving():
+    """Claude review #6: trend branches for ≥2 checkpoints had no
+    coverage — improving (latest - previous > 0.05)."""
+    rows = [
+        ("c2", 0.90, json.dumps({}), "2026-05-07T13:00:00"),
+        ("c1", 0.80, json.dumps({}), "2026-05-07T12:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_history(limit=10)
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_wellness_history_trend_declining():
+    """Claude review #6: declining (latest - previous < -0.05)."""
+    rows = [
+        ("c2", 0.80, json.dumps({}), "2026-05-07T13:00:00"),
+        ("c1", 0.90, json.dumps({}), "2026-05-07T12:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_history(limit=10)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["trend"] == "declining"
+
+
+@pytest.mark.asyncio
+async def test_wellness_history_trend_stable():
+    """Claude review #6: stable (latest - previous within ±0.05)."""
+    rows = [
+        ("c2", 0.86, json.dumps({}), "2026-05-07T13:00:00"),
+        ("c1", 0.85, json.dumps({}), "2026-05-07T12:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_history(limit=10)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_wellness_check_all_dimensions_failed_returns_overall_zero():
+    """Claude review #6: when ALL calculators error,
+    _calculate_overall returns 0.0 (total_weight == 0). Pin this
+    behavior so a regression doesn't silently flip to a non-zero
+    value."""
+    db = SimpleNamespace(execute=AsyncMock())
+    feat = _wellness_with_db(db=db)
+    feat._friction.measure.side_effect = RuntimeError("a")
+    feat._context_pressure.measure.side_effect = RuntimeError("b")
+    feat._interaction_depth.measure.side_effect = RuntimeError("c")
+    feat._session_continuity.measure.side_effect = RuntimeError("d")
+    feat._memory_health.measure.side_effect = RuntimeError("e")
+
+    result = await feat.wellness_check()
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["overall_score"] == 0.0
+    assert len(result.data["dimensions_with_errors"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_wellness_check_save_failure_confirmation_does_not_fabricate_id():
+    """Claude review #4: when the checkpoint save fails, the
+    confirmation must NOT include the checkpoint_id (an operator
+    querying history with it would find nothing). Pin this so a
+    regression doesn't put a phantom ID back in."""
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=RuntimeError("disk full"))
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_check()
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    # checkpoint_id is in data (for potential retry) but NOT in the
+    # confirmation, since it represents a record that was never
+    # persisted.
+    cp_id = result.data["checkpoint_id"]
+    assert cp_id  # generated ID is present in data
+    assert cp_id[:8] not in result.confirmation, (
+        "save-failed confirmation must not narrate a checkpoint_id "
+        "that was never written; operators querying history with "
+        "that ID would find nothing"
+    )
+    assert "not saved" in result.confirmation.lower()

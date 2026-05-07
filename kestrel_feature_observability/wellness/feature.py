@@ -240,6 +240,12 @@ class WellnessFeature(Feature):
         # Status downgrade: any per-dim failure OR a checkpoint
         # save failure → PARTIAL. Both work but the LLM must see
         # the partial signal to narrate honestly.
+        #
+        # Don't put the checkpoint_id in the confirmation when the
+        # save failed — an operator querying history with that ID
+        # would find nothing (claude review #4). Mention "not saved"
+        # instead so the LLM can be honest about the missing
+        # persistence.
         if failed_dims or checkpoint_save_error:
             errors_summary = []
             if failed_dims:
@@ -250,10 +256,22 @@ class WellnessFeature(Feature):
                 errors_summary.append(
                     f"checkpoint save failed: {checkpoint_save_error}"
                 )
+
+            if checkpoint_save_error:
+                confirmation_prefix = (
+                    f"Wellness measured (overall {overall:.2f}; "
+                    f"NOT saved to history)"
+                )
+            else:
+                # Save succeeded; per-dim failures only. Include the
+                # checkpoint_id so operators can find this record.
+                confirmation_prefix = (
+                    f"Wellness checkpoint {checkpoint_id[:8]} "
+                    f"(overall {overall:.2f})"
+                )
             return ToolResult.partial(
                 confirmation=(
-                    f"Wellness checkpoint {checkpoint_id[:8]} "
-                    f"(overall {overall:.2f}) — partial: {'; '.join(errors_summary)}"
+                    f"{confirmation_prefix} — partial: {'; '.join(errors_summary)}"
                 ),
                 error="; ".join(errors_summary),
                 data=data,
@@ -287,6 +305,9 @@ class WellnessFeature(Feature):
                 data={"reason": "agent has no storage backend"},
             )
 
+        # Cover both the DB query AND the per-row mapping — schema
+        # drift could cause IndexError on row[N] (claude review #2).
+        checkpoints = []
         try:
             exists = await self._db.table_exists("wellness_checkpoints")
             if not exists:
@@ -305,25 +326,23 @@ class WellnessFeature(Feature):
                 """,
                 (self._agent_id, limit),
             )
+            for row in rows:
+                try:
+                    metrics = json.loads(row[2]) if row[2] else {}
+                except (json.JSONDecodeError, TypeError):
+                    metrics = {}
+                checkpoints.append(
+                    {
+                        "id": row[0],
+                        "overall_score": row[1],
+                        "dimensions": metrics,
+                        "created_at": row[3],
+                    }
+                )
         except Exception as e:
             logger.error(f"Failed to get wellness history: {e}")
             return ToolResult.failed(
                 str(e), data={"limit_requested": limit}
-            )
-
-        checkpoints = []
-        for row in rows:
-            try:
-                metrics = json.loads(row[2]) if row[2] else {}
-            except (json.JSONDecodeError, TypeError):
-                metrics = {}
-            checkpoints.append(
-                {
-                    "id": row[0],
-                    "overall_score": row[1],
-                    "dimensions": metrics,
-                    "created_at": row[3],
-                }
             )
 
         # Trend: stable / improving / declining / no_data
@@ -372,6 +391,10 @@ class WellnessFeature(Feature):
                 data={"reason": "agent has no storage backend"},
             )
 
+        # Cover both the DB query AND the per-row mapping (claude
+        # review #2 + #3 — also adds the missing data= context to
+        # the failure case).
+        checkpoints = []
         try:
             exists = await self._db.table_exists("wellness_checkpoints")
             if not exists:
@@ -397,24 +420,24 @@ class WellnessFeature(Feature):
                 """,
                 (self._agent_id,),
             )
+            for row in rows:
+                try:
+                    metrics = json.loads(row[3]) if row[3] else {}
+                except (json.JSONDecodeError, TypeError):
+                    metrics = {}
+                checkpoints.append(
+                    {
+                        "id": row[0],
+                        "agent_id": row[1],
+                        "overall_score": row[2],
+                        "dimensions": metrics,
+                        "created_at": row[4],
+                    }
+                )
         except Exception as e:
             logger.error(f"Failed to export wellness data: {e}")
-            return ToolResult.failed(str(e))
-
-        checkpoints = []
-        for row in rows:
-            try:
-                metrics = json.loads(row[3]) if row[3] else {}
-            except (json.JSONDecodeError, TypeError):
-                metrics = {}
-            checkpoints.append(
-                {
-                    "id": row[0],
-                    "agent_id": row[1],
-                    "overall_score": row[2],
-                    "dimensions": metrics,
-                    "created_at": row[4],
-                }
+            return ToolResult.failed(
+                str(e), data={"agent_id": self._agent_id}
             )
 
         return ToolResult.ok(

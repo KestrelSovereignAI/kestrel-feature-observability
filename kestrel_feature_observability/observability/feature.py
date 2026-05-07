@@ -70,6 +70,12 @@ class ObservabilityFeature(Feature):
         from datetime import datetime, timedelta, timezone
 
         since = datetime.now(timezone.utc) - timedelta(hours=1)
+        # The serialization loop after the queries can raise on
+        # schema drift (missing attributes on event records). Cover
+        # BOTH the query and the iteration in the same try so any
+        # AttributeError lands in the envelope (claude review #1).
+        counts: Dict[str, int] = {}
+        recent_errors: List[Dict[str, Any]] = []
         try:
             events = await store.query_events(
                 event_type="metric", since=since, limit=1000
@@ -77,23 +83,24 @@ class ObservabilityFeature(Feature):
             error_events = await store.query_events(
                 event_type="error", since=since, limit=10
             )
+            for e in events:
+                hook_event = (
+                    e.metadata.get("hook_event", "unknown")
+                    if e.metadata else "unknown"
+                )
+                metric_name = (
+                    e.metadata.get("metric_name", "") if e.metadata else ""
+                )
+                if metric_name.startswith("hook."):
+                    counts[hook_event] = counts.get(hook_event, 0) + 1
+            for e in error_events:
+                recent_errors.append({
+                    "timestamp": str(e.timestamp),
+                    "error_message": e.error_message,
+                    "metadata": e.metadata,
+                })
         except Exception as e:
             return ToolResult.failed(str(e), data={"window": "last 1 hour"})
-
-        counts: Dict[str, int] = {}
-        for e in events:
-            hook_event = e.metadata.get("hook_event", "unknown") if e.metadata else "unknown"
-            metric_name = e.metadata.get("metric_name", "") if e.metadata else ""
-            if metric_name.startswith("hook."):
-                counts[hook_event] = counts.get(hook_event, 0) + 1
-
-        recent_errors: List[Dict[str, Any]] = []
-        for e in error_events:
-            recent_errors.append({
-                "timestamp": str(e.timestamp),
-                "error_message": e.error_message,
-                "metadata": e.metadata,
-            })
 
         total_hook_events = sum(counts.values())
         return ToolResult.ok(
@@ -131,30 +138,33 @@ class ObservabilityFeature(Feature):
                 data={"reason": "agent has no observability_store attribute"},
             )
 
+        # Cover both the query AND the serialization loop in the
+        # same try — schema drift on event records would otherwise
+        # raise AttributeError out of the loop and escape the
+        # envelope (claude review #1).
+        event_dicts: List[Dict[str, Any]] = []
         try:
             events = await store.query_events(
                 event_type=event_type if event_type else None,
                 limit=limit,
             )
+            for e in events:
+                event_dicts.append({
+                    "event_id": e.event_id,
+                    "timestamp": str(e.timestamp),
+                    "agent_name": e.agent_name,
+                    "event_type": e.event_type,
+                    "tool_name": e.tool_name,
+                    "duration_ms": e.duration_ms,
+                    "success": e.success,
+                    "error_message": e.error_message,
+                    "metadata": e.metadata,
+                })
         except Exception as e:
             return ToolResult.failed(
                 str(e),
                 data={"event_type": event_type or None, "limit_requested": limit},
             )
-
-        event_dicts: List[Dict[str, Any]] = []
-        for e in events:
-            event_dicts.append({
-                "event_id": e.event_id,
-                "timestamp": str(e.timestamp),
-                "agent_name": e.agent_name,
-                "event_type": e.event_type,
-                "tool_name": e.tool_name,
-                "duration_ms": e.duration_ms,
-                "success": e.success,
-                "error_message": e.error_message,
-                "metadata": e.metadata,
-            })
 
         # Honesty: phrase the confirmation as the REQUEST + the
         # actual count, never claim "Retrieved N" when fewer came
