@@ -10,7 +10,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.features.base import Feature, tool
-from kestrel_feature_observability.observability.hook import ObservabilityHook
+from kestrel_feature_observability.hook import ObservabilityHook
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
 
@@ -34,7 +34,7 @@ class ObservabilityFeature(Feature):
         The router is defined in endpoints/observability.py and mounted by
         the server only when ObservabilityFeature is discovered and enabled.
         """
-        from kestrel_feature_observability.endpoints.observability import router
+        from endpoints.observability import router
         return router
 
     async def initialize(self):

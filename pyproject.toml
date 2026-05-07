@@ -1,22 +1,69 @@
 [project]
 name = "kestrel-feature-observability"
 version = "0.1.0"
-description = "Kestrel observability, wellness, metrics"
-requires-python = ">=3.11"
+description = "Lifecycle event observability feature for Kestrel Sovereign — hook-driven logging with shared Prometheus registry"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UncleSaurus" }]
+maintainers = [{ name = "UncleSaurus" }]
+keywords = [
+    "ai",
+    "agents",
+    "kestrel",
+    "observability",
+    "prometheus",
+    "metrics",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: System :: Monitoring",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
-    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
+    "kestrel-sovereign-sdk>=0.3,<1",
 ]
 
+[project.optional-dependencies]
+# Pulls prometheus-client through the SDK's [metrics] extra so the
+# feature shares the framework's CollectorRegistry. Without this
+# extra installed, the feature still logs to the observability
+# store; only the Prometheus side becomes a no-op.
+metrics = [
+    "kestrel-sovereign-sdk[metrics]>=0.3,<1",
+]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+    "kestrel-sovereign-sdk[metrics]>=0.3,<1",
+]
+
+[project.urls]
+Homepage = "https://kestrelsovereign.com"
+Source = "https://github.com/KestrelSovereignAI/kestrel-feature-observability"
+Issues = "https://github.com/KestrelSovereignAI/kestrel-feature-observability/issues"
+
 [project.entry-points."kestrel_sovereign.features"]
-ObservabilityFeature = "kestrel_feature_observability:ObservabilityFeature"
+ObservabilityFeature = "kestrel_feature_observability.feature:ObservabilityFeature"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_observability"]
+
+[tool.hatch.build.targets.sdist]
+include = ["kestrel_feature_observability/**/*", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
