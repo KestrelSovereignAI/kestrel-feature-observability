@@ -133,6 +133,61 @@ async def test_obs_events_no_store_returns_failed():
 
 
 @pytest.mark.asyncio
+async def test_obs_events_serialization_attribute_error_returns_failed():
+    """Codex round-2 finding #2: obs_events also needs the schema-
+    drift coverage. Schema drift on event records would otherwise
+    AttributeError out of the iteration loop and escape the @tool
+    envelope."""
+    class _RaisingEvent:
+        @property
+        def event_id(self):
+            raise AttributeError("schema drift: event_id column gone")
+        timestamp = None
+        agent_name = None
+        event_type = None
+        tool_name = None
+        duration_ms = None
+        success = None
+        error_message = None
+        metadata = None
+
+    store = SimpleNamespace(
+        query_events=AsyncMock(return_value=[_RaisingEvent()]),
+    )
+    feat = ObservabilityFeature(agent=SimpleNamespace(observability_store=store))
+
+    result = await feat.obs_events(event_type="metric", limit=10)
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "schema drift" in result.error
+
+
+@pytest.mark.asyncio
+async def test_wellness_history_non_float_score_returns_insufficient_data():
+    """Codex round-2 finding #1: SQLite/schema drift could return
+    overall_score as a string / Decimal / non-numeric. The trend
+    diff math would TypeError out of the @tool envelope. Now safe-
+    casts via ``float()`` and falls back to insufficient_data on
+    cast failure rather than escaping."""
+    rows = [
+        ("c2", "not-a-number", json.dumps({}), "2026-05-07T13:00:00"),
+        ("c1", "also-not", json.dumps({}), "2026-05-07T12:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_history(limit=10)
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["trend"] == "insufficient_data"
+
+
+@pytest.mark.asyncio
 async def test_obs_status_serialization_attribute_error_returns_failed():
     """Claude review #1: schema drift on event records would
     AttributeError out of the iteration loop. Pin envelope

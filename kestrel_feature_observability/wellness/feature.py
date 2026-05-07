@@ -372,16 +372,26 @@ class WellnessFeature(Feature):
                 str(e), data={"limit_requested": limit}
             )
 
-        # Trend: stable / improving / declining / no_data
+        # Trend: stable / improving / declining / no_data /
+        # insufficient_data. Coerce scores defensively (codex round-2
+        # finding #1): if SQLite or schema drift returns a string /
+        # Decimal / something un-subtractable, the diff would
+        # TypeError out of the @tool envelope. Cast to float and
+        # land any cast failure in ``insufficient_data`` rather than
+        # leaking the exception.
         trend = "stable"
         if len(checkpoints) >= 2:
-            latest = checkpoints[0]["overall_score"] or 0
-            previous = checkpoints[1]["overall_score"] or 0
-            diff = latest - previous
-            if diff > 0.05:
-                trend = "improving"
-            elif diff < -0.05:
-                trend = "declining"
+            try:
+                latest = float(checkpoints[0]["overall_score"] or 0)
+                previous = float(checkpoints[1]["overall_score"] or 0)
+            except (TypeError, ValueError):
+                trend = "insufficient_data"
+            else:
+                diff = latest - previous
+                if diff > 0.05:
+                    trend = "improving"
+                elif diff < -0.05:
+                    trend = "declining"
         elif len(checkpoints) <= 1:
             # 1 sample is insufficient for trend; don't say "stable".
             trend = "insufficient_data"
