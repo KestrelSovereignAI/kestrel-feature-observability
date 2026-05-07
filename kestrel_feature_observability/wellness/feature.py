@@ -17,7 +17,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
@@ -190,8 +190,33 @@ class WellnessFeature(Feature):
             logger.error(f"Memory health calculator error: {e}")
             metrics["memory_health"] = {"health_score": 0.0, "error": str(e)}
 
-        # Compute overall score
-        overall = self._calculate_overall(metrics)
+        # Wrap the post-measurement phase (codex round-1 finding
+        # #3): a calculator that returns a malformed non-dict (e.g.
+        # ``None``, an int, a Pydantic model that doesn't expose
+        # ``.get``) would otherwise raise out of
+        # ``_calculate_overall`` or the failed_dims comprehension
+        # and escape the @tool envelope. Catching here means that
+        # adapter glitch lands in ToolResult.failed, not as a raised
+        # exception.
+        try:
+            overall = self._calculate_overall(metrics)
+            failed_dims = [
+                name for name, data in metrics.items()
+                if isinstance(data, dict) and data.get("error")
+            ]
+        except Exception as e:
+            logger.error(f"Wellness post-calc phase failed: {e}", exc_info=True)
+            return ToolResult.failed(
+                f"Wellness post-calculation failed: {e}",
+                data={
+                    "agent_id": self._agent_id,
+                    "raw_metrics": metrics,
+                    "warning": (
+                        "a calculator returned a malformed result; the "
+                        "raw_metrics field shows what was returned"
+                    ),
+                },
+            )
 
         # Save checkpoint
         checkpoint_id = str(uuid.uuid4())
@@ -219,13 +244,6 @@ class WellnessFeature(Feature):
                 logger.warning(f"Failed to save wellness checkpoint: {e}")
         else:
             checkpoint_save_error = "no database available"
-
-        # Honesty: report which dimensions failed (#1042). A clean
-        # OK confirmation when 2 of 5 calculators errored is a
-        # confident lie.
-        failed_dims = [
-            name for name, data in metrics.items() if data.get("error")
-        ]
         data = {
             "checkpoint_id": checkpoint_id,
             "agent_id": self._agent_id,
@@ -307,7 +325,12 @@ class WellnessFeature(Feature):
 
         # Cover both the DB query AND the per-row mapping — schema
         # drift could cause IndexError on row[N] (claude review #2).
+        # Track json parse failures separately (codex round-1
+        # finding #2): silently swallowing them was partial data
+        # loss masquerading as OK; surface them so the LLM can
+        # downgrade to PARTIAL.
         checkpoints = []
+        parse_failures: List[Dict[str, Any]] = []
         try:
             exists = await self._db.table_exists("wellness_checkpoints")
             if not exists:
@@ -329,8 +352,12 @@ class WellnessFeature(Feature):
             for row in rows:
                 try:
                     metrics = json.loads(row[2]) if row[2] else {}
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as parse_err:
                     metrics = {}
+                    parse_failures.append({
+                        "id": row[0],
+                        "error": str(parse_err),
+                    })
                 checkpoints.append(
                     {
                         "id": row[0],
@@ -359,17 +386,39 @@ class WellnessFeature(Feature):
             # 1 sample is insufficient for trend; don't say "stable".
             trend = "insufficient_data"
 
+        data = {
+            "checkpoints": checkpoints,
+            "count": len(checkpoints),
+            "trend": trend,
+            "limit_requested": limit,
+        }
+
+        # Parse failures = partial data loss. Surface them and
+        # downgrade to PARTIAL so the LLM can warn the user that
+        # some checkpoints had unreadable dimension data (codex
+        # round-1 finding #2).
+        if parse_failures:
+            data["parse_failures"] = parse_failures
+            return ToolResult.partial(
+                confirmation=(
+                    f"Wellness history: {len(checkpoints)} checkpoint(s), "
+                    f"trend={trend}; "
+                    f"{len(parse_failures)} checkpoint(s) had unreadable "
+                    f"dimension JSON (treated as empty)"
+                ),
+                error=(
+                    f"{len(parse_failures)} of {len(checkpoints)} "
+                    f"checkpoints had corrupt metrics_json"
+                ),
+                data=data,
+            )
+
         return ToolResult.ok(
             confirmation=(
                 f"Wellness history: {len(checkpoints)} checkpoint(s), "
                 f"trend={trend} (limit requested: {limit})"
             ),
-            data={
-                "checkpoints": checkpoints,
-                "count": len(checkpoints),
-                "trend": trend,
-                "limit_requested": limit,
-            },
+            data=data,
         )
 
     @tool(
@@ -391,10 +440,13 @@ class WellnessFeature(Feature):
                 data={"reason": "agent has no storage backend"},
             )
 
-        # Cover both the DB query AND the per-row mapping (claude
-        # review #2 + #3 — also adds the missing data= context to
-        # the failure case).
+        # Cover both the DB query AND the per-row mapping. Track
+        # json parse failures separately so an export with corrupt
+        # rows lands in PARTIAL — silently turning corrupt
+        # metrics_json into ``{}`` is partial data loss
+        # masquerading as a clean export (codex round-1 finding #2).
         checkpoints = []
+        parse_failures: List[Dict[str, Any]] = []
         try:
             exists = await self._db.table_exists("wellness_checkpoints")
             if not exists:
@@ -423,8 +475,12 @@ class WellnessFeature(Feature):
             for row in rows:
                 try:
                     metrics = json.loads(row[3]) if row[3] else {}
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as parse_err:
                     metrics = {}
+                    parse_failures.append({
+                        "id": row[0],
+                        "error": str(parse_err),
+                    })
                 checkpoints.append(
                     {
                         "id": row[0],
@@ -440,17 +496,34 @@ class WellnessFeature(Feature):
                 str(e), data={"agent_id": self._agent_id}
             )
 
+        data = {
+            "checkpoints": checkpoints,
+            "count": len(checkpoints),
+            "export_format": "v1",
+            "agent_id": self._agent_id,
+        }
+
+        if parse_failures:
+            data["parse_failures"] = parse_failures
+            return ToolResult.partial(
+                confirmation=(
+                    f"Exported {len(checkpoints)} wellness checkpoint(s) "
+                    f"(format v1); {len(parse_failures)} had unreadable "
+                    f"dimension JSON (treated as empty)"
+                ),
+                error=(
+                    f"{len(parse_failures)} of {len(checkpoints)} "
+                    f"exported checkpoints had corrupt metrics_json"
+                ),
+                data=data,
+            )
+
         return ToolResult.ok(
             confirmation=(
                 f"Exported {len(checkpoints)} wellness checkpoint(s) "
                 f"(format v1)"
             ),
-            data={
-                "checkpoints": checkpoints,
-                "count": len(checkpoints),
-                "export_format": "v1",
-                "agent_id": self._agent_id,
-            },
+            data=data,
         )
 
     def _calculate_overall(self, metrics: Dict[str, Any]) -> float:

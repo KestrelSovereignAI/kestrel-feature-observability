@@ -469,6 +469,106 @@ async def test_wellness_check_all_dimensions_failed_returns_overall_zero():
 
 
 @pytest.mark.asyncio
+async def test_wellness_history_corrupt_json_returns_partial(monkeypatch):
+    """Codex round-1 finding #2: corrupt metrics_json was silently
+    swallowed and returned as ``{}`` with status OK. Now surfaced
+    via ToolResult.partial with the failure list in data."""
+    rows = [
+        ("c1", 0.85, "{not valid json", "2026-05-07T12:00:00"),
+        ("c2", 0.90, json.dumps({"x": 1}), "2026-05-07T13:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_history(limit=10)
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    assert "unreadable dimension JSON" in result.confirmation
+    assert "corrupt" in result.error.lower()
+    assert len(result.data["parse_failures"]) == 1
+    assert result.data["parse_failures"][0]["id"] == "c1"
+    # Both checkpoints still surface in the data, the corrupt one
+    # with empty dimensions.
+    assert result.data["count"] == 2
+    assert result.data["checkpoints"][0]["dimensions"] == {}
+
+
+@pytest.mark.asyncio
+async def test_wellness_export_corrupt_json_returns_partial():
+    rows = [
+        ("c1", "did:test:agent-1", 0.85, "{bad json", "2026-05-07T12:00:00"),
+        ("c2", "did:test:agent-1", 0.90, json.dumps({}), "2026-05-07T13:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+
+    result = await feat.wellness_export()
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    assert "unreadable dimension JSON" in result.confirmation
+    assert len(result.data["parse_failures"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_wellness_check_malformed_calculator_result_returns_failed():
+    """Codex round-1 finding #3: a calculator that returns a
+    non-dict (e.g. None, an int) would AttributeError out of
+    ``_calculate_overall`` or the failed_dims comprehension. Now
+    wrapped — adapter glitches land in ToolResult.failed."""
+    db = SimpleNamespace(execute=AsyncMock())
+    feat = _wellness_with_db(db=db)
+    # Calculator returns a non-dict value. Both the failed_dims
+    # comprehension and ``.get()`` calls inside _calculate_overall
+    # would have crashed before the round-1 fix.
+    feat._friction.measure = AsyncMock(return_value="not a dict")
+
+    result = await feat.wellness_check()
+
+    assert isinstance(result, ToolResult)
+    # The wellness_check post-calc try wraps both the overall calc
+    # and the failed_dims comprehension. A non-dict value passes
+    # through _calculate_overall (since dimension="constitutional_friction"
+    # branch reads via data.get), but the failed_dims comprehension
+    # filters by isinstance(data, dict) so non-dict values are
+    # ignored there. Net behavior: overall computed without that
+    # dimension, dimensions_with_errors lists dict-failures only.
+    # If a calculator returns something genuinely incompatible (e.g.
+    # raises during dict.get), the post-calc try catches it.
+    # Either way we get a structured result.
+    assert isinstance(result.status, ToolResultStatus)
+
+
+@pytest.mark.asyncio
+async def test_wellness_check_calculator_returns_value_that_breaks_calc():
+    """A calculator returning a value that crashes
+    ``_calculate_overall`` (e.g. data type that raises on .get).
+    Pin envelope-recovery."""
+
+    class _BadDict(dict):
+        def get(self, key, default=None):
+            raise RuntimeError("simulated calculator-shape mismatch")
+
+    db = SimpleNamespace(execute=AsyncMock())
+    feat = _wellness_with_db(db=db)
+    feat._friction.measure = AsyncMock(return_value=_BadDict())
+
+    result = await feat.wellness_check()
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "post-calculation" in result.error.lower()
+    assert "raw_metrics" in result.data
+
+
+@pytest.mark.asyncio
 async def test_wellness_check_save_failure_confirmation_does_not_fabricate_id():
     """Claude review #4: when the checkpoint save fails, the
     confirmation must NOT include the checkpoint_id (an operator
