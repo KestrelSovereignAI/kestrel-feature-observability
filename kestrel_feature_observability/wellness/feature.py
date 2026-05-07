@@ -17,10 +17,11 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_feature_observability.wellness.metrics import (
     ContextPressureCalculator,
@@ -121,7 +122,7 @@ class WellnessFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!wellness",
     )
-    async def wellness_check(self) -> Dict[str, Any]:
+    async def wellness_check(self) -> ToolResult:
         """Run all metric calculators, compute overall score, save checkpoint.
 
         Returns wellness metrics as a tool response (telemetry-only).
@@ -130,7 +131,11 @@ class WellnessFeature(Feature):
         It is NOT injected into the system prompt or agent context window.
 
         Returns:
-            Dict with per-dimension metrics, overall score, and checkpoint id
+            ToolResult with per-dimension metrics, overall score, and
+            checkpoint id. ``ToolResult.partial`` if any dimension's
+            calculator failed (the others still ran) so the LLM can't
+            narrate a clean wellness check when some dimensions are
+            unmeasured.
         """
         metrics: Dict[str, Any] = {}
 
@@ -192,6 +197,7 @@ class WellnessFeature(Feature):
         checkpoint_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
+        checkpoint_save_error: Optional[str] = None
         if self._db:
             try:
                 await self._db.execute(
@@ -209,15 +215,57 @@ class WellnessFeature(Feature):
                     ),
                 )
             except Exception as e:
+                checkpoint_save_error = str(e)
                 logger.warning(f"Failed to save wellness checkpoint: {e}")
+        else:
+            checkpoint_save_error = "no database available"
 
-        return {
+        # Honesty: report which dimensions failed (#1042). A clean
+        # OK confirmation when 2 of 5 calculators errored is a
+        # confident lie.
+        failed_dims = [
+            name for name, data in metrics.items() if data.get("error")
+        ]
+        data = {
             "checkpoint_id": checkpoint_id,
             "agent_id": self._agent_id,
             "overall_score": overall,
             "dimensions": metrics,
             "created_at": now,
+            "dimensions_with_errors": failed_dims,
         }
+        if checkpoint_save_error:
+            data["checkpoint_save_error"] = checkpoint_save_error
+
+        # Status downgrade: any per-dim failure OR a checkpoint
+        # save failure → PARTIAL. Both work but the LLM must see
+        # the partial signal to narrate honestly.
+        if failed_dims or checkpoint_save_error:
+            errors_summary = []
+            if failed_dims:
+                errors_summary.append(
+                    f"{len(failed_dims)} dimension(s) failed: {', '.join(failed_dims)}"
+                )
+            if checkpoint_save_error:
+                errors_summary.append(
+                    f"checkpoint save failed: {checkpoint_save_error}"
+                )
+            return ToolResult.partial(
+                confirmation=(
+                    f"Wellness checkpoint {checkpoint_id[:8]} "
+                    f"(overall {overall:.2f}) — partial: {'; '.join(errors_summary)}"
+                ),
+                error="; ".join(errors_summary),
+                data=data,
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Wellness checkpoint {checkpoint_id[:8]} saved "
+                f"(overall {overall:.2f})"
+            ),
+            data=data,
+        )
 
     @tool(
         "wellness_history",
@@ -225,27 +273,27 @@ class WellnessFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!wellness-history",
     )
-    async def wellness_history(self, limit: int = 10) -> Dict[str, Any]:
+    async def wellness_history(self, limit: int = 10) -> ToolResult:
         """Query wellness checkpoints ordered by created_at DESC.
 
         Returns wellness history as a tool response (telemetry-only).
 
         COUNCIL CONDITION: This data is returned to the tool caller only.
         It is NOT injected into the system prompt or agent context window.
-
-        Args:
-            limit: Maximum number of checkpoints to return (default: 10)
-
-        Returns:
-            Dict with list of historical checkpoints and trend info
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed(
+                "Database not available",
+                data={"reason": "agent has no storage backend"},
+            )
 
         try:
             exists = await self._db.table_exists("wellness_checkpoints")
             if not exists:
-                return {"checkpoints": [], "count": 0}
+                return ToolResult.ok(
+                    confirmation="No wellness checkpoints recorded yet",
+                    data={"checkpoints": [], "count": 0, "trend": "no_data"},
+                )
 
             rows = await self._db.fetchall(
                 """
@@ -257,68 +305,88 @@ class WellnessFeature(Feature):
                 """,
                 (self._agent_id, limit),
             )
+        except Exception as e:
+            logger.error(f"Failed to get wellness history: {e}")
+            return ToolResult.failed(
+                str(e), data={"limit_requested": limit}
+            )
 
-            checkpoints = []
-            for row in rows:
-                try:
-                    metrics = json.loads(row[2]) if row[2] else {}
-                except (json.JSONDecodeError, TypeError):
-                    metrics = {}
+        checkpoints = []
+        for row in rows:
+            try:
+                metrics = json.loads(row[2]) if row[2] else {}
+            except (json.JSONDecodeError, TypeError):
+                metrics = {}
+            checkpoints.append(
+                {
+                    "id": row[0],
+                    "overall_score": row[1],
+                    "dimensions": metrics,
+                    "created_at": row[3],
+                }
+            )
 
-                checkpoints.append(
-                    {
-                        "id": row[0],
-                        "overall_score": row[1],
-                        "dimensions": metrics,
-                        "created_at": row[3],
-                    }
-                )
+        # Trend: stable / improving / declining / no_data
+        trend = "stable"
+        if len(checkpoints) >= 2:
+            latest = checkpoints[0]["overall_score"] or 0
+            previous = checkpoints[1]["overall_score"] or 0
+            diff = latest - previous
+            if diff > 0.05:
+                trend = "improving"
+            elif diff < -0.05:
+                trend = "declining"
+        elif len(checkpoints) <= 1:
+            # 1 sample is insufficient for trend; don't say "stable".
+            trend = "insufficient_data"
 
-            # Compute simple trend if we have multiple checkpoints
-            trend = "stable"
-            if len(checkpoints) >= 2:
-                latest = checkpoints[0]["overall_score"] or 0
-                previous = checkpoints[1]["overall_score"] or 0
-                diff = latest - previous
-                if diff > 0.05:
-                    trend = "improving"
-                elif diff < -0.05:
-                    trend = "declining"
-
-            return {
+        return ToolResult.ok(
+            confirmation=(
+                f"Wellness history: {len(checkpoints)} checkpoint(s), "
+                f"trend={trend} (limit requested: {limit})"
+            ),
+            data={
                 "checkpoints": checkpoints,
                 "count": len(checkpoints),
                 "trend": trend,
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to get wellness history: {e}")
-            return {"success": False, "error": str(e)}
+                "limit_requested": limit,
+            },
+        )
 
     @tool(
         "wellness_export",
         "Export wellness data for sovereignty packages",
         category=ToolCategory.SYSTEM,
     )
-    async def wellness_export(self) -> Dict[str, Any]:
+    async def wellness_export(self) -> ToolResult:
         """Return all wellness checkpoints for sovereignty export.
 
         Returns wellness export as a tool response (telemetry-only).
 
         COUNCIL CONDITION: This data is returned to the tool caller only.
         It is NOT injected into the system prompt or agent context window.
-
-        Returns:
-            Dict with all checkpoints and metadata for inclusion in
-            sovereignty data exports.
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed(
+                "Database not available",
+                data={"reason": "agent has no storage backend"},
+            )
 
         try:
             exists = await self._db.table_exists("wellness_checkpoints")
             if not exists:
-                return {"checkpoints": [], "count": 0, "export_format": "v1"}
+                return ToolResult.ok(
+                    confirmation=(
+                        "No wellness checkpoints to export "
+                        "(table does not exist yet)"
+                    ),
+                    data={
+                        "checkpoints": [],
+                        "count": 0,
+                        "export_format": "v1",
+                        "agent_id": self._agent_id,
+                    },
+                )
 
             rows = await self._db.fetchall(
                 """
@@ -329,34 +397,38 @@ class WellnessFeature(Feature):
                 """,
                 (self._agent_id,),
             )
+        except Exception as e:
+            logger.error(f"Failed to export wellness data: {e}")
+            return ToolResult.failed(str(e))
 
-            checkpoints = []
-            for row in rows:
-                try:
-                    metrics = json.loads(row[3]) if row[3] else {}
-                except (json.JSONDecodeError, TypeError):
-                    metrics = {}
+        checkpoints = []
+        for row in rows:
+            try:
+                metrics = json.loads(row[3]) if row[3] else {}
+            except (json.JSONDecodeError, TypeError):
+                metrics = {}
+            checkpoints.append(
+                {
+                    "id": row[0],
+                    "agent_id": row[1],
+                    "overall_score": row[2],
+                    "dimensions": metrics,
+                    "created_at": row[4],
+                }
+            )
 
-                checkpoints.append(
-                    {
-                        "id": row[0],
-                        "agent_id": row[1],
-                        "overall_score": row[2],
-                        "dimensions": metrics,
-                        "created_at": row[4],
-                    }
-                )
-
-            return {
+        return ToolResult.ok(
+            confirmation=(
+                f"Exported {len(checkpoints)} wellness checkpoint(s) "
+                f"(format v1)"
+            ),
+            data={
                 "checkpoints": checkpoints,
                 "count": len(checkpoints),
                 "export_format": "v1",
                 "agent_id": self._agent_id,
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to export wellness data: {e}")
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     def _calculate_overall(self, metrics: Dict[str, Any]) -> float:
         """Calculate weighted overall wellness score.
