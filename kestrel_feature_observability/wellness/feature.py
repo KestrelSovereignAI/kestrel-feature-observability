@@ -15,6 +15,7 @@ giving the agent (and its operator) a clear picture of operational health.
 
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -387,11 +388,20 @@ class WellnessFeature(Feature):
             except (TypeError, ValueError):
                 trend = "insufficient_data"
             else:
-                diff = latest - previous
-                if diff > 0.05:
-                    trend = "improving"
-                elif diff < -0.05:
-                    trend = "declining"
+                # ``float("nan")`` doesn't raise but produces a NaN
+                # whose comparisons are all False, so a corrupt
+                # score row would silently surface as ``stable``.
+                # ``float("inf")`` would confidently say improving/
+                # declining from invalid data. Reject both via
+                # ``math.isfinite`` (codex round-3 finding).
+                if not (math.isfinite(latest) and math.isfinite(previous)):
+                    trend = "insufficient_data"
+                else:
+                    diff = latest - previous
+                    if diff > 0.05:
+                        trend = "improving"
+                    elif diff < -0.05:
+                        trend = "declining"
         elif len(checkpoints) <= 1:
             # 1 sample is insufficient for trend; don't say "stable".
             trend = "insufficient_data"

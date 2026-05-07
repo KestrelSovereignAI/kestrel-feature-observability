@@ -164,6 +164,41 @@ async def test_obs_events_serialization_attribute_error_returns_failed():
 
 
 @pytest.mark.asyncio
+async def test_wellness_history_nan_inf_score_returns_insufficient_data():
+    """Codex round-3 finding: ``float("nan")`` doesn't raise — all
+    NaN comparisons are False, so corrupt rows would silently
+    surface as ``stable``. ``float("inf")`` would also confidently
+    say improving/declining from invalid data. Both must fall back
+    to insufficient_data via ``math.isfinite`` check."""
+    rows = [
+        ("c2", float("nan"), json.dumps({}), "2026-05-07T13:00:00"),
+        ("c1", 0.5, json.dumps({}), "2026-05-07T12:00:00"),
+    ]
+    db = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows),
+    )
+    feat = _wellness_with_db(db=db)
+    result = await feat.wellness_history(limit=10)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["trend"] == "insufficient_data"
+
+    # Same for inf.
+    rows2 = [
+        ("c2", float("inf"), json.dumps({}), "2026-05-07T13:00:00"),
+        ("c1", 0.5, json.dumps({}), "2026-05-07T12:00:00"),
+    ]
+    db2 = SimpleNamespace(
+        table_exists=AsyncMock(return_value=True),
+        fetchall=AsyncMock(return_value=rows2),
+    )
+    feat2 = _wellness_with_db(db=db2)
+    result2 = await feat2.wellness_history(limit=10)
+    assert result2.status is ToolResultStatus.OK
+    assert result2.data["trend"] == "insufficient_data"
+
+
+@pytest.mark.asyncio
 async def test_wellness_history_non_float_score_returns_insufficient_data():
     """Codex round-2 finding #1: SQLite/schema drift could return
     overall_score as a string / Decimal / non-numeric. The trend
