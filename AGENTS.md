@@ -10,32 +10,21 @@ kestrel-feature-observability/
 ├── README.md
 ├── kestrel_feature_observability/
 │   ├── __init__.py
-│   ├── metrics.py               # Prometheus metrics definitions
-│   ├── telemetry.py             # OpenTelemetry tracing setup
-│   ├── endpoints/
-│   │   ├── metrics.py           # /metrics HTTP endpoint
-│   │   └── observability.py     # Observability API endpoints
-│   ├── observability/
-│   │   ├── feature.py           # ObservabilityFeature entry point
-│   │   └── hook.py              # Lifecycle event hooks
-│   └── wellness/
-│       ├── feature.py           # WellnessFeature entry point
-│       └── metrics.py           # 5-dimension wellness metrics
+│   ├── feature.py               # ObservabilityFeature entry point
+│   └── hook.py                  # Lifecycle event hooks
 └── tests/
-    ├── test_metrics.py
-    └── test_telemetry.py
+    ├── test_observability_feature.py
+    └── test_tool_result_contracts.py
 ```
 
 ## Entry Points
 
-- `kestrel_sovereign.features`: `ObservabilityFeature = "kestrel_feature_observability.observability.feature:ObservabilityFeature"`
-- `kestrel_sovereign.features`: `WellnessFeature = "kestrel_feature_observability.wellness.feature:WellnessFeature"`
+- `kestrel_sovereign.features`: `ObservabilityFeature = "kestrel_feature_observability.feature:ObservabilityFeature"`
 
 ## Key Files to Read First
 
-1. `kestrel_feature_observability/observability/feature.py` — Observability feature and hooks
-2. `kestrel_feature_observability/wellness/feature.py` — Wellness feature and tools
-3. `kestrel_feature_observability/wellness/metrics.py` — 5-dimension health metrics
+1. `kestrel_feature_observability/feature.py` — Observability feature and tools
+2. `kestrel_feature_observability/hook.py` — Lifecycle event hook
 
 ## Running Tests
 
@@ -45,6 +34,6 @@ uv run pytest
 
 ## Agent-Specific Instructions
 
-- Wellness metrics are telemetry-only — they are NOT injected into agent reasoning
 - ObservabilityFeature uses the hook system for event logging
-- Prometheus and OpenTelemetry integrations are optional extras
+- User-message content is not logged; keep the hook observational and non-blocking
+- Prometheus metrics use the SDK's shared registry when the optional metrics extra is installed
