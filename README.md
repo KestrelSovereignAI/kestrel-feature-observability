@@ -30,7 +30,7 @@ The hook is observational — it never blocks, denies, or modifies. User-message
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.3,<1` — base `Feature`, `tool`, `ToolCategory`, `Hook`, and shared `metrics` module
+- `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `tool`, `ToolCategory`, `Hook`, and shared `metrics` module
 - Optional `[metrics]` extra → `kestrel-sovereign-sdk[metrics]` → `prometheus-client`
 
 No runtime dependency on `kestrel-sovereign` itself; the feature accesses `agent.observability_store` via duck typing, so it works against any host that provides one.

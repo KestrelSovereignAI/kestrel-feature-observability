@@ -1,9 +1,9 @@
 [project]
 name = "kestrel-feature-observability"
-version = "0.2.0"
+version = "0.2.1"
 description = "Lifecycle event observability feature for Kestrel Sovereign — hook-driven logging with shared Prometheus registry"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "UncleSaurus" }]
@@ -23,6 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
@@ -30,7 +31,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.4,<1",
+    "kestrel-sovereign-sdk>=0.14.1,<1",
 ]
 
 [project.optional-dependencies]
@@ -39,12 +40,12 @@ dependencies = [
 # extra installed, the feature still logs to the observability
 # store; only the Prometheus side becomes a no-op.
 metrics = [
-    "kestrel-sovereign-sdk[metrics]>=0.4,<1",
+    "kestrel-sovereign-sdk[metrics]>=0.14.1,<1",
 ]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
-    "kestrel-sovereign-sdk[metrics]>=0.4,<1",
+    "kestrel-sovereign-sdk[metrics]>=0.14.1,<1",
 ]
 
 [project.urls]
