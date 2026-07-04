@@ -10,6 +10,7 @@ kestrel-sovereign #1042 narration-honesty contract (v0.2.0).
 """
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.features.base import Feature, tool
@@ -35,11 +36,39 @@ class ObservabilityFeature(Feature):
     def get_router(self):
         """Return the Observability HTTP router for dynamic mounting.
 
-        The router is defined in endpoints/observability.py and mounted by
-        the server only when ObservabilityFeature is discovered and enabled.
+        The router (``GET /api/observability/llm-calls`` + ``/llm-stats``) is
+        built in ``endpoints.py`` and mounted by the server only when
+        ObservabilityFeature is discovered and enabled.
         """
-        from endpoints.observability import router
-        return router
+        from kestrel_feature_observability.endpoints import get_router
+        return get_router()
+
+    def get_ui_contributions(self):
+        """Declare the "LLM Calls" panel this feature contributes to the Console.
+
+        Ships ``static/llm-calls.js`` — an ES module that self-registers a panel
+        through the host's ``ui-ext`` panel registry (``registerPanel``), gated on
+        the ``observability`` capability. Mirrors the Spawn feature: the server
+        mounts this package's ``static/`` dir at ``/features/{slug}/static`` and
+        the boot loader ``import()``s the declared module.
+
+        ``UIContributions`` lives in the host (``kestrel_sovereign``); it is
+        imported lazily and only ever constructed when a host actually calls this
+        hook (the host is guaranteed to have the class then). When the host class
+        is unavailable — e.g. running this package standalone — a structurally
+        identical local descriptor is returned so the shape stays inspectable.
+        """
+        static_dir = str((Path(__file__).parent / "static").resolve())
+        try:
+            from kestrel_sovereign.features.base import UIContributions
+        except Exception:  # noqa: BLE001 - host not present (standalone/tests)
+            from kestrel_feature_observability._ui import UIContributions
+
+        return UIContributions(
+            modules=["llm-calls.js"],
+            static_dir=static_dir,
+            capability="observability",
+        )
 
     async def initialize(self):
         """Create the ObservabilityHook (auto-registered via get_hooks)."""

@@ -46,6 +46,10 @@ test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
     "kestrel-sovereign-sdk[metrics]>=0.14.1,<1",
+    # Router unit tests exercise the FastAPI query endpoints via TestClient.
+    # FastAPI/httpx are host-provided at runtime; pulled here only for tests.
+    "fastapi>=0.110.0",
+    "httpx>=0.27.0",
 ]
 
 [project.urls]
