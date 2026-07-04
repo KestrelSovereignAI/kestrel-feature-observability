@@ -37,6 +37,14 @@ logger = logging.getLogger(__name__)
 # Path prefix matches the downstream Frinz mount so migration is mechanical.
 API_PREFIX = "/api/observability"
 
+# Upper bound on paging offset. Paging over a cursor-less store fetches
+# ``limit + offset`` rows, so an unbounded offset (``?offset=1000000000``) would
+# materialize the whole table; cap the offset to keep the over-fetch bounded.
+MAX_OFFSET = 100_000
+
+# Row cap for the agent-scoped aggregate + percentile fetch in ``get_llm_stats``.
+_STATS_FETCH_LIMIT = 10_000
+
 # Fields projected for each call — the exact set Frinz's pane rendered.
 _CALL_FIELDS = (
     "event_id",
@@ -103,8 +111,11 @@ async def query_llm_calls(
 
     Reads via ``store.query_llm_calls`` (the host observability store). Paging is
     applied here: the store has no native offset, so we over-fetch ``limit +
-    offset`` rows and slice — the natural cost of a cursor-less backend.
+    offset`` rows and slice — the natural cost of a cursor-less backend. Offset is
+    clamped to ``MAX_OFFSET`` so a huge ``?offset=`` can't materialize the whole
+    table.
     """
+    offset = min(max(0, offset), MAX_OFFSET)
     raw = await store.query_llm_calls(
         agent_did=agent_did,
         companion_id=companion_id,
@@ -133,37 +144,66 @@ async def get_llm_stats(
 ) -> Dict[str, Any]:
     """Return aggregate LLM stats plus latency percentiles for the window.
 
-    ``store.get_llm_stats`` supplies the counts / tokens / avg-latency /
-    per-provider / per-model breakdown (the Frinz shape). Percentiles aren't part
-    of that aggregate, so we derive p50/p95/p99 in Python from the window's
-    durations via a bounded ``query_llm_calls`` fetch. A ``success_count`` is
-    surfaced explicitly (the panel renders "N / total") alongside the store's
-    ``success_rate``.
+    Every aggregate (counts / tokens / avg-latency / percentiles / per-provider /
+    per-model breakdown, the Frinz shape) is computed here from an *agent-scoped*
+    ``query_llm_calls(agent_did=...)`` fetch. The store's ``get_llm_stats`` takes
+    only time bounds, so in a multi-agent store it would mix in other agents'
+    rows while the endpoint claims per-agent scoping — computing from the scoped
+    query keeps counts/tokens/success/latency isolated to the requesting agent.
     """
-    stats: Dict[str, Any] = dict(await store.get_llm_stats(since=since))
-
-    total_calls = stats.get("total_calls") or 0
-    success_rate = stats.get("success_rate") or 0
-    stats.setdefault("success_count", round(total_calls * success_rate / 100.0))
-
-    # Latency percentiles from the window's durations (best-effort — never let a
-    # percentile failure sink the whole stats response).
-    durations: List[float] = []
+    calls: List[Any] = []
+    query_error = False
     try:
-        calls = await store.query_llm_calls(
-            agent_did=agent_did, since=since, limit=1000
+        raw = await store.query_llm_calls(
+            agent_did=agent_did, since=since, limit=_STATS_FETCH_LIMIT
         )
-        durations = sorted(
-            float(getattr(c, "duration_ms", 0) or 0) for c in calls
-        )
-    except Exception as exc:  # noqa: BLE001 - percentiles are supplementary
-        logger.debug("llm-stats percentile computation skipped: %s", exc)
+        calls = list(raw)
+    except Exception as exc:  # noqa: BLE001 - stats are supplementary, never fatal
+        query_error = True
+        logger.debug("llm-stats aggregate computation skipped: %s", exc)
 
-    stats["latency_ms"] = {
-        "avg": stats.get("avg_duration_ms", 0),
-        "p50": round(_percentile(durations, 50), 2),
-        "p95": round(_percentile(durations, 95), 2),
-        "p99": round(_percentile(durations, 99), 2),
+    total_calls = len(calls)
+    success_count = sum(1 for c in calls if getattr(c, "success", None))
+    success_rate = round(success_count / total_calls * 100.0, 2) if total_calls else 0.0
+
+    durations = sorted(float(getattr(c, "duration_ms", 0) or 0) for c in calls)
+    avg_duration_ms = round(sum(durations) / total_calls, 2) if total_calls else 0
+
+    calls_by_provider: Dict[str, int] = {}
+    calls_by_model: Dict[str, int] = {}
+    total_input_tokens = 0
+    total_output_tokens = 0
+    for c in calls:
+        provider = getattr(c, "provider", None)
+        model = getattr(c, "model", None)
+        calls_by_provider[provider] = calls_by_provider.get(provider, 0) + 1
+        calls_by_model[model] = calls_by_model.get(model, 0) + 1
+        total_input_tokens += int(getattr(c, "input_tokens", 0) or 0)
+        total_output_tokens += int(getattr(c, "output_tokens", 0) or 0)
+
+    stats: Dict[str, Any] = {
+        "total_calls": total_calls,
+        "success_count": success_count,
+        "success_rate": success_rate,
+        "avg_duration_ms": avg_duration_ms,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "calls_by_provider": calls_by_provider,
+        "calls_by_model": calls_by_model,
+        "latency_ms": {
+            "avg": avg_duration_ms,
+            "p50": round(_percentile(durations, 50), 2),
+            "p95": round(_percentile(durations, 95), 2),
+            "p99": round(_percentile(durations, 99), 2),
+        },
+        # The store has no agent-scoped aggregate, so every total above is
+        # computed from a fetch capped at ``_STATS_FETCH_LIMIT``. When the cap is
+        # hit the counts/tokens are a floor, not an exact total — flag it so the
+        # consumer doesn't present truncated numbers as complete. ``error`` marks
+        # a failed store fetch so an all-zeros body isn't mistaken for an idle
+        # agent.
+        "truncated": total_calls >= _STATS_FETCH_LIMIT,
+        "error": query_error,
     }
 
     if period_hours is not None:
@@ -203,7 +243,7 @@ def get_router():
     async def llm_calls(
         request: Request,
         limit: int = Query(50, ge=1, le=500),
-        offset: int = Query(0, ge=0),
+        offset: int = Query(0, ge=0, le=MAX_OFFSET),
         companion_id: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
@@ -259,6 +299,7 @@ def get_router():
 
 __all__ = [
     "API_PREFIX",
+    "MAX_OFFSET",
     "get_router",
     "query_llm_calls",
     "get_llm_stats",
