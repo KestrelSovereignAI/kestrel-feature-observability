@@ -36,9 +36,12 @@ class ObservabilityFeature(Feature):
     def get_router(self):
         """Return the Observability HTTP router for dynamic mounting.
 
-        The router (``GET /api/observability/llm-calls`` + ``/llm-stats``) is
-        built in ``endpoints.py`` and mounted by the server only when
-        ObservabilityFeature is discovered and enabled.
+        The router is built in ``endpoints.py`` and mounted by the server only
+        when ObservabilityFeature is discovered and enabled. It serves the
+        read-side LLM panel routes (``GET /api/observability/llm-calls`` +
+        ``/llm-stats``) plus the data-plane routes: ``POST /events`` (external
+        ingest for out-of-process agents), ``GET /agent-tree`` (spawn
+        hierarchy), and ``GET /events`` (per-agent or whole-subtree query).
         """
         from kestrel_feature_observability.endpoints import get_router
         return get_router()

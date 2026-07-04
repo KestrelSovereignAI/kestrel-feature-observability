@@ -1,11 +1,21 @@
-"""HTTP query endpoints for the Observability feature — LLM call diagnostics.
+"""HTTP endpoints for the Observability feature — LLM diagnostics + data plane.
 
-Exposes two read-only routes the Console's "LLM Calls" panel consumes:
+Read-side routes the Console's "LLM Calls" panel consumes:
 
 * ``GET /api/observability/llm-calls`` — paged, filterable list of LLM call
   records written to the feature's observability store.
 * ``GET /api/observability/llm-stats`` — aggregate stats (counts, tokens,
   latency avg + percentiles, per-provider / per-model breakdown) over a window.
+
+Data-plane routes (issue #10) that let a swimlane UI reconstruct the fleet:
+
+* ``POST /api/observability/events`` — external ingest. Out-of-process agents
+  (notably kestrel-talon) push a single event or ``{"events":[...]}`` batch into
+  the same store; each ``event_type`` maps to a ``store.log_*`` writer, inbound
+  metadata is redacted, and parent lineage from the body is folded in.
+* ``GET /api/observability/agent-tree`` — the spawn hierarchy (agent → children,
+  recursively) built from ``AgentManager.get_children``.
+* ``GET /api/observability/events`` — per-agent or whole-subtree event query.
 
 The response shapes mirror the proven downstream implementation in
 ``frinz/endpoints/observability.py`` so a host that already built its own
@@ -28,7 +38,9 @@ against the module globals; since FastAPI is imported lazily inside
 would make FastAPI mistake ``request`` for a query parameter (→ 422).
 """
 
+import inspect
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -213,6 +225,359 @@ async def get_llm_stats(
     return stats
 
 
+# ---------------------------------------------------------------------------
+# External ingest (POST /events) — out-of-process agents push here
+# ---------------------------------------------------------------------------
+
+# Keys whose values are scrubbed from inbound metadata before it is persisted.
+# Mirrors the host's redaction intent so telemetry pushed by out-of-process
+# agents (notably kestrel-talon) can't smuggle secrets into the store.
+_SENSITIVE_KEY = re.compile(
+    r"(api[_-]?key|secret|password|passwd|token|authorization|auth|"
+    r"credential|private[_-]?key|cookie|session[_-]?token|bearer)",
+    re.IGNORECASE,
+)
+_REDACTED = "[REDACTED]"
+
+# Top-level POST-body fields that carry parent/lineage, folded into metadata so
+# a swimlane can nest talon/subagent sublanes under their driver.
+_LINEAGE_FIELDS = (
+    "parent_agent",
+    "parent_session_id",
+    "driven_by",
+    "driver",
+    "subagent_id",
+    "child_session_id",
+)
+
+# event_type → the store method that persists it. ``agent_response`` has no
+# ``log_`` prefix on the store, matching the host surface named in issue #10.
+_INGEST_TYPES = {
+    "tool_call": "tool_call",
+    "tool_response": "tool_response",
+    "subagent_call": "tool_call",
+    "subagent_response": "tool_response",
+    "error": "error",
+    "metric": "metric",
+    "agent_response": "agent_response",
+}
+
+
+class IngestError(Exception):
+    """Raised for a malformed ingest event → surfaced as HTTP 422."""
+
+
+def redact_metadata(metadata: Any, redactor: Optional[Any] = None) -> Dict[str, Any]:
+    """Return a copy of ``metadata`` with sensitive values scrubbed.
+
+    Prefers the host store's own ``redact_metadata`` when provided (issue #10:
+    "reuse the host's redaction"); otherwise applies a local key-name scrub
+    recursively over nested dicts/lists.
+    """
+    if redactor is not None:
+        try:
+            result = redactor(metadata)
+            # Only trust a synchronous redactor that returns a mapping/list;
+            # anything else (e.g. a coroutine) falls back to the local scrub.
+            if isinstance(result, (dict, list)):
+                return result
+        except Exception:  # noqa: BLE001 - fall back to local scrub
+            logger.debug("host redactor failed; using local scrub", exc_info=True)
+
+    if isinstance(metadata, dict):
+        out: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            if isinstance(key, str) and _SENSITIVE_KEY.search(key):
+                out[key] = _REDACTED
+            else:
+                out[key] = redact_metadata(value, None)
+        return out
+    if isinstance(metadata, list):
+        return [redact_metadata(v, None) for v in metadata]  # type: ignore[return-value]
+    return metadata
+
+
+def _build_ingest_metadata(event: Dict[str, Any], redactor: Optional[Any]) -> Dict[str, Any]:
+    """Redact inbound metadata and fold in lineage fields from the body."""
+    metadata = redact_metadata(dict(event.get("metadata") or {}), redactor)
+    metadata.setdefault("event_category", event.get("event_type"))
+    for field in _LINEAGE_FIELDS:
+        value = event.get(field)
+        if value is not None and field not in metadata:
+            metadata[field] = value
+    if event.get("session_id") is not None:
+        metadata.setdefault("session_id", event["session_id"])
+    return metadata
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await ``value`` if it is awaitable, else return it as-is."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def ingest_event(
+    store: Any,
+    event: Dict[str, Any],
+    *,
+    redactor: Optional[Any] = None,
+) -> Any:
+    """Persist a single external event via the matching ``store.log_*``.
+
+    Required: ``agent_name`` and ``session_id``. Unknown ``event_type`` →
+    ``IngestError`` (HTTP 422). Returns the created ``event_id`` (or ``None``).
+    """
+    if not isinstance(event, dict):
+        raise IngestError("event must be an object")
+
+    event_type = event.get("event_type")
+    if event_type not in _INGEST_TYPES:
+        raise IngestError(f"unknown event_type: {event_type!r}")
+
+    agent_name = event.get("agent_name")
+    session_id = event.get("session_id")
+    if not agent_name:
+        raise IngestError("agent_name is required")
+    if not session_id:
+        raise IngestError("session_id is required")
+
+    metadata = _build_ingest_metadata(event, redactor)
+    target = _INGEST_TYPES[event_type]
+
+    if target == "tool_call":
+        return await _maybe_await(
+            store.log_tool_call(
+                agent_name=agent_name,
+                session_id=session_id,
+                tool_name=event.get("tool_name"),
+                metadata=metadata,
+            )
+        )
+    if target == "tool_response":
+        # Paired UPDATE when a correlation id is supplied; standalone INSERT
+        # otherwise (a lone response posted by talon) — issue #10 Q2 Option 2.
+        return await _maybe_await(
+            store.log_tool_response(
+                event_id=event.get("event_id") or event.get("tool_use_id"),
+                agent_name=agent_name,
+                session_id=session_id,
+                tool_name=event.get("tool_name"),
+                success=event.get("success", True),
+                duration_ms=event.get("duration_ms"),
+                metadata=metadata,
+            )
+        )
+    if target == "error":
+        return await _maybe_await(
+            store.log_error(
+                agent_name=agent_name,
+                session_id=session_id,
+                error_message=event.get("error_message") or event.get("error") or "",
+                metadata=metadata,
+            )
+        )
+    if target == "metric":
+        return await _maybe_await(
+            store.log_metric(
+                agent_name=agent_name,
+                metric_name=event.get("metric_name") or "external",
+                metric_value=event.get("metric_value", 1),
+                metadata=metadata,
+            )
+        )
+    # agent_response
+    return await _maybe_await(
+        store.agent_response(
+            agent_name=agent_name,
+            session_id=session_id,
+            metadata=metadata,
+        )
+    )
+
+
+async def ingest_events(
+    store: Any,
+    payload: Any,
+    *,
+    redactor: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Ingest a single event or a ``{"events":[...]}`` batch.
+
+    Returns ``{"event_id": ...}`` for a single event, or
+    ``{"event_ids": [...], "count": N}`` for a batch.
+    """
+    if isinstance(payload, dict) and "events" in payload:
+        events = payload.get("events") or []
+        if not isinstance(events, list):
+            raise IngestError("'events' must be a list")
+        event_ids = [await ingest_event(store, e, redactor=redactor) for e in events]
+        return {"event_ids": event_ids, "count": len(event_ids)}
+
+    event_id = await ingest_event(store, payload, redactor=redactor)
+    return {"event_id": event_id}
+
+
+# ---------------------------------------------------------------------------
+# Agent tree / subtree (GET /agent-tree, subtree events query)
+# ---------------------------------------------------------------------------
+
+
+def _agent_name_of(agent_manager: Any, did: str) -> str:
+    """Resolve a DID to a human agent name via the manager, else the DID."""
+    if agent_manager is not None:
+        getter = getattr(agent_manager, "get_agent", None)
+        if callable(getter):
+            try:
+                record = getter(did)
+            except Exception:  # noqa: BLE001
+                record = None
+            if record is not None:
+                name = getattr(record, "agent_name", None) or getattr(record, "name", None)
+                if name:
+                    return name
+    return did
+
+
+async def build_agent_tree(
+    agent_manager: Any,
+    root_did: str,
+    *,
+    _visited: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Build the spawn hierarchy (agent → children, recursively) from a DID.
+
+    Uses ``AgentManager.get_children`` (sync or async). Degrades to a single
+    node with no children when the manager is unavailable. Cycle-safe.
+    """
+    visited = _visited if _visited is not None else set()
+    node: Dict[str, Any] = {
+        "agent_did": root_did,
+        "agent_name": _agent_name_of(agent_manager, root_did),
+        "children": [],
+    }
+    if root_did in visited:
+        return node
+    visited.add(root_did)
+
+    if agent_manager is None or not hasattr(agent_manager, "get_children"):
+        return node
+
+    try:
+        child_dids = await _maybe_await(agent_manager.get_children(root_did)) or []
+    except Exception:  # noqa: BLE001 - degrade to a flat node
+        logger.debug("get_children(%s) failed; flat node", root_did, exc_info=True)
+        return node
+
+    for child_did in child_dids:
+        node["children"].append(
+            await build_agent_tree(agent_manager, child_did, _visited=visited)
+        )
+    return node
+
+
+async def collect_subtree_dids(agent_manager: Any, root_did: str) -> List[str]:
+    """Flatten the spawn subtree rooted at ``root_did`` into a DID list."""
+    ordered: List[str] = []
+    seen: set = set()
+
+    async def _walk(did: str) -> None:
+        if did in seen:
+            return
+        seen.add(did)
+        ordered.append(did)
+        if agent_manager is None or not hasattr(agent_manager, "get_children"):
+            return
+        try:
+            children = await _maybe_await(agent_manager.get_children(did)) or []
+        except Exception:  # noqa: BLE001
+            return
+        for child in children:
+            await _walk(child)
+
+    await _walk(root_did)
+    return ordered
+
+
+def _serialize_event(e: Any) -> Dict[str, Any]:
+    """Project a store event record into the JSON shape the UI consumes."""
+    ts = getattr(e, "timestamp", None)
+    return {
+        "event_id": getattr(e, "event_id", None),
+        "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else (str(ts) if ts is not None else None),
+        "agent_name": getattr(e, "agent_name", None),
+        "agent_did": getattr(e, "agent_did", None),
+        "event_type": getattr(e, "event_type", None),
+        "tool_name": getattr(e, "tool_name", None),
+        "session_id": getattr(e, "session_id", None),
+        "duration_ms": getattr(e, "duration_ms", None),
+        "success": getattr(e, "success", None),
+        "error_message": getattr(e, "error_message", None),
+        "metadata": getattr(e, "metadata", None),
+    }
+
+
+async def query_subtree_events(
+    store: Any,
+    agent_manager: Any,
+    root_did: str,
+    *,
+    root_agent_name: Optional[str] = None,
+    event_type: Optional[str] = None,
+    since: Optional[datetime] = None,
+    limit: int = 200,
+    subtree: bool = True,
+) -> Dict[str, Any]:
+    """Union per-agent ``query_events`` across an agent + its descendants.
+
+    Resolves the spawn subtree to DIDs, maps each to an agent name, and unions
+    a bounded ``query_events`` fetch per agent. When ``subtree`` is False (or no
+    manager is available) it degrades to the single root agent — issue #10 Q3
+    Option 1. Lineage stored in each event's ``metadata`` lets the UI nest.
+    """
+    if subtree and agent_manager is not None:
+        dids = await collect_subtree_dids(agent_manager, root_did)
+        agent_names = [_agent_name_of(agent_manager, d) for d in dids]
+    else:
+        agent_names = [root_agent_name or _agent_name_of(agent_manager, root_did)]
+
+    # De-dup names while preserving order.
+    seen: set = set()
+    unique_names = [n for n in agent_names if not (n in seen or seen.add(n))]
+
+    events: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    for name in unique_names:
+        try:
+            raw = await store.query_events(
+                agent_name=name,
+                event_type=event_type or None,
+                since=since,
+                limit=limit,
+            )
+        except TypeError:
+            # Store's query_events may not accept agent_name/since kwargs.
+            raw = await store.query_events(event_type=event_type or None, limit=limit)
+        except Exception:  # noqa: BLE001 - one agent's failure is non-fatal
+            logger.debug("query_events failed for agent %s", name, exc_info=True)
+            continue
+        for e in raw:
+            serialized = _serialize_event(e)
+            eid = serialized.get("event_id")
+            if eid is not None and eid in seen_ids:
+                continue
+            if eid is not None:
+                seen_ids.add(eid)
+            events.append(serialized)
+
+    return {
+        "events": events,
+        "count": len(events),
+        "agents": unique_names,
+        "subtree": bool(subtree and agent_manager is not None),
+    }
+
+
 def get_router():
     """Build and return the FastAPI router for the observability query endpoints.
 
@@ -238,6 +603,87 @@ def get_router():
         if store is None:
             raise HTTPException(status_code=503, detail="Observability not enabled")
         return store
+
+    def _resolve_agent_manager(request: Request, agent):
+        """Locate the spawn AgentManager (drives the agent-tree hierarchy)."""
+        return (
+            getattr(agent, "agent_manager", None)
+            or getattr(request.state, "agent_manager", None)
+            or getattr(request.app.state, "agent_manager", None)
+        )
+
+    def _redactor(store):
+        """Host store's own metadata redaction, if it exposes one."""
+        return getattr(store, "redact_metadata", None)
+
+    @router.post("/events")
+    async def post_events(request: Request):
+        """Ingest external telemetry (single event or ``{"events":[...]}``).
+
+        Out-of-process agents (e.g. kestrel-talon) push events into the same
+        ``observability_store``. Best-effort/non-blocking; unknown ``event_type``
+        or missing ``agent_name``/``session_id`` → 422.
+        """
+        agent = _resolve_agent(request)
+        store = _store(agent)
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid JSON body")
+        try:
+            return await ingest_events(store, payload, redactor=_redactor(store))
+        except IngestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception:
+            logger.exception("Failed to ingest observability events")
+            raise HTTPException(500, "Failed to ingest events. Please try again.")
+
+    @router.get("/agent-tree")
+    async def agent_tree(request: Request):
+        """Return the spawn hierarchy (agent → children, recursively)."""
+        agent = _resolve_agent(request)
+        manager = _resolve_agent_manager(request, agent)
+        root_did = _agent_did(agent)
+        if root_did is None:
+            raise HTTPException(status_code=503, detail="Agent DID unavailable")
+        try:
+            return await build_agent_tree(manager, root_did)
+        except Exception:
+            logger.exception("Failed to build agent tree")
+            raise HTTPException(500, "Failed to build agent tree. Please try again.")
+
+    @router.get("/events")
+    async def events(
+        request: Request,
+        event_type: Optional[str] = None,
+        subtree: bool = Query(True),
+        limit: int = Query(200, ge=1, le=1000),
+        hours_ago: Optional[int] = Query(None, ge=1, le=168),
+    ):
+        """Query events for the agent, optionally across its whole subtree."""
+        agent = _resolve_agent(request)
+        store = _store(agent)
+        manager = _resolve_agent_manager(request, agent)
+        root_did = _agent_did(agent)
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+            if hours_ago
+            else None
+        )
+        try:
+            return await query_subtree_events(
+                store,
+                manager,
+                root_did,
+                root_agent_name=getattr(agent, "agent_name", None),
+                event_type=event_type,
+                since=since,
+                limit=limit,
+                subtree=subtree,
+            )
+        except Exception:
+            logger.exception("Failed to query subtree events")
+            raise HTTPException(500, "Failed to query events. Please try again.")
 
     @router.get("/llm-calls")
     async def llm_calls(
@@ -303,4 +749,11 @@ __all__ = [
     "get_router",
     "query_llm_calls",
     "get_llm_stats",
+    "IngestError",
+    "redact_metadata",
+    "ingest_event",
+    "ingest_events",
+    "build_agent_tree",
+    "collect_subtree_dids",
+    "query_subtree_events",
 ]
