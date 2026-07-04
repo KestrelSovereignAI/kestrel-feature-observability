@@ -124,7 +124,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-observability"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "kestrel-sovereign-sdk" },
