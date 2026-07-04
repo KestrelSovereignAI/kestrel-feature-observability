@@ -37,7 +37,7 @@ class TestUIContributions:
     def test_returns_contribution(self):
         contrib = _make_feature().get_ui_contributions()
         assert contrib is not None
-        assert contrib.modules == ["llm-calls.js"]
+        assert contrib.modules == ["llm-calls.js", "timeline.js"]
         assert contrib.capability == "observability"
 
     def test_static_dir_exists_and_holds_module(self):
@@ -45,6 +45,7 @@ class TestUIContributions:
         static_dir = Path(contrib.static_dir)
         assert static_dir.is_dir()
         assert (static_dir / "llm-calls.js").is_file()
+        assert (static_dir / "timeline.js").is_file()
 
     def test_module_paths_are_relative(self):
         # No absolute asset paths beyond the /features/{slug}/static mount.
@@ -98,6 +99,7 @@ class TestManifest:
         assert len(entries) == 1
         entry = entries[0]
         assert any(m.endswith("/static/llm-calls.js") for m in entry["modules"])
+        assert any(m.endswith("/static/timeline.js") for m in entry["modules"])
 
     def test_disabled_feature_contributes_nothing(self):
         feature = _make_feature(enabled=False)
