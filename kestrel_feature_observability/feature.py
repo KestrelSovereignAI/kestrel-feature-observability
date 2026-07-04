@@ -47,13 +47,21 @@ class ObservabilityFeature(Feature):
         return get_router()
 
     def get_ui_contributions(self):
-        """Declare the "LLM Calls" panel this feature contributes to the Console.
+        """Declare the panels this feature contributes to the Console.
 
-        Ships ``static/llm-calls.js`` — an ES module that self-registers a panel
-        through the host's ``ui-ext`` panel registry (``registerPanel``), gated on
-        the ``observability`` capability. Mirrors the Spawn feature: the server
-        mounts this package's ``static/`` dir at ``/features/{slug}/static`` and
-        the boot loader ``import()``s the declared module.
+        Ships two ES modules, each self-registering a panel through the host's
+        ``ui-ext`` panel registry (``registerPanel``), gated on the
+        ``observability`` capability:
+
+        * ``static/llm-calls.js`` — the LLM-call table.
+        * ``static/timeline.js`` — the fleet swimlane: a left agent selector
+          driven by ``GET /agent-tree`` and a right timeline of lanes + nested
+          sublanes (talon/subagents indented under their driver via the event
+          lineage fields), with Pause/Play, time-range, and color controls.
+
+        Mirrors the Spawn feature: the server mounts this package's ``static/``
+        dir at ``/features/{slug}/static`` and the boot loader ``import()``s each
+        declared module.
 
         ``UIContributions`` lives in the host (``kestrel_sovereign``); it is
         imported lazily and only ever constructed when a host actually calls this
@@ -68,7 +76,7 @@ class ObservabilityFeature(Feature):
             from kestrel_feature_observability._ui import UIContributions
 
         return UIContributions(
-            modules=["llm-calls.js"],
+            modules=["llm-calls.js", "timeline.js"],
             static_dir=static_dir,
             capability="observability",
         )
