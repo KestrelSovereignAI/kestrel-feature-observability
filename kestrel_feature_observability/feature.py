@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.features.base import Feature, tool
+from kestrel_sdk.features.ui import UIContributions
 from kestrel_feature_observability.hook import ObservabilityHook
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
@@ -63,18 +64,11 @@ class ObservabilityFeature(Feature):
         dir at ``/features/{slug}/static`` and the boot loader ``import()``s each
         declared module.
 
-        ``UIContributions`` lives in the host (``kestrel_sovereign``); it is
-        imported lazily and only ever constructed when a host actually calls this
-        hook (the host is guaranteed to have the class then). When the host class
-        is unavailable — e.g. running this package standalone — a structurally
-        identical local descriptor is returned so the shape stays inspectable.
+        ``UIContributions`` is owned by ``kestrel-sovereign-sdk``, so this
+        out-of-tree feature remains standalone without importing the host or
+        carrying a duplicate fallback descriptor.
         """
         static_dir = str((Path(__file__).parent / "static").resolve())
-        try:
-            from kestrel_sovereign.features.base import UIContributions
-        except Exception:  # noqa: BLE001 - host not present (standalone/tests)
-            from kestrel_feature_observability._ui import UIContributions
-
         return UIContributions(
             modules=["llm-calls.js", "timeline.js"],
             static_dir=static_dir,
