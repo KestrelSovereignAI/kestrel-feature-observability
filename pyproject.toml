@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-observability"
-version = "0.4.0"
+version = "0.4.1"
 description = "Observability feature for Kestrel Sovereign — hook-driven lifecycle logging, external event ingest, and a fleet swimlane UI (agent-tree selector + lanes/sublanes), with a shared Prometheus registry"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -31,7 +31,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.14.1,<1",
+    "kestrel-sovereign-sdk>=0.29.3,<1",
 ]
 
 [project.optional-dependencies]
@@ -40,12 +40,12 @@ dependencies = [
 # extra installed, the feature still logs to the observability
 # store; only the Prometheus side becomes a no-op.
 metrics = [
-    "kestrel-sovereign-sdk[metrics]>=0.14.1,<1",
+    "kestrel-sovereign-sdk[metrics]>=0.29.3,<1",
 ]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
-    "kestrel-sovereign-sdk[metrics]>=0.14.1,<1",
+    "kestrel-sovereign-sdk[metrics]>=0.29.3,<1",
     # Router unit tests exercise the FastAPI query endpoints via TestClient.
     # FastAPI/httpx are host-provided at runtime; pulled here only for tests.
     "fastapi>=0.110.0",

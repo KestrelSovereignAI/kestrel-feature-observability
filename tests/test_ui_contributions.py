@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from kestrel_feature_observability.feature import ObservabilityFeature
+from kestrel_sdk.features.ui import UIContributions
 
 
 def _make_feature(enabled=True):
@@ -37,6 +38,7 @@ class TestUIContributions:
     def test_returns_contribution(self):
         contrib = _make_feature().get_ui_contributions()
         assert contrib is not None
+        assert isinstance(contrib, UIContributions)
         assert contrib.modules == ["llm-calls.js", "timeline.js"]
         assert contrib.capability == "observability"
 
