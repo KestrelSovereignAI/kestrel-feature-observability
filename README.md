@@ -1,6 +1,15 @@
 # kestrel-feature-observability
 
-Lifecycle event observability for Kestrel Sovereign agents. Attaches an `ObservabilityHook` to the agent's hook system; every lifecycle event is logged to the agent's `observability_store`. Prometheus metrics emit through the SDK's shared registry, so a single `/metrics` scrape stays coherent across the framework + every feature package.
+Per-agent lifecycle observability **emitter** for Kestrel Sovereign agents.
+Attaches an `ObservabilityHook` to the agent's hook system; every lifecycle
+event is POSTed to the fleet host's observability store
+(`POST {KESTREL_OBSERVABILITY_URL}/api/host/observability/events`). Prometheus
+metrics emit through the SDK's shared registry, so a single `/metrics` scrape
+stays coherent across the framework + every feature package.
+
+This package is **producer-only**. The event store, query routes, and Console
+UI (LLM-call table + fleet swimlane) are owned by the fleet host feature — the
+single tenant-aware owner of the observability data plane.
 
 ## Installation
 
@@ -16,47 +25,34 @@ uv pip install 'kestrel-feature-observability[metrics]'
 
 The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.features` entry point — install it alongside `kestrel-sovereign` and `ObservabilityFeature` registers itself at startup.
 
-## Tools
+## Emitter transport
 
-| Tool | Category | Description |
-|------|----------|-------------|
-| `observability_summary` | DATA_ACCESS | Recent metric and error counts |
-| `observability_query` | DATA_ACCESS | Query lifecycle events by type and time window |
-| `observability_session` | DATA_ACCESS | Per-session event timeline |
+The hook reads two **frozen** env vars (the same keys talon's emitter uses):
 
-## Console panels
+- `KESTREL_OBSERVABILITY_URL` — the fleet host root. The hook POSTs to this URL
+  plus the path `/api/host/observability/events`. When unset, the emit path is a
+  **no-op** (the agent still runs; Prometheus counters still fire).
+- `KESTREL_OBSERVABILITY_KEY` — sent as the `X-API-Key` request header when set.
 
-The feature contributes two ES modules to the Console via `get_ui_contributions()`,
-each self-registering through the host `ui-ext` `registerPanel` registry and gated
-on the `observability` capability:
-
-- **LLM Calls** (`static/llm-calls.js`) — paged, filterable LLM-call table.
-- **Fleet Timeline** (`static/timeline.js`) — the headline swimlane view. A left
-  agent selector populated from `GET /agent-tree`, and a right timeline of lanes
-  (per agent) + **nested sublanes** — talon jobs / subagents indented under their
-  driver via the event lineage fields (`parent_agent`/`driven_by`/
-  `parent_session_id`/`subagent_id`). Pause/Play, time-range (1m/5m/all), and
-  status/tool/hook color modes; live updates via SSE when the host exposes an
-  event stream, else polling of the subtree events endpoint.
-
-`static/timeline.js` keeps its grouping logic (`buildLanes`/`nestLanes`) pure and
-DOM-free at import time — panel registration and rendering run only in a browser —
-so the nesting logic is unit-tested with node's built-in runner
-(`node --test tests/timeline.nesting.test.mjs`), ported from the original
-kestrel-claws `dashboard/tests/timeline.test.ts`. This swimlane supersedes the
-kestrel-claws `dashboard/src/views/timeline.ts`, which should be retired (removed
-or stubbed to point here) in a follow-up kestrel-claws PR.
+Delivery is lightweight and best-effort: an `httpx.AsyncClient` POST,
+fire-and-forget with a short (~2s) timeout, **all failures swallowed, no
+buffering, no retry, no `entities` dependency**. Each event payload carries
+`orchestrator`/`session_id`/`tool_name`/lineage and friends; `orchestrator` is
+the agent itself when self-driven, else `null` (rendered "Direct" by the fleet
+store).
 
 ## Privacy
 
-The hook is observational — it never blocks, denies, or modifies. User-message content is **not** logged (only length); tool errors are truncated to 200 chars; exceptions in the hook are swallowed so they cannot affect agent operation.
+The hook is observational — it never blocks, denies, or modifies. User-message content is **not** sent (only length); tool errors are truncated to 200 chars; exceptions in the hook are swallowed so they cannot affect agent operation.
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `tool`, `ToolCategory`, `Hook`, and shared `metrics` module
+- `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `Hook`, and shared `metrics` module
+- `httpx>=0.27.0` — lightweight HTTP client for the emitter POST
 - Optional `[metrics]` extra → `kestrel-sovereign-sdk[metrics]` → `prometheus-client`
 
-No runtime dependency on `kestrel-sovereign` itself; the feature accesses `agent.observability_store` via duck typing, so it works against any host that provides one.
+No runtime dependency on `kestrel-sovereign` (or any `entities`/fleet package);
+the hook talks to the fleet host purely over HTTP.
 
 ## Development
 
