@@ -39,9 +39,10 @@ class ObservabilityFeature(Feature):
         The router is built in ``endpoints.py`` and mounted by the server only
         when ObservabilityFeature is discovered and enabled. It serves the
         read-side LLM panel routes (``GET /api/observability/llm-calls`` +
-        ``/llm-stats``) plus the data-plane routes: ``POST /events`` (external
-        ingest for out-of-process agents), ``GET /agent-tree`` (spawn
-        hierarchy), and ``GET /events`` (per-agent or whole-subtree query).
+        ``/llm-stats``) plus ``GET /agent-tree`` (spawn hierarchy). External
+        event ingest and fleet-wide/per-agent event query
+        (``POST``/``GET /api/observability/events``) are owned by the fleet host
+        feature (epic #20), the single tenant-aware owner of that path.
         """
         from kestrel_feature_observability.endpoints import get_router
         return get_router()

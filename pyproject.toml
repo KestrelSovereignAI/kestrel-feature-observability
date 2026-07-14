@@ -1,7 +1,7 @@
 [project]
 name = "kestrel-feature-observability"
-version = "0.4.0"
-description = "Observability feature for Kestrel Sovereign — hook-driven lifecycle logging, external event ingest, and a fleet swimlane UI (agent-tree selector + lanes/sublanes), with a shared Prometheus registry"
+version = "0.5.0"
+description = "Observability feature for Kestrel Sovereign — hook-driven lifecycle logging, per-agent LLM-call views, and a fleet swimlane UI (agent-tree selector + lanes/sublanes), with a shared Prometheus registry"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
