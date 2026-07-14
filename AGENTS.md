@@ -11,10 +11,9 @@ kestrel-feature-observability/
 ├── kestrel_feature_observability/
 │   ├── __init__.py
 │   ├── feature.py               # ObservabilityFeature entry point
-│   └── hook.py                  # Lifecycle event hooks
+│   └── hook.py                  # Lifecycle event emitter (POSTs to fleet)
 └── tests/
-    ├── test_observability_feature.py
-    └── test_tool_result_contracts.py
+    └── test_observability_feature.py
 ```
 
 ## Entry Points
@@ -23,8 +22,8 @@ kestrel-feature-observability/
 
 ## Key Files to Read First
 
-1. `kestrel_feature_observability/feature.py` — Observability feature and tools
-2. `kestrel_feature_observability/hook.py` — Lifecycle event hook
+1. `kestrel_feature_observability/feature.py` — Observability feature (hook registration only)
+2. `kestrel_feature_observability/hook.py` — Lifecycle event emitter (POSTs to the fleet store)
 
 ## Running Tests
 
@@ -34,6 +33,10 @@ uv run pytest
 
 ## Agent-Specific Instructions
 
-- ObservabilityFeature uses the hook system for event logging
-- User-message content is not logged; keep the hook observational and non-blocking
+- ObservabilityFeature is producer-only: the hook POSTs lifecycle events to the fleet host's
+  observability ingest (`POST {KESTREL_OBSERVABILITY_URL}/api/host/observability/events`, auth via
+  `X-API-Key: {KESTREL_OBSERVABILITY_KEY}`). No local store, query tools, HTTP router, or UI panels —
+  those belong to the fleet host feature. Keep the emitter free of any `entities` dependency.
+- User-message content is not sent; keep the hook observational, non-blocking, and fire-and-forget
+  (short timeout, failures swallowed, no retry/buffering)
 - Prometheus metrics use the SDK's shared registry when the optional metrics extra is installed

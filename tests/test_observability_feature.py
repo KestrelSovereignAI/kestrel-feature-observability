@@ -1,19 +1,21 @@
 """
-Tests for the ObservabilityHook and ObservabilityFeature.
+Tests for the ObservabilityHook (per-agent emitter) and ObservabilityFeature.
 
 Covers:
 1. Hook registers on all events
 2. Hook always returns ALLOW (never blocks)
-3. Hook logs to ObservabilityStore on each event type
-4. Hook handles missing ObservabilityStore gracefully
-5. Hook handles exceptions without propagating
+3. Hook POSTs a lifecycle-event payload to the fleet ingest
+4. Hook is a no-op when KESTREL_OBSERVABILITY_URL is unset
+5. Hook swallows POST/transport failures
 6. Feature registers hook during initialize()
-7. Privacy: user_message content is NOT logged, only length
+7. Privacy: user_message content is NOT sent, only length
 8. Privacy: tool_response error truncated to 200 chars
+9. orchestrator = agent when self-driven, else null (Direct)
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,7 +25,7 @@ from kestrel_sdk.hooks.base import (
     HookOutput,
     PermissionDecision,
 )
-from kestrel_feature_observability.hook import ObservabilityHook
+from kestrel_feature_observability.hook import ObservabilityHook, INGEST_PATH
 from kestrel_feature_observability.feature import ObservabilityFeature
 
 
@@ -31,28 +33,13 @@ from kestrel_feature_observability.feature import ObservabilityFeature
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_agent(with_store=True, with_hooks_manager=True):
-    """Create a mock agent with optional observability_store and hooks_manager."""
-    agent = MagicMock()
-    agent.agent_name = "test-agent"
+FLEET_URL = "https://fleet.example.com"
+API_KEY = "secret-key"
 
-    if with_store:
-        store = AsyncMock()
-        store.log_metric = AsyncMock(return_value="event-id-123")
-        store.query_events = AsyncMock(return_value=[])
-        agent.observability_store = store
-    else:
-        agent.observability_store = None
 
-    if with_hooks_manager:
-        manager = MagicMock()
-        manager.register = MagicMock()
-        manager.unregister = MagicMock()
-        agent.hooks_manager = manager
-    else:
-        agent.hooks_manager = None
-
-    return agent
+def _make_agent(agent_name="test-agent", agent_id="did:agent:test"):
+    """Create a stand-in agent with an identity (no auto-created attrs)."""
+    return SimpleNamespace(agent_name=agent_name, agent_id=agent_id)
 
 
 def _make_input(event_name="PreToolUse", **overrides):
@@ -65,30 +52,63 @@ def _make_input(event_name="PreToolUse", **overrides):
     return HookInput(**defaults)
 
 
+def _configured_hook(agent=None, key=API_KEY):
+    """Build a hook with the fleet ingest env vars set, capturing POSTs.
+
+    Returns ``(hook, posts)`` where ``posts`` is a list the fake
+    ``httpx.AsyncClient.post`` appends ``(url, json, headers)`` to.
+    """
+    agent = agent or _make_agent()
+    env = {"KESTREL_OBSERVABILITY_URL": FLEET_URL}
+    if key is not None:
+        env["KESTREL_OBSERVABILITY_KEY"] = key
+    # clear=True so a real KESTREL_OBSERVABILITY_KEY in the ambient env can't
+    # leak into the key=None case (construction only reads these two vars).
+    with patch.dict("os.environ", env, clear=True):
+        hook = ObservabilityHook(agent=agent)
+
+    posts = []
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            posts.append((url, json, headers))
+            return MagicMock()
+
+    return hook, posts, _FakeClient
+
+
+async def _drain():
+    """Let fire-and-forget POST tasks run to completion."""
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+
 # ---------------------------------------------------------------------------
 # 1. Hook registers on all events
 # ---------------------------------------------------------------------------
 
 class TestHookRegistration:
     def test_registers_on_all_hook_events(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
+        hook = ObservabilityHook(agent=_make_agent())
         assert set(hook.events) == set(HookEvent)
 
     def test_priority_is_999(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        assert hook.priority == 999
+        assert ObservabilityHook(agent=_make_agent()).priority == 999
 
     def test_name_is_observability(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        assert hook.name == "observability"
+        assert ObservabilityHook(agent=_make_agent()).name == "observability"
 
     def test_timeout_is_5_seconds(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        assert hook.timeout == 5.0
+        assert ObservabilityHook(agent=_make_agent()).timeout == 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -98,183 +118,167 @@ class TestHookRegistration:
 class TestHookAlwaysAllows:
     @pytest.mark.asyncio
     async def test_returns_allow_on_pre_tool_use(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("PreToolUse", tool_name="some_tool"))
-        assert result.continue_execution is True
-        assert result.permission_decision == PermissionDecision.ALLOW
-
-    @pytest.mark.asyncio
-    async def test_returns_allow_on_session_start(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("SessionStart"))
+        hook, _, client = _configured_hook()
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            result = await hook.execute(_make_input("PreToolUse", tool_name="some_tool"))
         assert result.continue_execution is True
         assert result.permission_decision == PermissionDecision.ALLOW
 
     @pytest.mark.asyncio
     async def test_returns_allow_on_stop(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("Stop"))
+        hook, _, client = _configured_hook()
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            result = await hook.execute(_make_input("Stop"))
         assert result.continue_execution is True
 
     @pytest.mark.asyncio
-    async def test_returns_allow_when_store_missing(self):
-        agent = _make_agent(with_store=False)
-        hook = ObservabilityHook(agent=agent)
+    async def test_returns_allow_when_unconfigured(self):
+        with patch.dict("os.environ", {}, clear=True):
+            hook = ObservabilityHook(agent=_make_agent())
         result = await hook.execute(_make_input("PreToolUse"))
         assert result.continue_execution is True
 
-    @pytest.mark.asyncio
-    async def test_returns_allow_when_store_raises(self):
-        agent = _make_agent()
-        agent.observability_store.log_metric.side_effect = RuntimeError("DB down")
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("PreToolUse"))
-        assert result.continue_execution is True
-        assert result.permission_decision == PermissionDecision.ALLOW
-
 
 # ---------------------------------------------------------------------------
-# 3. Hook logs to ObservabilityStore on each event type
+# 3. Hook POSTs to the fleet ingest
 # ---------------------------------------------------------------------------
 
-class TestHookLogsEvents:
+class TestHookEmitsEvents:
     @pytest.mark.asyncio
-    async def test_logs_metric_for_pre_tool_use(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(_make_input("PreToolUse", tool_name="web_search"))
+    async def test_posts_to_host_root_ingest_path(self):
+        hook, posts, client = _configured_hook()
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(_make_input("PreToolUse", tool_name="web_search"))
+            await _drain()
 
-        agent.observability_store.log_metric.assert_called_once()
-        call_kwargs = agent.observability_store.log_metric.call_args
-        assert call_kwargs.kwargs["agent_name"] == "test-agent"
-        assert call_kwargs.kwargs["metric_name"] == "hook.PreToolUse"
-        assert call_kwargs.kwargs["metric_value"] == 1
-        assert call_kwargs.kwargs["metadata"]["tool_name"] == "web_search"
-
-    @pytest.mark.asyncio
-    async def test_logs_metric_for_session_start(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(_make_input("SessionStart"))
-
-        call_kwargs = agent.observability_store.log_metric.call_args
-        assert call_kwargs.kwargs["metric_name"] == "hook.SessionStart"
+        assert len(posts) == 1
+        url, payload, headers = posts[0]
+        assert url == FLEET_URL + INGEST_PATH
+        assert INGEST_PATH == "/api/host/observability/events"
+        assert headers["X-API-Key"] == API_KEY
+        assert payload["agent_name"] == "test-agent"
+        assert payload["event_type"] == "tool_call"
+        assert payload["metadata"]["hook_event_type"] == "PreToolUse"
+        assert payload["tool_name"] == "web_search"
+        assert payload["session_id"] == "sess-1"
 
     @pytest.mark.asyncio
-    async def test_logs_metric_for_user_prompt_submit(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(_make_input("UserPromptSubmit", user_message="hello world"))
-
-        call_kwargs = agent.observability_store.log_metric.call_args
-        assert call_kwargs.kwargs["metric_name"] == "hook.UserPromptSubmit"
-        assert call_kwargs.kwargs["metadata"]["user_message_length"] == 11
+    async def test_no_api_key_omits_header(self):
+        hook, posts, client = _configured_hook(key=None)
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(_make_input("SessionStart"))
+            await _drain()
+        assert len(posts) == 1
+        _, _, headers = posts[0]
+        assert "X-API-Key" not in headers
 
     @pytest.mark.asyncio
-    async def test_logs_all_seven_event_types(self):
-        """Verify each HookEvent value can be logged without error."""
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-
+    async def test_all_event_types_emit(self):
         for event in HookEvent:
-            agent.observability_store.log_metric.reset_mock()
-            inp = _make_input(event.value)
-            result = await hook.execute(inp)
+            hook, posts, client = _configured_hook()
+            with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+                result = await hook.execute(_make_input(event.value))
+                await _drain()
             assert result.continue_execution is True
-            agent.observability_store.log_metric.assert_called_once()
+            assert len(posts) == 1
 
     @pytest.mark.asyncio
-    async def test_logs_execution_time_ms(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(_make_input("PostToolUse", tool_name="test", execution_time_ms=42))
-
-        metadata = agent.observability_store.log_metric.call_args.kwargs["metadata"]
-        assert metadata["execution_time_ms"] == 42
-
-    @pytest.mark.asyncio
-    async def test_logs_feature_name(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(_make_input("PreToolUse", tool_name="t", feature_name="SecurityFeature"))
-
-        metadata = agent.observability_store.log_metric.call_args.kwargs["metadata"]
-        assert metadata["feature_name"] == "SecurityFeature"
-
-    @pytest.mark.asyncio
-    async def test_logs_tool_response_success(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(
-            _make_input(
-                "PostToolUse",
-                tool_name="t",
-                tool_response={"success": True, "result": "ok"},
+    async def test_posts_execution_time_and_success(self):
+        hook, posts, client = _configured_hook()
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(
+                _make_input(
+                    "PostToolUse",
+                    tool_name="t",
+                    execution_time_ms=42,
+                    tool_response={"success": True, "result": "ok"},
+                )
             )
-        )
-
-        metadata = agent.observability_store.log_metric.call_args.kwargs["metadata"]
-        assert metadata["success"] is True
+            await _drain()
+        _, payload, _ = posts[0]
+        assert payload["duration_ms"] == 42
+        assert payload["success"] is True
 
     @pytest.mark.asyncio
-    async def test_logs_tool_response_failure(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(
-            _make_input(
-                "PostToolUse",
-                tool_name="t",
-                tool_response={"success": False, "error": "something broke"},
+    async def test_posts_feature_name(self):
+        hook, posts, client = _configured_hook()
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(
+                _make_input("PreToolUse", tool_name="t", feature_name="SecurityFeature")
             )
-        )
-
-        metadata = agent.observability_store.log_metric.call_args.kwargs["metadata"]
-        assert metadata["success"] is False
-        assert metadata["error"] == "something broke"
+            await _drain()
+        _, payload, _ = posts[0]
+        assert payload["metadata"]["feature_name"] == "SecurityFeature"
 
 
 # ---------------------------------------------------------------------------
-# 4. Hook handles missing ObservabilityStore gracefully
+# 4. No-op when unconfigured
 # ---------------------------------------------------------------------------
 
-class TestHookMissingStore:
+class TestUnconfigured:
     @pytest.mark.asyncio
-    async def test_no_store_attribute(self):
-        agent = MagicMock(spec=[])  # No attributes at all
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("PreToolUse"))
-        assert result.continue_execution is True
+    async def test_no_post_when_url_unset(self):
+        with patch.dict("os.environ", {}, clear=True):
+            hook = ObservabilityHook(agent=_make_agent())
 
-    @pytest.mark.asyncio
-    async def test_store_is_none(self):
-        agent = _make_agent(with_store=False)
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("Stop"))
+        posts = []
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                posts.append("constructed")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **kw):
+                posts.append("posted")
+
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", _FakeClient):
+            result = await hook.execute(_make_input("PreToolUse", tool_name="t"))
+            await _drain()
+
         assert result.continue_execution is True
+        assert posts == []  # never touched the client
 
 
 # ---------------------------------------------------------------------------
-# 5. Hook handles exceptions without propagating
+# 5. Failures are swallowed
 # ---------------------------------------------------------------------------
 
 class TestHookExceptionHandling:
     @pytest.mark.asyncio
-    async def test_store_log_metric_raises(self):
-        agent = _make_agent()
-        agent.observability_store.log_metric.side_effect = Exception("DB error")
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("PreToolUse", tool_name="test"))
+    async def test_post_raises_is_swallowed(self):
+        hook, _, _ = _configured_hook()
+
+        class _FailingClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **kw):
+                raise RuntimeError("network down")
+
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", _FailingClient):
+            result = await hook.execute(_make_input("PreToolUse", tool_name="t"))
+            await _drain()
         assert result.continue_execution is True
 
     @pytest.mark.asyncio
     async def test_agent_name_missing(self):
         agent = _make_agent()
         del agent.agent_name
-        hook = ObservabilityHook(agent=agent)
-        result = await hook.execute(_make_input("PreToolUse"))
+        hook, posts, client = _configured_hook(agent=agent)
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            result = await hook.execute(_make_input("PreToolUse"))
+            await _drain()
         assert result.continue_execution is True
 
 
@@ -285,8 +289,7 @@ class TestHookExceptionHandling:
 class TestFeatureInitialization:
     @pytest.mark.asyncio
     async def test_feature_provides_hook_via_get_hooks(self):
-        agent = _make_agent()
-        feature = ObservabilityFeature(agent)
+        feature = ObservabilityFeature(_make_agent())
         await feature.initialize()
 
         hooks = feature.get_hooks()
@@ -296,82 +299,70 @@ class TestFeatureInitialization:
         assert hooks[0].priority == 999
 
     @pytest.mark.asyncio
-    async def test_feature_handles_no_hooks_manager(self):
-        agent = _make_agent(with_hooks_manager=False)
-        feature = ObservabilityFeature(agent)
-        # Should not raise
-        await feature.initialize()
-
-    @pytest.mark.asyncio
     async def test_feature_clears_hook_on_shutdown(self):
-        agent = _make_agent()
-        feature = ObservabilityFeature(agent)
+        feature = ObservabilityFeature(_make_agent())
         await feature.initialize()
         await feature.shutdown()
-
-        # After shutdown, get_hooks() returns empty (hook reference cleared)
         assert feature.get_hooks() == []
 
     def test_feature_tool_description(self):
-        agent = _make_agent()
-        feature = ObservabilityFeature(agent)
+        feature = ObservabilityFeature(_make_agent())
         assert "observability" in feature.tool_description.lower()
 
-    @pytest.mark.asyncio
-    async def test_feature_has_obs_status_tool(self):
-        agent = _make_agent()
-        feature = ObservabilityFeature(agent)
+    def test_feature_has_no_query_tools(self):
+        """Producer-only: no obs_status/obs_events @tool surface remains."""
+        feature = ObservabilityFeature(_make_agent())
         tool_names = [t.name for t in feature.get_tools()]
-        assert "obs_status" in tool_names
+        assert "obs_status" not in tool_names
+        assert "obs_events" not in tool_names
 
-    @pytest.mark.asyncio
-    async def test_feature_has_obs_events_tool(self):
-        agent = _make_agent()
-        feature = ObservabilityFeature(agent)
-        tool_names = [t.name for t in feature.get_tools()]
-        assert "obs_events" in tool_names
+    def test_feature_has_no_router_or_ui(self):
+        """Producer-only: router + UI panels belong to the fleet host.
+
+        The feature no longer overrides the base hooks, so both fall through
+        to the SDK defaults (``None``) — nothing mounted, no panels shipped.
+        """
+        feature = ObservabilityFeature(_make_agent())
+        assert feature.get_router() is None
+        assert feature.get_ui_contributions() is None
 
 
 # ---------------------------------------------------------------------------
-# 7. Privacy: user_message content NOT logged, only length
+# 7. Privacy: user_message content NOT sent, only length
 # ---------------------------------------------------------------------------
 
 class TestPrivacy:
     @pytest.mark.asyncio
-    async def test_user_message_not_in_metadata(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
+    async def test_user_message_not_in_payload(self):
+        hook, posts, client = _configured_hook()
         secret_message = "my password is hunter2"
-        await hook.execute(
-            _make_input("UserPromptSubmit", user_message=secret_message)
-        )
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(_make_input("UserPromptSubmit", user_message=secret_message))
+            await _drain()
 
-        metadata = agent.observability_store.log_metric.call_args.kwargs["metadata"]
-        # Length is logged
-        assert metadata["user_message_length"] == len(secret_message)
-        # Actual content must not be in any metadata value
-        for key, value in metadata.items():
+        _, payload, _ = posts[0]
+        assert payload["metadata"]["user_message_length"] == len(secret_message)
+        # Content never appears anywhere in the payload — top-level or metadata.
+        for value in list(payload.values()) + list(payload["metadata"].values()):
             if isinstance(value, str):
                 assert secret_message not in value
 
     @pytest.mark.asyncio
-    async def test_tool_input_not_logged(self):
-        """Tool input args should not appear in metadata (privacy)."""
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
-        await hook.execute(
-            _make_input(
-                "PreToolUse",
-                tool_name="web_search",
-                tool_input={"query": "sensitive query", "api_key": "secret123"},
+    async def test_tool_input_not_sent(self):
+        hook, posts, client = _configured_hook()
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(
+                _make_input(
+                    "PreToolUse",
+                    tool_name="web_search",
+                    tool_input={"query": "sensitive query", "api_key": "secret123"},
+                )
             )
-        )
+            await _drain()
 
-        metadata = agent.observability_store.log_metric.call_args.kwargs["metadata"]
-        # tool_input should not be directly in metadata
-        assert "tool_input" not in metadata
-        # The values should not leak
-        for key, value in metadata.items():
+        _, payload, _ = posts[0]
+        assert "tool_input" not in payload
+        for value in payload.values():
             if isinstance(value, str):
                 assert "sensitive query" not in value
                 assert "secret123" not in value
@@ -384,16 +375,46 @@ class TestPrivacy:
 class TestErrorTruncation:
     @pytest.mark.asyncio
     async def test_long_error_truncated_to_200_chars(self):
-        agent = _make_agent()
-        hook = ObservabilityHook(agent=agent)
+        hook, posts, client = _configured_hook()
         long_error = "x" * 500
-        await hook.execute(
-            _make_input(
-                "PostToolUse",
-                tool_name="t",
-                tool_response={"success": False, "error": long_error},
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(
+                _make_input(
+                    "PostToolUse",
+                    tool_name="t",
+                    tool_response={"success": False, "error": long_error},
+                )
             )
-        )
+            await _drain()
 
-        metadata = agent.observability_store.log_metric.call_args.kwargs["metadata"]
-        assert len(metadata["error"]) == 200
+        _, payload, _ = posts[0]
+        assert payload["success"] is False
+        assert len(payload["error_message"]) == 200
+
+
+# ---------------------------------------------------------------------------
+# 9. orchestrator semantics (self-driven vs driven → Direct)
+# ---------------------------------------------------------------------------
+
+class TestOrchestrator:
+    @pytest.mark.asyncio
+    async def test_self_driven_sets_orchestrator_to_agent(self):
+        hook, posts, client = _configured_hook(agent=_make_agent(agent_id="did:agent:me"))
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(_make_input("SessionStart"))
+            await _drain()
+        _, payload, _ = posts[0]
+        # Self-driven → orchestrator is the agent's DISPLAY name (matches how the
+        # fleet store groups ``agent_name``), not the DID. DID rides in metadata.
+        assert payload["orchestrator"] == "test-agent"
+        assert payload["metadata"]["agent_did"] == "did:agent:me"
+
+    @pytest.mark.asyncio
+    async def test_driven_agent_sets_orchestrator_null(self):
+        hook, posts, client = _configured_hook()
+        with patch("kestrel_feature_observability.hook.httpx.AsyncClient", client):
+            await hook.execute(_make_input("PreToolUse", parent_did="did:agent:driver"))
+            await _drain()
+        _, payload, _ = posts[0]
+        assert payload["orchestrator"] is None
+        assert payload["metadata"]["parent_agent"] == "did:agent:driver"
