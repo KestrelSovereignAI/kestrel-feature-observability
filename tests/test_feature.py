@@ -63,6 +63,14 @@ def test_get_ui_contributions_ships_swimlane():
     assert any("swimlane.js" in m for m in contributions.modules)
 
 
+def test_get_ui_contributions_ships_runs_panel():
+    """The Fleet Runs panel is contributed as a second UI module."""
+    feature = FleetObservabilityHostFeature()
+    contributions = feature.get_ui_contributions()
+    assert contributions is not None
+    assert any("runs.js" in m for m in contributions.modules)
+
+
 def test_ui_module_paths_are_mount_relative_and_shipped():
     """Every declared module URL must resolve to a shipped file.
 
