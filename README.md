@@ -1,15 +1,29 @@
 # kestrel-feature-observability
 
-Per-agent lifecycle observability **emitter** for Kestrel Sovereign agents.
-Attaches an `ObservabilityHook` to the agent's hook system; every lifecycle
-event is POSTed to the fleet host's observability store
-(`POST {KESTREL_OBSERVABILITY_URL}/api/host/observability/events`). Prometheus
-metrics emit through the SDK's shared registry, so a single `/metrics` scrape
-stays coherent across the framework + every feature package.
+The **single** observability package for Kestrel Sovereign — one repo, one
+version, one source of truth for the whole observability domain — with two roles
+selected by the two entry-point groups (package boundaries need not match
+process boundaries):
 
-This package is **producer-only**. The event store, query routes, and Console
-UI (LLM-call table + fleet swimlane) are owned by the fleet host feature — the
-single tenant-aware owner of the observability data plane.
+- **Base install** (`pip install kestrel-feature-observability`) — the
+  lightweight per-agent **emitter** `Feature` (the `kestrel_sovereign.features`
+  entry point). It attaches an `ObservabilityHook` to the agent's hook system;
+  every lifecycle event is POSTed to the fleet host's observability store
+  (`POST {KESTREL_OBSERVABILITY_URL}/api/host/observability/events`). No
+  `entities`, no DB — this is what every agent gets. Prometheus metrics emit
+  through the SDK's shared registry, so a single `/metrics` scrape stays
+  coherent across the framework + every feature package.
+- **Host extra** (`kestrel-feature-observability[fleet]`) — pulls
+  `kestrel-feature-entities` and enables the **`FleetObservabilityHostFeature`**
+  (tenant-scoped event store + query routes + orchestrator swimlane; the
+  `kestrel_sovereign.host_features` entry point). The HostFeature lives in the
+  `kestrel_feature_observability.fleet` subpackage and its import/entry point is
+  **guarded** — on a base install (extra absent) it resolves to `None` and the
+  host skips it, so the emitter path never imports `entities`.
+
+> This package supersedes the separate `kestrel-feature-observability-fleet`
+> package, which is deprecated: its HostFeature, store, and swimlane now live
+> here behind the `[fleet]` extra.
 
 ## Installation
 
@@ -23,7 +37,16 @@ For real Prometheus output:
 uv pip install 'kestrel-feature-observability[metrics]'
 ```
 
-The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.features` entry point — install it alongside `kestrel-sovereign` and `ObservabilityFeature` registers itself at startup.
+For the fleet host role (event store + swimlane):
+
+```bash
+uv pip install 'kestrel-feature-observability[fleet]'
+```
+
+Both features are auto-discovered by Kestrel Sovereign via their entry-point
+groups — install the base package alongside `kestrel-sovereign` and
+`ObservabilityFeature` registers itself into every agent; install with `[fleet]`
+on the host and `FleetObservabilityHostFeature` registers at host scope.
 
 ## Emitter transport
 
@@ -50,9 +73,14 @@ The hook is observational — it never blocks, denies, or modifies. User-message
 - `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `Hook`, and shared `metrics` module
 - `httpx>=0.27.0` — lightweight HTTP client for the emitter POST
 - Optional `[metrics]` extra → `kestrel-sovereign-sdk[metrics]` → `prometheus-client`
+- Optional `[fleet]` extra → `kestrel-sovereign-sdk>=0.29.2,<0.30` (the HostFeature
+  contract) + `kestrel-feature-entities` (the tenant-scoped event store, pulling
+  SQLAlchemy 2.0 async + Alembic). Only this extra pulls `entities`.
 
-No runtime dependency on `kestrel-sovereign` (or any `entities`/fleet package);
-the hook talks to the fleet host purely over HTTP.
+The base emitter has **no** runtime dependency on `kestrel-sovereign` (or any
+`entities`/fleet package); the hook talks to the fleet host purely over HTTP.
+The store's heavy dependencies live entirely behind the `[fleet]` extra, so
+agents stay lightweight.
 
 ## Development
 
