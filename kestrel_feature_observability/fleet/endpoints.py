@@ -9,6 +9,10 @@ Endpoints:
 * ``GET  /api/host/observability/events`` — filter by orchestrator/agent/session/time
   (+ ``subtree=true``).
 * ``GET  /api/host/observability/tree`` — orchestrator tree with a ``Direct`` node.
+* ``GET  /api/host/observability/runs`` — runs aggregated by ``workflow_run_id``
+  (derived status + per-stage rollups; ``orchestrator``/``since`` filters).
+* ``GET  /api/host/observability/runs/{run_id}`` — one run's ordered stage/subagent
+  event sequence (run → stage → tool-call drill-down).
 * ``GET  /api/host/observability/stream`` — Streamable-HTTP live stream: one
   fetch-based endpoint, body streamed as ``text/event-stream`` with a session id
   + ``Last-Event-ID`` resumability, fanned out behind the pub/sub backplane.
@@ -88,6 +92,7 @@ async def event_stream(
     last_event_id: Optional[int] = None,
     session_id: str,
     tenant_id: Optional[uuid.UUID] = None,
+    workflow_run_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Yield SSE frames: a session preamble, replayed backlog, then live events.
 
@@ -98,6 +103,9 @@ async def event_stream(
     Fail-closed per tenant: a subscriber only sees frames for its resolved
     tenant (``tenant_id`` or the store's zero-config default). The backplane
     ring is shared across tenants, so frames are filtered here by ``tenant_id``.
+
+    When ``workflow_run_id`` is given, frames are further narrowed to that run
+    so the Fleet Runs panel gets a live, run-scoped feed.
     """
     tenant_str = str(tenant_id if tenant_id is not None else store.tenant_id)
     yield f": stream {session_id}\n\n"
@@ -106,6 +114,8 @@ async def event_stream(
     try:
         async for stream_id, event in subscription:
             if event.get("tenant_id") != tenant_str:
+                continue
+            if workflow_run_id is not None and event.get("workflow_run_id") != workflow_run_id:
                 continue
             yield _sse_frame(stream_id, event)
     finally:
@@ -171,6 +181,7 @@ def get_router(
         orchestrator: Optional[str] = Query(None),
         agent_name: Optional[str] = Query(None),
         session_id: Optional[str] = Query(None),
+        workflow_run_id: Optional[str] = Query(None),
         since: Optional[str] = Query(None),
         until: Optional[str] = Query(None),
         subtree: bool = Query(False),
@@ -183,6 +194,7 @@ def get_router(
                 orchestrator=orchestrator,
                 agent_name=agent_name,
                 session_id=session_id,
+                workflow_run_id=workflow_run_id,
                 since=_parse_ts(since),
                 until=_parse_ts(until),
                 subtree=subtree,
@@ -199,8 +211,35 @@ def get_router(
         tenant_id = await _resolve_tenant(tenant_resolver, request)
         return await store.tree(tenant_id=tenant_id)
 
+    @router.get("/runs")
+    async def get_runs(
+        request: Request,
+        orchestrator: Optional[str] = Query(None),
+        since: Optional[str] = Query(None),
+    ) -> dict:
+        store = _store()
+        tenant_id = await _resolve_tenant(tenant_resolver, request)
+        runs = await store.runs(
+            orchestrator=orchestrator,
+            since=_parse_ts(since),
+            tenant_id=tenant_id,
+        )
+        return {"runs": runs, "count": len(runs)}
+
+    @router.get("/runs/{run_id}")
+    async def get_run_detail(request: Request, run_id: str) -> dict:
+        store = _store()
+        tenant_id = await _resolve_tenant(tenant_resolver, request)
+        detail = await store.run_detail(run_id, tenant_id=tenant_id)
+        if detail is None:
+            raise HTTPException(404, f"run not found: {run_id}")
+        return detail
+
     @router.get("/stream")
-    async def stream(request: Request) -> Any:
+    async def stream(
+        request: Request,
+        workflow_run_id: Optional[str] = Query(None),
+    ) -> Any:
         store = _store()
         # Resumability: the browser replays the last frame id it saw.
         header_id = request.headers.get("Last-Event-ID")
@@ -212,6 +251,7 @@ def get_router(
             last_event_id=last_event_id,
             session_id=session_id,
             tenant_id=tenant_id,
+            workflow_run_id=workflow_run_id,
         )
         return StreamingResponse(
             generator,

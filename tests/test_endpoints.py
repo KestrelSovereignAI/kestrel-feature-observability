@@ -145,6 +145,73 @@ def test_get_tree_has_direct_node(client):
     assert any(n["is_direct"] and n["label"] == "Direct" for n in tree)
 
 
+def test_get_runs_aggregates(client):
+    client.post(
+        "/api/host/observability/events",
+        json={
+            "events": [
+                make_event(agent_name="orch", orchestrator="orch", session_id="s1",
+                           event_type="subagent_call", workflow_run_id="R1", stage="plan"),
+                make_event(agent_name="w", orchestrator="orch", session_id="s2",
+                           event_type="agent_response", workflow_run_id="R1", stage="build"),
+                # run-less → omitted
+                make_event(agent_name="solo", session_id="s3"),
+            ]
+        },
+    )
+    resp = client.get("/api/host/observability/runs")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    run = body["runs"][0]
+    assert run["run_id"] == "R1"
+    assert run["status"] == "completed"
+    assert {s["stage"] for s in run["stages"]} == {"plan", "build"}
+
+
+def test_get_run_detail(client):
+    client.post(
+        "/api/host/observability/events",
+        json={
+            "events": [
+                make_event(agent_name="a", session_id="s", event_type="tool_call",
+                           workflow_run_id="RD", stage="one"),
+                make_event(agent_name="a", session_id="s", event_type="tool_response",
+                           workflow_run_id="RD", stage="one"),
+            ]
+        },
+    )
+    resp = client.get("/api/host/observability/runs/RD")
+    assert resp.status_code == 200
+    detail = resp.json()
+    assert detail["run_id"] == "RD"
+    assert detail["event_count"] == 2
+    assert len(detail["events"]) == 2
+
+
+def test_get_run_detail_404_when_missing(client):
+    resp = client.get("/api/host/observability/runs/does-not-exist")
+    assert resp.status_code == 404
+
+
+def test_get_events_workflow_run_id_filter(client):
+    client.post(
+        "/api/host/observability/events",
+        json={
+            "events": [
+                make_event(session_id="s", workflow_run_id="WF1", event_type="metric"),
+                make_event(session_id="s", workflow_run_id="WF2", event_type="metric"),
+            ]
+        },
+    )
+    resp = client.get(
+        "/api/host/observability/events", params={"workflow_run_id": "WF1"}
+    )
+    assert resp.status_code == 200
+    events = resp.json()["events"]
+    assert {e["workflow_run_id"] for e in events} == {"WF1"}
+
+
 # NOTE: the HTTP-level `/stream` endpoint is intentionally NOT exercised via an
 # HTTP client here. It is an *unbounded* SSE stream, and tearing down the client
 # mid-stream deadlocks the test harness (sync TestClient's portal thread; and
@@ -188,6 +255,24 @@ async def test_stream_generator_is_tenant_scoped(store):
     frame = await gen.__anext__()
     assert '"session_id": "a-only"' in frame
     assert "b-only" not in frame
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_filters_by_workflow_run_id(store):
+    from kestrel_feature_observability.fleet.endpoints import event_stream
+
+    gen = event_stream(
+        store, last_event_id=0, session_id="sess", workflow_run_id="RUN"
+    )
+    assert (await gen.__anext__()).startswith(": stream ")
+    assert (await gen.__anext__()).startswith("retry:")
+    # An event for a different run is filtered out; only the matching run flows.
+    await store.ingest([make_event(session_id="other", workflow_run_id="NOPE")])
+    await store.ingest([make_event(session_id="mine", workflow_run_id="RUN")])
+    frame = await gen.__anext__()
+    assert '"session_id": "mine"' in frame
+    assert "other" not in frame
     await gen.aclose()
 
 

@@ -158,6 +158,107 @@ async def test_tree_is_tenant_scoped(store):
     assert a_agents == {"a-agent"}
 
 
+async def test_runs_aggregates_by_workflow_run_id(store):
+    await store.ingest(
+        [
+            make_event(
+                agent_name="orch", orchestrator="orch", session_id="s1",
+                event_type="subagent_call", workflow_run_id="run-1", stage="plan",
+            ),
+            make_event(
+                agent_name="worker", orchestrator="orch", session_id="s2",
+                event_type="tool_call", workflow_run_id="run-1", stage="build",
+            ),
+            make_event(
+                agent_name="worker", orchestrator="orch", session_id="s2",
+                event_type="agent_response", workflow_run_id="run-1", stage="build",
+            ),
+            # A run-less event is omitted from the runs view.
+            make_event(agent_name="solo", session_id="s3"),
+        ]
+    )
+    runs = await store.runs()
+    assert len(runs) == 1
+    run = runs[0]
+    assert run["run_id"] == "run-1"
+    assert run["orchestrator"] == "orch"
+    assert run["status"] == "completed"
+    assert run["event_count"] == 3
+    stage_names = {s["stage"] for s in run["stages"]}
+    assert stage_names == {"plan", "build"}
+    assert run["duration_ms"] is not None
+
+
+async def test_runs_status_failed_and_running(store):
+    await store.ingest(
+        [
+            make_event(
+                agent_name="a", session_id="f", event_type="gate_failed",
+                workflow_run_id="run-fail", stage="verify",
+                metadata={"gate": "verify", "attempt": 2},
+            ),
+            make_event(
+                agent_name="a", session_id="r", event_type="tool_call",
+                workflow_run_id="run-live", stage="build",
+            ),
+        ]
+    )
+    by_id = {r["run_id"]: r for r in await store.runs()}
+    assert by_id["run-fail"]["status"] == "failed"
+    assert by_id["run-live"]["status"] == "running"
+
+
+async def test_runs_orchestrator_filter(store):
+    await store.ingest(
+        [
+            make_event(agent_name="a", orchestrator="o1", session_id="s",
+                       workflow_run_id="r1", event_type="metric"),
+            make_event(agent_name="b", orchestrator="o2", session_id="s",
+                       workflow_run_id="r2", event_type="metric"),
+        ]
+    )
+    runs = await store.runs(orchestrator="o1")
+    assert {r["run_id"] for r in runs} == {"r1"}
+
+
+async def test_run_detail_ordered_events(store):
+    await store.ingest(
+        [
+            make_event(agent_name="a", session_id="s", event_type="tool_call",
+                       workflow_run_id="r", stage="one", ts="2024-01-01T00:00:02Z"),
+            make_event(agent_name="a", session_id="s", event_type="tool_response",
+                       workflow_run_id="r", stage="one", ts="2024-01-01T00:00:01Z"),
+        ]
+    )
+    detail = await store.run_detail("r")
+    assert detail is not None
+    assert detail["run_id"] == "r"
+    assert [e["event_type"] for e in detail["events"]] == ["tool_response", "tool_call"]
+    assert detail["event_count"] == 2
+
+
+async def test_run_detail_missing_returns_none(store):
+    assert await store.run_detail("nope") is None
+
+
+async def test_runs_is_tenant_scoped(store):
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await store.ingest(
+        [make_event(agent_name="a", session_id="s", workflow_run_id="ra",
+                    event_type="metric")],
+        tenant_id=tenant_a,
+    )
+    await store.ingest(
+        [make_event(agent_name="b", session_id="s", workflow_run_id="rb",
+                    event_type="metric")],
+        tenant_id=tenant_b,
+    )
+    a_runs = await store.runs(tenant_id=tenant_a)
+    assert {r["run_id"] for r in a_runs} == {"ra"}
+    assert await store.run_detail("rb", tenant_id=tenant_a) is None
+
+
 async def test_tree_shortens_did_shaped_values(store):
     await store.ingest(
         [make_event(agent_name="did:key:z6MkverylongidentifierABCDEF", session_id="s")]

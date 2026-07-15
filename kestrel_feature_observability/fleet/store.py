@@ -50,6 +50,61 @@ def _coerce_ts(value: Any) -> datetime:
     raise IngestError(f"invalid ts: {value!r}")
 
 
+#: Event types that mark a run/stage as terminally complete (the top agent's or
+#: a subagent's final response). Used to derive run/stage status.
+_TERMINAL_EVENT_TYPES = frozenset({"agent_response", "subagent_response"})
+
+#: Event types that mark a failure.
+_FAILURE_EVENT_TYPES = frozenset({"error", "gate_failed"})
+
+
+def _derive_status(events: list[dict]) -> str:
+    """Derive a run/stage status from its events (running/completed/failed).
+
+    Failed wins over completed: any ``error``/``gate_failed`` event, or any
+    event with ``success is False``, marks the group failed. Otherwise a
+    terminal response event marks it completed; absent either, it is running.
+    """
+    for e in events:
+        if e.get("event_type") in _FAILURE_EVENT_TYPES or e.get("success") is False:
+            return "failed"
+    for e in events:
+        if e.get("event_type") in _TERMINAL_EVENT_TYPES:
+            return "completed"
+    return "running"
+
+
+def _duration_ms(started: Optional[str], ended: Optional[str]) -> Optional[int]:
+    """Milliseconds between two ISO timestamps, or ``None`` if either is absent."""
+    if not started or not ended:
+        return None
+    try:
+        a = datetime.fromisoformat(started)
+        b = datetime.fromisoformat(ended)
+    except ValueError:
+        return None
+    return int((b - a).total_seconds() * 1000)
+
+
+def _ts_at_or_after(ts: Optional[str], cutoff: datetime) -> bool:
+    """Whether an ISO timestamp string is at/after a (tz-aware) cutoff.
+
+    Naive timestamps are treated as UTC so the comparison never raises on a
+    naive/aware mismatch. A missing/unparseable ``ts`` sorts before any cutoff.
+    """
+    if not ts:
+        return False
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    return parsed >= cutoff
+
+
 def _shorten_did(value: Optional[str]) -> Optional[str]:
     """Defensive polish (Q1): render a DID-shaped label shortened, else as-is.
 
@@ -199,6 +254,7 @@ class FleetObservabilityStore:
         orchestrator: Optional[str] = None,
         agent_name: Optional[str] = None,
         session_id: Optional[str] = None,
+        workflow_run_id: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         subtree: bool = False,
@@ -212,6 +268,10 @@ class FleetObservabilityStore:
         stmt = select(ObservabilityEvent)
         if orchestrator is not None:
             stmt = stmt.where(ObservabilityEvent.orchestrator == orchestrator)
+        if workflow_run_id is not None:
+            stmt = stmt.where(
+                ObservabilityEvent.workflow_run_id == workflow_run_id
+            )
         if agent_name is not None:
             if subtree:
                 stmt = stmt.where(
@@ -232,6 +292,139 @@ class FleetObservabilityStore:
             async with self._factory.read_session() as session:
                 result = await session.execute(stmt)
                 return [row.to_dict() for row in result.scalars().all()]
+
+    # -- runs ---------------------------------------------------------------
+
+    async def runs(
+        self,
+        *,
+        orchestrator: Optional[str] = None,
+        since: Optional[datetime] = None,
+        tenant_id: Optional[uuid.UUID] = None,
+    ) -> list[dict]:
+        """Aggregate events by ``workflow_run_id`` into run summaries.
+
+        Each run is ``{run_id, orchestrator, status, started_at, ended_at,
+        duration_ms, stages: [...], event_count}`` with a derived status
+        (running/completed/failed) and per-stage rollups. Events with a null
+        ``workflow_run_id`` are **omitted** (they surface in the swimlane's
+        Direct/agent lanes, not the runs view). Ordered newest-run first.
+
+        ``orchestrator`` filters to runs driven by that orchestrator; ``since``
+        keeps runs whose latest event is at/after the cutoff.
+        """
+        # ``since`` filters whole *runs*, not individual events: a long-running
+        # workflow that began before the cutoff but is still active must keep its
+        # full event history (so started_at / early stages aren't truncated).
+        # Load candidate events unfiltered by ts, aggregate per run, then drop
+        # runs whose latest event is before the cutoff.
+        stmt = (
+            select(ObservabilityEvent)
+            .where(ObservabilityEvent.workflow_run_id.isnot(None))
+            .order_by(ObservabilityEvent.ts.asc())
+        )
+
+        with TenantContext.use(self._resolve(tenant_id)):
+            async with self._factory.read_session() as session:
+                result = await session.execute(stmt)
+                rows = [row.to_dict() for row in result.scalars().all()]
+
+        grouped: dict[str, list[dict]] = {}
+        for event in rows:
+            grouped.setdefault(event["workflow_run_id"], []).append(event)
+
+        runs: list[dict] = []
+        for run_id, events in grouped.items():
+            events.sort(key=lambda e: e["ts"] or "")
+            run_orchestrator = next(
+                (e["orchestrator"] for e in events if e["orchestrator"]), None
+            )
+            if orchestrator is not None and run_orchestrator != orchestrator:
+                continue
+            timestamps = [e["ts"] for e in events if e["ts"]]
+            started_at = timestamps[0] if timestamps else None
+            ended_at = timestamps[-1] if timestamps else None
+            # Run-level ``since``: keep the run if its latest event is at/after
+            # the cutoff (the whole run's history is retained above).
+            if since is not None and not _ts_at_or_after(ended_at, since):
+                continue
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "orchestrator": run_orchestrator,
+                    "status": _derive_status(events),
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_ms": _duration_ms(started_at, ended_at),
+                    "stages": self._summarise_stages(events),
+                    "event_count": len(events),
+                }
+            )
+
+        runs.sort(key=lambda r: r["started_at"] or "", reverse=True)
+        return runs
+
+    @staticmethod
+    def _summarise_stages(events: list[dict]) -> list[dict]:
+        """Roll a run's events up into per-``stage`` summaries, ordered by first
+        appearance. A null ``stage`` is grouped under a ``None`` stage.
+        """
+        stages: dict[Optional[str], list[dict]] = {}
+        for event in events:
+            stages.setdefault(event["stage"], []).append(event)
+        summaries = []
+        for stage_name, stage_events in stages.items():
+            summaries.append(
+                {
+                    "stage": stage_name,
+                    "agent_name": next(
+                        (e["agent_name"] for e in stage_events), None
+                    ),
+                    "status": _derive_status(stage_events),
+                    "event_count": len(stage_events),
+                }
+            )
+        # Order stages by the timestamp of their first event.
+        summaries.sort(
+            key=lambda s: next(
+                (e["ts"] or "" for e in events if e["stage"] == s["stage"]), ""
+            )
+        )
+        return summaries
+
+    async def run_detail(
+        self, run_id: str, *, tenant_id: Optional[uuid.UUID] = None
+    ) -> Optional[dict]:
+        """The ordered stage/subagent event sequence for one run.
+
+        Returns ``{run_id, orchestrator, status, started_at, ended_at,
+        duration_ms, stages, event_count, events}`` with ``events`` ordered
+        oldest-first so the panel can drill run → stage → tool-call events, or
+        ``None`` when the run id has no events (fail-closed per tenant).
+        """
+        events = await self.query(
+            workflow_run_id=run_id, limit=10_000, tenant_id=tenant_id
+        )
+        if not events:
+            return None
+        # query() orders newest-first; the run sequence reads oldest-first.
+        events.sort(key=lambda e: e["ts"] or "")
+        timestamps = [e["ts"] for e in events if e["ts"]]
+        started_at = timestamps[0] if timestamps else None
+        ended_at = timestamps[-1] if timestamps else None
+        return {
+            "run_id": run_id,
+            "orchestrator": next(
+                (e["orchestrator"] for e in events if e["orchestrator"]), None
+            ),
+            "status": _derive_status(events),
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_ms": _duration_ms(started_at, ended_at),
+            "stages": self._summarise_stages(events),
+            "event_count": len(events),
+            "events": events,
+        }
 
     # -- tree ---------------------------------------------------------------
 
