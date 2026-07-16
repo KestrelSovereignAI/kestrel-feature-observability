@@ -138,7 +138,7 @@ class FleetObservabilityHostFeature(HostFeature):
     # -- UI -----------------------------------------------------------------
 
     def get_ui_contributions(self) -> Optional[UIContributions]:
-        """Ship the orchestrator swimlane + Fleet Runs console panels."""
+        """Ship the single "Observability" console panel (Swimlane / Runs subtabs)."""
         import os
 
         static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -149,10 +149,12 @@ class FleetObservabilityHostFeature(HostFeature):
             # Mount-relative to this feature's static dir. The host serves
             # ``static_dir`` at ``/host/features/{slug}/static`` and resolves each
             # module as ``{mount}/{path}``, so the path is relative to the static
-            # root (the file ships at ``static/swimlane.js``) — no ``slug`` prefix
-            # here (the host already adds it) or the URL 404s. The Fleet Runs
-            # panel (``runs.js``) is a second, self-registering UI module.
-            modules=["swimlane.js", "runs.js"],
+            # root (the file ships at ``static/observability.js``) — no ``slug``
+            # prefix here (the host already adds it) or the URL 404s. Only the
+            # container module is a registered top-level panel; it imports the
+            # ``swimlane.js`` and ``runs.js`` sub-views (shipped as sibling static
+            # assets) and swaps them into an internal sub-nav.
+            modules=["observability.js"],
             # Host panels are always-on; keep the capability gate off (the
             # sovereign gate bug is fixed separately in
             # KestrelSovereignAI/kestrel-sovereign#2459).

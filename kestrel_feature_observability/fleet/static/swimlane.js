@@ -6,14 +6,14 @@
 // stream (GET /stream — a fetch-based text/event-stream with Last-Event-ID
 // resumability, reconciled from GET /events on (re)connect).
 //
-// Registered via HostFeature.get_ui_contributions(); sovereign mounts this
-// module (gated on the `observability-fleet` capability) and serves the sibling
-// static assets. Self-registers through the host `ui-ext` registerPanel API.
+// A sub-view of the unified "Observability" console panel (observability.js);
+// the container imports and mounts/unmounts this view — it does not
+// self-register a top-level panel. `mount(container)` fills the supplied content
+// element and returns a handle whose `destroy()` unmounts it.
 //
 // All pure grouping logic lives in swimlane.lanes.js (DOM-free, unit-tested).
 
 import { buildLanes, nestLanes, ts } from "./swimlane.lanes.js";
-import { registerPanel } from "/js/ui-ext/panels.js";
 
 const API_PREFIX = "/api/host/observability";
 
@@ -769,16 +769,3 @@ function ensureStyles() {
   document.head.appendChild(style);
   stylesInjected = true;
 }
-
-// ── Registration via the host ui-ext panel registry ──────────
-//
-// The host `registerPanel` (from /js/ui-ext/panels.js) expects a `panelId`
-// string and a lazy `render(bodyEl)` callback; `mount(container)` fills the
-// supplied panel body on first activation. Host panels are always-on (issue
-// #23), so no `gate` is declared — the nav tab always shows.
-
-registerPanel({
-  panelId: "observability-fleet-swimlane",
-  label: "Fleet Swimlane",
-  render: mount,
-});

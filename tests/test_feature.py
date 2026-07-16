@@ -56,19 +56,31 @@ async def test_router_503_before_start(db_url):
         assert resp.status_code == 503
 
 
-def test_get_ui_contributions_ships_swimlane():
+def test_get_ui_contributions_ships_single_observability_panel():
+    """A single container module is registered as the top-level panel."""
     feature = FleetObservabilityHostFeature()
     contributions = feature.get_ui_contributions()
     assert contributions is not None
-    assert any("swimlane.js" in m for m in contributions.modules)
+    # Exactly one registered top-level panel: the "Observability" container.
+    assert contributions.modules == ["observability.js"]
 
 
-def test_get_ui_contributions_ships_runs_panel():
-    """The Fleet Runs panel is contributed as a second UI module."""
+def test_swimlane_and_runs_ship_as_container_sub_views():
+    """The Swimlane/Runs views ship as sibling assets, not registered panels.
+
+    They are imported by ``observability.js`` (the container), so the files must
+    exist in the static dir but must not appear in ``modules`` (which lists only
+    separately-registered top-level panels).
+    """
+    import os
+
     feature = FleetObservabilityHostFeature()
     contributions = feature.get_ui_contributions()
     assert contributions is not None
-    assert any("runs.js" in m for m in contributions.modules)
+    assert "swimlane.js" not in contributions.modules
+    assert "runs.js" not in contributions.modules
+    for view in ("swimlane.js", "runs.js"):
+        assert os.path.isfile(os.path.join(contributions.static_dir, view))
 
 
 def test_ui_module_paths_are_mount_relative_and_shipped():
