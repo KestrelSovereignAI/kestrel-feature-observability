@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # --- dep degrades to a pure no-op rather than breaking the agent import path.
 try:
     from opentelemetry import trace as _trace
+    from opentelemetry.trace import set_span_in_context as _set_span_in_context
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
@@ -48,6 +49,7 @@ try:
 
     _OTEL_AVAILABLE = True
 except Exception:  # noqa: BLE001 - degrade to no-op tracing when SDK absent
+    _set_span_in_context = None
     _OTEL_AVAILABLE = False
 
 # --- OpenInference semantic conventions (span kinds + I/O attribute keys). ---
@@ -254,6 +256,92 @@ class KestrelTracer:
 
         with self._tracer.start_as_current_span(name, attributes=span_attrs) as span:
             yield span
+
+    def _start_span(
+        self,
+        name: str,
+        kind: str,
+        *,
+        parent: Optional[Any] = None,
+        start_time: Optional[int] = None,
+        agent_name: Optional[str] = None,
+        stage: Optional[str] = None,
+        repo: Optional[str] = None,
+        run_id: Optional[str] = None,
+        orchestrator: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+        attributes: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
+        """Start a span WITHOUT making it current and return the live span.
+
+        Unlike :meth:`_span`, this never attaches the span to the ambient OTel
+        context, so a long-held span cannot leak parentage onto unrelated spans
+        created between its start and end. The caller owns the span lifetime and
+        MUST call ``span.end()`` (optionally with an explicit ``end_time``).
+
+        - ``parent`` (a live span) sets explicit nesting — required because the
+          span is never current, so implicit-context parenting won't apply.
+        - ``start_time`` (epoch-ns) backdates the span start (e.g. to reflect a
+          tool's real runtime on a completed event).
+        """
+        span_attrs: Dict[str, Any] = {_OI_KIND_KEY: kind}
+        span_attrs.update(
+            self._kestrel_attrs(
+                agent_name=agent_name,
+                stage=stage,
+                repo=repo,
+                run_id=run_id,
+                orchestrator=orchestrator,
+            )
+        )
+        if extra:
+            span_attrs.update({k: v for k, v in extra.items() if v is not None})
+        if attributes:
+            span_attrs.update({k: v for k, v in attributes.items() if v is not None})
+
+        if self._tracer is None:
+            return _NoopSpan()
+
+        ctx = (
+            _set_span_in_context(parent)
+            if parent is not None and _set_span_in_context is not None
+            else None
+        )
+        return self._tracer.start_span(
+            name, context=ctx, start_time=start_time, attributes=span_attrs
+        )
+
+    def start_run_span(self, name: str, **kwargs: Any) -> Any:
+        """Start a held-open AGENT span (NOT made current); caller must ``end()`` it.
+
+        For a session/agent run whose lifetime spans many discrete events: hold
+        the returned span on the caller, parent child spans to it explicitly, and
+        end it on the terminal event. Because it is never made current, it never
+        leaks into the ambient context — overlapping runs stay separate traces.
+        """
+        return self._start_span(name, _KIND_AGENT, **kwargs)
+
+    def emit_tool_span(
+        self,
+        name: str,
+        *,
+        parent: Optional[Any] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Emit a completed TOOL span with explicit timing, parented to ``parent``.
+
+        ``start_time`` / ``end_time`` are epoch-ns. Backdate ``start_time`` to
+        ``end_time - duration`` so the exported span's duration reflects the real
+        tool runtime (a correct Phoenix/waterfall) rather than ~0. The span is
+        started and immediately ended; the caller does not manage its lifetime.
+        """
+        span = self._start_span(
+            name, _KIND_TOOL, parent=parent, start_time=start_time, **kwargs
+        )
+        span.end(end_time=end_time)
+        return span
 
     # ------------------------------------------------------------------
     # Span builders — one ``with`` each, auto-nesting via OTel context.
