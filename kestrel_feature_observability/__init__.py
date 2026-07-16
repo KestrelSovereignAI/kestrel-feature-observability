@@ -25,10 +25,17 @@ from importlib.metadata import PackageNotFoundError, version as _version
 
 from .feature import ObservabilityFeature
 from .hook import ObservabilityHook
+from .tracing import KestrelTracer, configure as configure_tracing
 
 try:
     __version__ = _version("kestrel-feature-observability")
 except PackageNotFoundError:
     __version__ = "0.0.0+local"
 
-__all__ = ["ObservabilityFeature", "ObservabilityHook", "__version__"]
+__all__ = [
+    "ObservabilityFeature",
+    "ObservabilityHook",
+    "KestrelTracer",
+    "configure_tracing",
+    "__version__",
+]
