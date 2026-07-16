@@ -1,26 +1,33 @@
 """
-Kestrel Observability Hook — per-agent emitter (producer) for the fleet store.
+Kestrel Observability Hook — per-agent emitter (producer) of OTel spans.
 
-POSTs every lifecycle event to the fleet host's observability ingest
-(``POST {KESTREL_OBSERVABILITY_URL}/api/host/observability/events``) so the
-fleet feature — the single tenant-aware owner of the event store, query routes,
-and UI — can reconstruct the fleet. This hook is purely observational: it never
-blocks, denies, or modifies anything.
+Emits an OpenTelemetry trace per agent lifecycle via :class:`KestrelTracer`
+(``kestrel_feature_observability.tracing``): a session/agent ``run_span`` with each
+tool invocation recorded as a child ``tool_span``. Spans are exported to whatever
+``OTEL_EXPORTER_OTLP_ENDPOINT`` points at (e.g. a host-supervised Phoenix). This
+hook is purely observational: it never blocks, denies, or modifies anything.
 
-Transport is lightweight and best-effort: an ``httpx.AsyncClient`` POST,
-fire-and-forget with a short timeout, all failures swallowed, no buffering or
-retry, and no ``entities`` dependency. When ``KESTREL_OBSERVABILITY_URL`` is
-unset the emit path is a no-op — the agent still runs, and Prometheus counters
+Span shape (robust, real durations — no Pre/Post tool-span pairing):
+
+- A ``run_span`` (OpenInference ``AGENT``) is opened lazily on the first lifecycle
+  event of a session and held open on ``self``, keyed by ``session_id``.
+- Each ``PostToolUse`` emits a child ``tool_span`` (OpenInference ``TOOL``) parented
+  to the session's run span, carrying the tool name, duration, and success.
+- The run span is closed on ``Stop`` / ``AgentTerminate`` — and defensively on
+  hook teardown (:meth:`close`) so an in-flight run always exports.
+
+INV-SOLO: when ``OTEL_EXPORTER_OTLP_ENDPOINT`` (or the traces-specific var) is
+unset, :class:`KestrelTracer` is a no-op — no provider, no exporter, no network —
+so the emit path costs nothing and the agent runs unaffected. Prometheus counters
 still fire locally.
 
-User-message content is never sent (only its length). Exceptions are swallowed
-so observability can never affect agent operation.
+User-message content is never recorded (never stamped on any span). Exceptions are
+swallowed so observability can never affect agent operation.
 """
 
-import asyncio
 import logging
-import os
-from typing import Any, Dict, Optional, Set
+import time
+from typing import Any, Dict, Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sdk.metrics import (
@@ -30,47 +37,25 @@ from kestrel_sdk.metrics import (
     TOOL_DURATION,
 )
 
-try:  # httpx is a lightweight runtime dep; guard so import never breaks the hook
-    import httpx
-except Exception:  # noqa: BLE001 - degrade to no-op emit when unavailable
-    httpx = None
+from kestrel_feature_observability.tracing import (
+    KestrelTracer,
+    configure as configure_tracing,
+)
 
 logger = logging.getLogger(__name__)
 
-# Host-root path the fleet observability HostFeature serves ingest under
-# (host-scoped namespace — NOT the old ``/api/observability/events``).
-INGEST_PATH = "/api/host/observability/events"
+# Standard Kestrel span attribute for the agent session (no constant in tracing.py).
+KESTREL_SESSION_ID = "kestrel.session_id"
 
-# Frozen env vars talon's emitter already uses — do NOT invent new keys.
-_URL_ENV = "KESTREL_OBSERVABILITY_URL"
-_KEY_ENV = "KESTREL_OBSERVABILITY_KEY"
+# Lifecycle events that terminate a run — close the held run span so it exports.
+_TERMINAL_EVENTS = frozenset({"Stop", "AgentTerminate"})
 
-# Fire-and-forget POST timeout (seconds). Short so a slow or unreachable fleet
-# host never stalls the agent.
-_POST_TIMEOUT = 2.0
-
-# Maps SDK hook event names → an ``event_type`` the fleet ingest accepts.
-# The fleet store 422s any ``event_type`` outside its accepted set
-# (tool_call / tool_response / agent_response / subagent_call /
-# subagent_response / error / metric / gate_*). Lifecycle hooks with no
-# telemetry analogue fall through to ``metric`` (see ``_DEFAULT_EVENT_TYPE``).
-EVENT_TYPE_MAP = {
-    "PreToolUse": "tool_call",
-    "PostToolUse": "tool_response",
-    "PreSubagentCall": "subagent_call",
-    "PostSubagentCall": "subagent_response",
-    "PostResponse": "agent_response",
-}
-
-# Lifecycle hooks (SessionStart / UserPromptSubmit / Stop / AgentSpawn /
-# AgentTerminate) carry no telemetry-specific type; the fleet accepts ``metric``
-# for these operational events. The raw hook name is preserved in
-# ``metadata.hook_event_type``.
-_DEFAULT_EVENT_TYPE = "metric"
+# OTel service name for the per-agent emitter's spans.
+_SERVICE_NAME = "kestrel-agent"
 
 
 class ObservabilityHook(Hook):
-    """Per-agent emitter — POSTs lifecycle events to the fleet observability store."""
+    """Per-agent emitter — emits OTel spans (session → tool) via KestrelTracer."""
 
     def __init__(self, agent):
         super().__init__(
@@ -80,13 +65,15 @@ class ObservabilityHook(Hook):
             timeout=5.0,
         )
         self.agent = agent
-        # Frozen at construction, matching talon's emitter. When the URL is unset
-        # the emit path is a no-op.
-        self._ingest_url = os.environ.get(_URL_ENV)
-        self._api_key = os.environ.get(_KEY_ENV)
-        # Hold references to in-flight fire-and-forget POST tasks so they are not
-        # garbage-collected mid-flight; discarded on completion.
-        self._tasks: Set[asyncio.Task] = set()
+        # Frozen at construction. A no-op tracer when OTEL_EXPORTER_OTLP_ENDPOINT
+        # (or the traces-specific var) is unset — never blocks, never networks.
+        self._tracer: KestrelTracer = configure_tracing(service_name=_SERVICE_NAME)
+        # Open run spans keyed by session_id → the live (non-current) run span.
+        # Started via ``start_run_span`` so it is NEVER attached to the ambient
+        # OTel context — it can't leak parentage onto unrelated spans, and
+        # overlapping sessions stay separate traces. Ended on the terminal event
+        # / teardown (an unended span never exports).
+        self._runs: Dict[Optional[str], Any] = {}
 
     # ------------------------------------------------------------------
     # Identity / lineage
@@ -104,137 +91,133 @@ class ObservabilityHook(Hook):
             or getattr(self.agent, "parent_did", None)
         )
 
-    def _lineage_metadata(self, input: HookInput) -> Dict[str, Any]:
-        """Capture parent/child lineage so the fleet swimlane can nest sublanes."""
-        lineage: Dict[str, Any] = {}
-
-        parent_agent = self._driving_parent(input)
-        if parent_agent:
-            lineage["parent_agent"] = parent_agent
-
-        parent_session = getattr(self.agent, "parent_session_id", None)
-        if parent_session:
-            lineage["parent_session_id"] = parent_session
-
-        if input.child_did:
-            lineage["subagent_id"] = input.child_did
-        if input.child_name:
-            lineage["child_name"] = input.child_name
-
-        return lineage
-
     # ------------------------------------------------------------------
-    # Emit path
+    # Run-span lifecycle (held open across invocations)
     # ------------------------------------------------------------------
 
-    def _build_payload(
-        self,
-        agent_name: str,
-        hook_event_name: str,
-        wire_event_type: str,
-        input: HookInput,
-    ) -> Dict[str, Any]:
-        """Build the fleet-ingest event payload for one lifecycle event.
+    def _ensure_run_span(
+        self, session_id: Optional[str], agent_name: str, input: HookInput
+    ) -> Any:
+        """Return the session's run span, opening (and holding) it on first event."""
+        existing = self._runs.get(session_id)
+        if existing is not None:
+            return existing
 
-        The wire shape matches the fleet observability store's ingest contract
-        (``agent_name`` / ``event_type`` / ``session_id`` top-level; hook
-        details under ``metadata``). ``orchestrator`` is the agent's own display
-        name when self-driven, else ``None`` — the fleet store groups by the
-        stored ``orchestrator``/``agent_name`` *display* values (no DID
-        resolution) and renders a null orchestrator as "Direct".
-        """
+        # Self-driven → the agent is its own orchestrator; driven → inherit the
+        # process-global orchestrator (env default), if any.
+        orchestrator = agent_name if self._driving_parent(input) is None else None
+
+        attributes: Dict[str, Any] = {}
+        if session_id:
+            attributes[KESTREL_SESSION_ID] = session_id
         agent_did = self._agent_did()
-        driven_by = self._driving_parent(input)
-        # Self-driven → the agent is its own orchestrator, keyed by the SAME
-        # display name the store groups ``agent_name`` on (not the DID, which
-        # would never match). Driven → null (Direct).
-        orchestrator = agent_name if driven_by is None else None
-
-        # Hook-specific details ride in ``metadata`` (the only free-form field
-        # the fleet store persists); the raw hook name + DID live here.
-        metadata: Dict[str, Any] = {"hook_event_type": hook_event_name}
         if agent_did:
-            metadata["agent_did"] = agent_did
-        if input.feature_name:
-            metadata["feature_name"] = input.feature_name
-        if input.user_message:
-            # Privacy: length only, never the content.
-            metadata["user_message_length"] = len(input.user_message)
-        metadata.update(self._lineage_metadata(input))
+            attributes["kestrel.agent_did"] = agent_did
 
-        payload: Dict[str, Any] = {
-            "event_type": wire_event_type,
-            "agent_name": agent_name,
-            "session_id": input.session_id,
-            "orchestrator": orchestrator,
-            "ts": input.timestamp.isoformat() if input.timestamp else None,
-            "metadata": metadata,
-        }
+        # start_run_span (NOT run_span): the span is held open across events but
+        # never made current, so it can't leak into the ambient OTel context.
+        span = self._tracer.start_run_span(
+            agent_name,
+            agent_name=agent_name,
+            orchestrator=orchestrator,
+            attributes=attributes,
+        )
+        self._runs[session_id] = span
+        return span
 
-        if input.tool_name:
-            payload["tool_name"] = input.tool_name
+    def _emit_tool_span(
+        self, run_span: Any, agent_name: str, input: HookInput
+    ) -> None:
+        """Emit a child tool span for a completed tool call (PostToolUse)."""
+        success = (
+            input.tool_response.get("success", True)
+            if isinstance(input.tool_response, dict)
+            else True
+        )
+
+        extra: Dict[str, Any] = {"tool.success": success}
         if input.execution_time_ms is not None:
-            payload["duration_ms"] = input.execution_time_ms
-        if input.tool_response is not None:
-            success = (
-                input.tool_response.get("success", True)
-                if isinstance(input.tool_response, dict)
-                else True
-            )
-            payload["success"] = success
-            if not success and isinstance(input.tool_response, dict):
-                payload["error_message"] = str(
-                    input.tool_response.get("error", "")
-                )[:200]
+            extra["tool.duration_ms"] = input.execution_time_ms
 
-        return payload
+        attributes: Dict[str, Any] = {}
+        if input.feature_name:
+            attributes["kestrel.feature_name"] = input.feature_name
+        if not success and isinstance(input.tool_response, dict):
+            # Privacy: truncate error text (never user-message content).
+            attributes["tool.error"] = str(input.tool_response.get("error", ""))[:200]
 
-    def _schedule_post(self, payload: Dict[str, Any]) -> None:
-        """Fire-and-forget the POST without blocking the hook. No-op if unconfigured."""
-        if not self._ingest_url or httpx is None:
+        # PostToolUse fires after the tool completed, so backdate the span start
+        # to end − duration → the exported span's duration is the real tool
+        # runtime (a correct waterfall), not ~0. The span is explicitly parented
+        # to the held run span (it is never current) so nesting stays correct.
+        end_ns = time.time_ns()
+        start_ns = None
+        if input.execution_time_ms is not None:
+            start_ns = end_ns - int(input.execution_time_ms * 1_000_000)
+
+        self._tracer.emit_tool_span(
+            input.tool_name,
+            parent=run_span,
+            start_time=start_ns,
+            end_time=end_ns,
+            agent_name=agent_name,
+            extra=extra,
+            attributes=attributes,
+        )
+
+    def _close_run_span(self, session_id: Optional[str]) -> None:
+        """Close and export the session's run span, if open."""
+        span = self._runs.pop(session_id, None)
+        if span is None:
             return
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:  # no running loop — nothing to schedule onto
-            return
-        task = loop.create_task(self._post(payload))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+            span.end()
+        except Exception as e:  # noqa: BLE001 - never fatal
+            logger.debug("ObservabilityHook run-span close failed (non-fatal): %s", e)
 
-    async def _post(self, payload: Dict[str, Any]) -> None:
-        """Best-effort POST to the fleet ingest. All failures swallowed."""
-        url = self._ingest_url.rstrip("/") + INGEST_PATH
-        headers = {"X-API-Key": self._api_key} if self._api_key else {}
+    def close(self) -> None:
+        """Close every open run span — defensive teardown so runs always export."""
+        for session_id in list(self._runs):
+            self._close_run_span(session_id)
+
+    def __del__(self):  # best-effort export if the hook is dropped without shutdown
         try:
-            async with httpx.AsyncClient(timeout=_POST_TIMEOUT) as client:
-                await client.post(url, json=payload, headers=headers)
-        except Exception as e:  # noqa: BLE001 - no retry, no buffering, never fatal
-            logger.debug("ObservabilityHook POST failed (non-fatal): %s", e)
+            self.close()
+        except Exception:  # noqa: BLE001 - interpreter teardown safety
+            pass
 
     # ------------------------------------------------------------------
     # Hook entry point
     # ------------------------------------------------------------------
 
     async def execute(self, input: HookInput) -> HookOutput:
-        """Emit the event to the fleet store and bump Prometheus counters. Never blocks."""
+        """Emit OTel spans and bump Prometheus counters. Never blocks."""
         try:
             agent_name = getattr(self.agent, "agent_name", "unknown")
             event_type = input.hook_event_name
-            wire_event_type = EVENT_TYPE_MAP.get(event_type, _DEFAULT_EVENT_TYPE)
+            session_id = input.session_id
 
-            # --- Fleet emit (fire-and-forget; no-op when unconfigured) ---
-            payload = self._build_payload(
-                agent_name, event_type, wire_event_type, input
-            )
-            self._schedule_post(payload)
+            # --- OTel spans (no-op when the OTLP endpoint is unset) ---
+            try:
+                run_span = self._ensure_run_span(session_id, agent_name, input)
+                if event_type == "PostToolUse" and input.tool_name:
+                    self._emit_tool_span(run_span, agent_name, input)
+                elif event_type in _TERMINAL_EVENTS:
+                    self._close_run_span(session_id)
+            except Exception as e:  # noqa: BLE001 - tracing must never break the agent
+                logger.debug("ObservabilityHook tracing error (non-fatal): %s", e)
 
-            # --- Prometheus counters (local operational metrics, kept here) ---
+            # --- Prometheus counters (local operational metrics, unchanged) ---
             if PROMETHEUS_AVAILABLE:
                 HOOK_EVENTS.labels(event_type=event_type).inc()
 
                 # Tool metrics from PostToolUse events
                 if event_type == "PostToolUse" and input.tool_name:
-                    success = payload.get("success", True)
+                    success = (
+                        input.tool_response.get("success", True)
+                        if isinstance(input.tool_response, dict)
+                        else True
+                    )
                     TOOL_CALLS.labels(
                         tool_name=input.tool_name, success=str(success)
                     ).inc()
