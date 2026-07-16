@@ -111,3 +111,7 @@ include = ["kestrel_feature_observability/**/*", "README.md", "LICENSE", "pyproj
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Ensure the package is importable from the repo root even when pytest is
+# invoked from a foreign environment where this package is not installed
+# (the verification gate runs a bare ``pytest -q`` off PATH).
+pythonpath = ["."]

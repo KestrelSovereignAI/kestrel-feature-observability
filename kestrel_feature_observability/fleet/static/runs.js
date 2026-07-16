@@ -14,12 +14,10 @@
 // orchestration, not the store) are an orchestration concern for a separate
 // surface and are deliberately absent here — no dead buttons.
 //
-// Registered via HostFeature.get_ui_contributions(); sovereign mounts this
-// module and serves the sibling static assets. Self-registers through the host
-// `ui-ext` registerPanel API. `capability: null` → host-always-on (sovereign
-// #2460), so the nav tab always renders.
-
-import { registerPanel } from "/js/ui-ext/panels.js";
+// A sub-view of the unified "Observability" console panel (observability.js);
+// the container imports and mounts/unmounts this view — it does not
+// self-register a top-level panel. `mount(container)` fills the supplied content
+// element and returns a handle whose `destroy()` unmounts it.
 
 const API_PREFIX = "/api/host/observability";
 
@@ -559,16 +557,3 @@ function ensureStyles() {
   document.head.appendChild(style);
   stylesInjected = true;
 }
-
-// ── Registration via the host ui-ext panel registry ──────────
-//
-// The host `registerPanel` (from /js/ui-ext/panels.js) expects a `panelId`
-// string and a lazy `render(bodyEl)` callback; `mount(container)` fills the
-// supplied panel body on first activation. Host panels are always-on
-// (`capability: null`), so no `gate` is declared — the nav tab always shows.
-
-registerPanel({
-  panelId: panel.id,
-  label: panel.title,
-  render: mount,
-});
