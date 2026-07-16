@@ -19,6 +19,8 @@
 // self-register a top-level panel. `mount(container)` fills the supplied content
 // element and returns a handle whose `destroy()` unmounts it.
 
+import API from "/js/api.js";
+
 const API_PREFIX = "/api/host/observability";
 
 // ── Utilities ─────────────────────────────────────────────────
@@ -132,19 +134,12 @@ export const panel = {
     if (orchestrator != null) params.set("orchestrator", orchestrator);
     if (since != null) params.set("since", since);
     const qs = params.toString();
-    const res = await fetch(`${API_PREFIX}/runs${qs ? "?" + qs : ""}`, {
-      credentials: "include",
-    });
-    if (!res.ok) throw new Error(`runs ${res.status}`);
-    return res.json();
+    // Authenticated host-root GET (attaches X-API-Key); returns parsed JSON.
+    return API.requestHost(`${API_PREFIX}/runs${qs ? "?" + qs : ""}`);
   },
 
   async fetchRunDetail(runId) {
-    const res = await fetch(`${API_PREFIX}/runs/${encodeURIComponent(runId)}`, {
-      credentials: "include",
-    });
-    if (!res.ok) throw new Error(`run ${res.status}`);
-    return res.json();
+    return API.requestHost(`${API_PREFIX}/runs/${encodeURIComponent(runId)}`);
   },
 
   // Fetch-based live stream, narrowed to one run via `workflow_run_id`.
@@ -153,10 +148,13 @@ export const panel = {
   async stream(runId, onEvent, { signal, lastEventId } = {}) {
     const params = new URLSearchParams();
     if (runId != null) params.set("workflow_run_id", runId);
+    // Raw fetch (needs the streaming Response body), but authenticated with the
+    // console's cached X-API-Key — the cookie alone is not accepted by the host.
     const headers = {};
+    const apiKey = API.getApiKey();
+    if (apiKey) headers["X-API-Key"] = apiKey;
     if (lastEventId) headers["Last-Event-ID"] = String(lastEventId);
     const res = await fetch(`${API_PREFIX}/stream?${params}`, {
-      credentials: "include",
       headers,
       signal,
     });
