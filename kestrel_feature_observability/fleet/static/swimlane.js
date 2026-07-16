@@ -13,6 +13,7 @@
 //
 // All pure grouping logic lives in swimlane.lanes.js (DOM-free, unit-tested).
 
+import API from "/js/api.js";
 import { buildLanes, nestLanes, ts } from "./swimlane.lanes.js";
 
 const API_PREFIX = "/api/host/observability";
@@ -65,27 +66,27 @@ export const panel = {
   capability: "observability-fleet",
 
   async fetchTree() {
-    const res = await fetch(`${API_PREFIX}/tree`, { credentials: "include" });
-    if (!res.ok) throw new Error(`tree ${res.status}`);
-    return res.json();
+    // Authenticated host-root GET (attaches X-API-Key); returns parsed JSON.
+    return API.requestHost(`${API_PREFIX}/tree`);
   },
 
   async fetchEvents({ orchestrator, subtree } = {}) {
     const params = new URLSearchParams({ limit: "1000" });
     if (orchestrator != null) params.set("orchestrator", orchestrator);
     if (subtree) params.set("subtree", "true");
-    const res = await fetch(`${API_PREFIX}/events?${params}`, { credentials: "include" });
-    if (!res.ok) throw new Error(`events ${res.status}`);
-    return res.json();
+    return API.requestHost(`${API_PREFIX}/events?${params}`);
   },
 
   // Fetch-based live stream. `onEvent(payload, id)` is called per event; resumes
   // from the last stream id after a reconnect via the Last-Event-ID header.
   async stream(onEvent, { signal, lastEventId } = {}) {
+    // Raw fetch (needs the streaming Response body), but authenticated with the
+    // console's cached X-API-Key — the cookie alone is not accepted by the host.
     const headers = {};
+    const apiKey = API.getApiKey();
+    if (apiKey) headers["X-API-Key"] = apiKey;
     if (lastEventId) headers["Last-Event-ID"] = String(lastEventId);
     const res = await fetch(`${API_PREFIX}/stream`, {
-      credentials: "include",
       headers,
       signal,
     });
