@@ -66,11 +66,13 @@ def test_get_ui_contributions_ships_single_observability_panel():
 
 
 def test_swimlane_and_runs_ship_as_container_sub_views():
-    """The Swimlane/Runs views ship as sibling assets, not registered panels.
+    """The legacy Swimlane/Runs views ship as static assets, not registered panels.
 
-    They are imported by ``observability.js`` (the container), so the files must
-    exist in the static dir but must not appear in ``modules`` (which lists only
-    separately-registered top-level panels).
+    After the OTel-native pivot (#37) the panel embeds Phoenix and no longer
+    imports these views, but the files still ship on disk (they are removed with
+    the store in a separate deprecation issue). They must exist in the static dir
+    but must not appear in ``modules`` (which lists only registered top-level
+    panels).
     """
     import os
 

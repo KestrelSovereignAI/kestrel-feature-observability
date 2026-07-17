@@ -138,7 +138,7 @@ class FleetObservabilityHostFeature(HostFeature):
     # -- UI -----------------------------------------------------------------
 
     def get_ui_contributions(self) -> Optional[UIContributions]:
-        """Ship the single "Observability" console panel (Swimlane / Runs subtabs)."""
+        """Ship the single "Observability" console panel (embedded Phoenix UI)."""
         import os
 
         static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -150,10 +150,11 @@ class FleetObservabilityHostFeature(HostFeature):
             # ``static_dir`` at ``/host/features/{slug}/static`` and resolves each
             # module as ``{mount}/{path}``, so the path is relative to the static
             # root (the file ships at ``static/observability.js``) — no ``slug``
-            # prefix here (the host already adds it) or the URL 404s. Only the
-            # container module is a registered top-level panel; it imports the
-            # ``swimlane.js`` and ``runs.js`` sub-views (shipped as sibling static
-            # assets) and swaps them into an internal sub-nav.
+            # prefix here (the host already adds it) or the URL 404s. The single
+            # panel module embeds the self-hosted Phoenix UI (``/phoenix/``) via
+            # an iframe (OTel-native pivot #32); the legacy ``swimlane.js`` /
+            # ``runs.js`` views still ship as static assets but are no longer
+            # imported (data-dead until the store-deprecation issue removes them).
             modules=["observability.js"],
             # Host panels are always-on; keep the capability gate off (the
             # sovereign gate bug is fixed separately in
