@@ -1,137 +1,74 @@
-// Fleet observability — unified "Observability" console panel.
+// Fleet observability — "Observability" console panel (embedded Phoenix).
 //
-// The single top-level host panel for the whole observability domain. It renders
-// an internal sub-nav (pill bar) and swaps the active sub-view — Swimlane, Runs,
-// and room for more — into a shared content area. Each sub-view is a module that
-// exports `mount(container)` (returning a handle with `destroy()`); the container
-// mounts the active view and unmounts it on switch/teardown, so only one view is
-// live at a time.
+// Part of the OTel-native pivot (#32): the console no longer renders traces
+// itself. The Observability tab is now a thin embed of the self-hosted Phoenix
+// UI that the host serves same-origin at `/phoenix/`.
 //
-// Registered via HostFeature.get_ui_contributions() as the *single* module in
-// UIContributions.modules; the view modules (swimlane.js, runs.js) are imported
-// here, not separately registered as top-level panels. `capability: null` →
-// host-always-on (sovereign #2460), so the nav tab always renders.
+// On mount we probe availability by minting an embed session:
+//   POST /api/host/phoenix/session  (authenticated via the console's standard
+//   header auth) sets an HttpOnly cookie scoped to `/phoenix` — no credentials
+//   ever appear in a URL. On success we mount a full-bleed
+//   `<iframe src="/phoenix/">` (the cookie authenticates it; same-origin, no
+//   CSP work). On 503/failure we render a friendly notice instead of a broken
+//   frame.
 //
-// Adding a future view is one entry in VIEWS below — no new top-level tab.
+// The old Swimlane/Runs sub-views are gone: the emitters stopped feeding the
+// custom store (hook 0.11.0 + talon#69 emit OTel only), so those views are
+// data-dead. Their modules stay on disk until the store-deprecation issue
+// removes them, but nothing imports them anymore.
+//
+// Registered via HostFeature.get_ui_contributions() as the single module in
+// UIContributions.modules. `capability: null` → host-always-on (sovereign
+// #2460), so the nav tab always renders.
 
 import { registerPanel } from "/js/ui-ext/panels.js";
-import { mount as mountSwimlane } from "./swimlane.js";
-import { mount as mountRuns } from "./runs.js";
+import API from "/js/api.js";
 
-// ── Sub-views ─────────────────────────────────────────────────
-//
-// Extensible registry: adding a view = one entry (id + label + mount).
-
-const VIEWS = [
-  { id: "swimlane", label: "Swimlane", mount: mountSwimlane },
-  { id: "runs", label: "Runs", mount: mountRuns },
-];
-
-const STORAGE_KEY = "kestrel.observability.subtab";
-
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-// Persisted selection survives reloads. URL hash (#observability/<id>) wins so a
-// link is shareable; localStorage is the fallback; else the first view.
-function readPersistedViewId() {
-  try {
-    const hash = (typeof location !== "undefined" && location.hash) || "";
-    const m = /#observability\/([\w-]+)/.exec(hash);
-    if (m && VIEWS.some((v) => v.id === m[1])) return m[1];
-  } catch {
-    /* ignore */
-  }
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored && VIEWS.some((v) => v.id === stored)) return stored;
-  } catch {
-    /* ignore */
-  }
-  return VIEWS[0].id;
-}
-
-function persistViewId(id) {
-  try {
-    localStorage.setItem(STORAGE_KEY, id);
-  } catch {
-    /* ignore */
-  }
-  try {
-    if (typeof location !== "undefined") {
-      location.hash = `observability/${id}`;
-    }
-  } catch {
-    /* ignore */
-  }
-}
+const PHOENIX_SESSION_PATH = "/api/host/phoenix/session";
+const PHOENIX_URL = "/phoenix/";
 
 // ── View / mount ──────────────────────────────────────────────
 
 export function mount(container) {
   ensureStyles();
 
-  let activeId = readPersistedViewId();
-  let handle = null; // handle returned by the active view's mount()
   let destroyed = false;
 
-  container.innerHTML = `
-    <div class="obs-panel">
-      <nav class="obs-subnav" role="tablist">
-        ${VIEWS.map(
-          (v) => `
-          <button class="obs-subnav__tab" role="tab" data-view="${escapeHtml(v.id)}">
-            ${escapeHtml(v.label)}
-          </button>`
-        ).join("")}
-      </nav>
-      <div class="obs-content" data-obs-content></div>
-    </div>`;
+  container.innerHTML = `<div class="obs-panel"><div class="obs-notice">Connecting to Phoenix…</div></div>`;
+  const panelEl = container.querySelector(".obs-panel");
 
-  const contentEl = container.querySelector("[data-obs-content]");
-
-  function unmountActive() {
-    try {
-      handle?.destroy?.();
-    } catch {
-      /* ignore */
-    }
-    handle = null;
-    if (contentEl) contentEl.innerHTML = "";
+  function renderIframe() {
+    if (destroyed || !panelEl) return;
+    // Full-bleed embed. The embed cookie set by the session mint authenticates
+    // it; same-origin `/phoenix/` needs no credentials in the URL.
+    const iframe = document.createElement("iframe");
+    iframe.className = "obs-frame";
+    iframe.src = PHOENIX_URL;
+    iframe.setAttribute("title", "Phoenix");
+    panelEl.replaceChildren(iframe);
   }
 
-  function mountView(id) {
-    const view = VIEWS.find((v) => v.id === id) || VIEWS[0];
-    activeId = view.id;
-    unmountActive();
-    // Reflect the active tab.
-    container.querySelectorAll("[data-view]").forEach((btn) => {
-      btn.classList.toggle("obs-subnav__tab--active", btn.dataset.view === activeId);
-    });
-    handle = view.mount(contentEl);
+  function renderNotice() {
+    if (destroyed || !panelEl) return;
+    panelEl.innerHTML = `
+      <div class="obs-notice">
+        <div class="obs-notice__title">Phoenix is not running on this host</div>
+        <div class="obs-notice__body">
+          Install <code>kestrel-sovereign[phoenix]</code> and restart, or set
+          <code>KESTREL_PHOENIX_ENABLED=1</code>.
+        </div>
+      </div>`;
   }
 
-  function switchTo(id) {
-    if (destroyed || id === activeId) return;
-    persistViewId(id);
-    mountView(id);
-  }
-
-  container.querySelectorAll("[data-view]").forEach((btn) => {
-    btn.addEventListener("click", () => switchTo(btn.dataset.view));
-  });
-
-  mountView(activeId);
+  // Probe availability by minting an embed session (sets the HttpOnly `/phoenix`
+  // cookie). Success → embed the UI; any failure → friendly notice.
+  API.requestHost(PHOENIX_SESSION_PATH, { method: "POST" })
+    .then(() => renderIframe())
+    .catch(() => renderNotice());
 
   return {
     destroy() {
       destroyed = true;
-      unmountActive();
     },
   };
 }
@@ -147,15 +84,13 @@ function ensureStyles() {
   style.setAttribute("data-observability", "");
   style.textContent = `
     .obs-panel { display:flex; flex-direction:column; height:100%; color:var(--color-text,#e2e8f0); }
-    .obs-subnav { display:flex; align-items:center; gap:4px; padding:6px 12px;
-                  border-bottom:1px solid var(--color-border,#334155); }
-    .obs-subnav__tab { background:transparent; color:var(--color-text-muted,#94a3b8);
-                       border:1px solid transparent; border-radius:999px; padding:4px 14px;
-                       cursor:pointer; font-size:13px; font-weight:600; }
-    .obs-subnav__tab:hover { background:var(--color-surface,#1e293b); color:var(--color-text,#e2e8f0); }
-    .obs-subnav__tab--active { background:var(--color-accent,#818cf8); color:#0b1120;
-                               border-color:var(--color-accent,#818cf8); }
-    .obs-content { flex:1; min-height:0; overflow:hidden; }
+    .obs-frame { flex:1; min-height:0; width:100%; border:0; }
+    .obs-notice { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+                  gap:8px; padding:24px; text-align:center; color:var(--color-text-muted,#94a3b8); }
+    .obs-notice__title { font-size:15px; font-weight:600; color:var(--color-text,#e2e8f0); }
+    .obs-notice__body { max-width:520px; line-height:1.5; }
+    .obs-notice code { font-family:ui-monospace,monospace; background:var(--color-surface,#1e293b);
+                       border:1px solid var(--color-border,#334155); border-radius:4px; padding:1px 5px; }
   `;
   document.head.appendChild(style);
   stylesInjected = true;
@@ -165,7 +100,7 @@ function ensureStyles() {
 //
 // A single always-on top-level panel. `registerPanel` expects a `panelId` and a
 // lazy `render(bodyEl)` callback; `mount(container)` fills the panel body and
-// renders the sub-nav on first activation.
+// embeds Phoenix (or the notice) on first activation.
 
 registerPanel({
   panelId: "observability",
