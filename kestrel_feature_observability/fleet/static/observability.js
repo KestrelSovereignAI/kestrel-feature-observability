@@ -12,10 +12,9 @@
 //   CSP work). On 503/failure we render a friendly notice instead of a broken
 //   frame.
 //
-// The old Swimlane/Runs sub-views are gone: the emitters stopped feeding the
-// custom store (hook 0.11.0 + talon#69 emit OTel only), so those views are
-// data-dead. Their modules stay on disk until the store-deprecation issue
-// removes them, but nothing imports them anymore.
+// The old Swimlane/Runs sub-views and the custom event store they read from are
+// gone: the emitters emit OTel only (hook 0.11.0 + talon#69) and the store/routes
+// were retired in the store-deprecation issue. This embed is the only UI module.
 //
 // Registered via HostFeature.get_ui_contributions() as the single module in
 // UIContributions.modules. `capability: null` → host-always-on (sovereign

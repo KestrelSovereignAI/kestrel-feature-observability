@@ -1,9 +1,0 @@
-{
-  "name": "kestrel-feature-observability",
-  "private": true,
-  "type": "module",
-  "description": "JS test harness for the fleet observability swimlane panel's pure grouping logic.",
-  "scripts": {
-    "test": "node --test"
-  }
-}
