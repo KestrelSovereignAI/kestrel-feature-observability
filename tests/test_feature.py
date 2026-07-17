@@ -1,59 +1,10 @@
-"""FleetObservabilityHostFeature lifecycle + discovery wiring."""
+"""FleetObservabilityHostFeature UI contribution + discovery wiring."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-import pytest
-
 from kestrel_feature_observability.fleet.feature import (
-    FLEET_TENANT_ID,
     FleetObservabilityHostFeature,
 )
-
-
-def _ctx(db_url: str) -> SimpleNamespace:
-    return SimpleNamespace(config={"observability_fleet_db_url": db_url})
-
-
-@pytest.mark.asyncio
-async def test_on_host_start_opens_store_and_stop_closes(db_url):
-    feature = FleetObservabilityHostFeature()
-    assert feature.store is None
-
-    await feature.on_host_start(_ctx(db_url))
-    assert feature.store is not None
-    assert feature.store.tenant_id == FLEET_TENANT_ID
-
-    # Round-trips through the live store.
-    ids = await feature.store.ingest(
-        [{"agent_name": "a", "session_id": "s", "event_type": "metric"}]
-    )
-    assert len(ids) == 1
-
-    await feature.on_host_stop(_ctx(db_url))
-    assert feature.store is None
-
-
-@pytest.mark.asyncio
-async def test_on_host_stop_is_idempotent(db_url):
-    feature = FleetObservabilityHostFeature()
-    # Safe to stop before ever starting.
-    await feature.on_host_stop(_ctx(db_url))
-    assert feature.store is None
-
-
-async def test_router_503_before_start(db_url):
-    pytest.importorskip("fastapi")
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    feature = FleetObservabilityHostFeature()
-    app = FastAPI()
-    app.include_router(feature.get_router())
-    with TestClient(app) as client:
-        resp = client.get("/api/host/observability/tree")
-        assert resp.status_code == 503
 
 
 def test_get_ui_contributions_ships_single_observability_panel():
@@ -65,24 +16,15 @@ def test_get_ui_contributions_ships_single_observability_panel():
     assert contributions.modules == ["observability.js"]
 
 
-def test_swimlane_and_runs_ship_as_container_sub_views():
-    """The legacy Swimlane/Runs views ship as static assets, not registered panels.
-
-    After the OTel-native pivot (#37) the panel embeds Phoenix and no longer
-    imports these views, but the files still ship on disk (they are removed with
-    the store in a separate deprecation issue). They must exist in the static dir
-    but must not appear in ``modules`` (which lists only registered top-level
-    panels).
-    """
+def test_no_retired_panels_ship_on_disk():
+    """The retired Swimlane/Runs views must no longer ship as static assets."""
     import os
 
     feature = FleetObservabilityHostFeature()
     contributions = feature.get_ui_contributions()
     assert contributions is not None
-    assert "swimlane.js" not in contributions.modules
-    assert "runs.js" not in contributions.modules
-    for view in ("swimlane.js", "runs.js"):
-        assert os.path.isfile(os.path.join(contributions.static_dir, view))
+    for view in ("swimlane.js", "swimlane.lanes.js", "runs.js"):
+        assert not os.path.isfile(os.path.join(contributions.static_dir, view))
 
 
 def test_ui_module_paths_are_mount_relative_and_shipped():
@@ -107,88 +49,30 @@ def test_ui_module_paths_are_mount_relative_and_shipped():
         assert os.path.isfile(shipped), shipped
 
 
-@pytest.mark.asyncio
-async def test_router_solo_default_when_no_resolver(db_url):
-    """INV-SOLO: with no resolver configured, the production router still works."""
-    pytest.importorskip("fastapi")
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    feature = FleetObservabilityHostFeature()
-    await feature.on_host_start(_ctx(db_url))
-    assert feature._tenant_resolver is None
-
-    app = FastAPI()
-    app.include_router(feature.get_router())
-    try:
-        with TestClient(app) as client:
-            resp = client.post(
-                "/api/host/observability/events",
-                json={"agent_name": "a", "session_id": "solo", "event_type": "metric"},
-            )
-            assert resp.status_code == 200
-            events = client.get("/api/host/observability/events").json()["events"]
-            assert {e["session_id"] for e in events} == {"solo"}
-    finally:
-        await feature.on_host_stop(_ctx(db_url))
-
-
-@pytest.mark.asyncio
-async def test_router_isolates_callers_via_host_supplied_resolver(db_url):
-    """A host-configured resolver flows through the production feature path and
-    isolates two callers' ingest+query (fail-closed)."""
-    import uuid
-
-    pytest.importorskip("fastapi")
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    tenant_a = uuid.uuid4()
-    tenant_b = uuid.uuid4()
-
-    def resolver(request):
-        return tenant_a if request.headers.get("X-Caller") == "a" else tenant_b
-
-    ctx = SimpleNamespace(
-        config={
-            "observability_fleet_db_url": db_url,
-            "observability_tenant_resolver": resolver,
-        }
-    )
-
-    feature = FleetObservabilityHostFeature()
-    await feature.on_host_start(ctx)
-    assert feature._tenant_resolver is resolver
-
-    app = FastAPI()
-    app.include_router(feature.get_router())
-    try:
-        with TestClient(app) as client:
-            client.post(
-                "/api/host/observability/events",
-                json={"agent_name": "a", "session_id": "from-a", "event_type": "metric"},
-                headers={"X-Caller": "a"},
-            )
-            client.post(
-                "/api/host/observability/events",
-                json={"agent_name": "b", "session_id": "from-b", "event_type": "metric"},
-                headers={"X-Caller": "b"},
-            )
-            a_events = client.get(
-                "/api/host/observability/events", headers={"X-Caller": "a"}
-            ).json()["events"]
-            b_events = client.get(
-                "/api/host/observability/events", headers={"X-Caller": "b"}
-            ).json()["events"]
-            assert {e["session_id"] for e in a_events} == {"from-a"}
-            assert {e["session_id"] for e in b_events} == {"from-b"}
-    finally:
-        await feature.on_host_stop(ctx)
-
-
 def test_entry_point_registered():
+    """``FleetObservabilityHostFeature`` stays on the ``host_features`` group.
+
+    Resolve from the installed distribution's entry-point metadata when it is
+    present; otherwise fall back to the packaging source of truth
+    (``pyproject.toml``). The verification gate runs a bare ``pytest -q`` off
+    PATH against the source tree (``pythonpath = ["."]`` in pyproject.toml),
+    where the package is importable but not pip-installed, so no ``*.dist-info``
+    entry-point metadata exists to enumerate. Either way the entry point must
+    remain declared and point at the fleet subpackage.
+    """
     from importlib.metadata import entry_points
 
-    eps = entry_points(group="kestrel_sovereign.host_features")
-    names = {ep.name for ep in eps}
-    assert "FleetObservabilityHostFeature" in names
+    group = "kestrel_sovereign.host_features"
+    registered = {ep.name: ep.value for ep in entry_points(group=group)}
+    if "FleetObservabilityHostFeature" not in registered:
+        import pathlib
+        import tomllib
+
+        pyproject = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        registered = data["project"]["entry-points"][group]
+
+    assert "FleetObservabilityHostFeature" in registered
+    assert registered["FleetObservabilityHostFeature"] == (
+        "kestrel_feature_observability.fleet:FleetObservabilityHostFeature"
+    )

@@ -7,18 +7,19 @@ entry-point group; auto-discovered when installed alongside
 kestrel-sovereign.
 
 The feature attaches an ``ObservabilityHook`` to the agent's hook
-system. Every lifecycle event is POSTed to the fleet host's
-observability store (the fleet feature owns the store, query routes,
-and UI). All mutations of Prometheus metrics happen via
-``kestrel_sdk.metrics``, so the feature shares the framework's metric
-registry — a single ``/metrics`` scrape stays coherent.
+system. Every lifecycle event is emitted as an OTel span (session run
+span → tool spans) via ``KestrelTracer``; the fleet host feature owns
+the embedded Phoenix UI that renders them. All mutations of Prometheus
+metrics happen via ``kestrel_sdk.metrics``, so the feature shares the
+framework's metric registry — a single ``/metrics`` scrape stays
+coherent.
 
 Install with the [metrics] extra to enable real Prometheus output:
 
     uv pip install 'kestrel-feature-observability[metrics]'
 
 Without prometheus-client installed, metric handles are no-ops and
-the hook still emits events to the fleet store.
+the hook still emits OTel spans.
 """
 
 from importlib.metadata import PackageNotFoundError, version as _version

@@ -3,9 +3,8 @@ Kestrel Observability Feature — always-on lifecycle event emitter.
 
 Auto-discovers via the feature system and registers the ``ObservabilityHook``,
 which emits an OTel trace (session → tool spans) per agent lifecycle via
-``KestrelTracer``. This package is producer-only: the fleet host feature owns any
-event store, query routes, and UI. Prometheus operational counters stay local to
-this package.
+``KestrelTracer``. This package is producer-only: the fleet host feature owns the
+embedded Phoenix UI. Prometheus operational counters stay local to this package.
 """
 
 import logging
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class ObservabilityFeature(Feature):
-    """Always-on observability. Emits all lifecycle events to the fleet store."""
+    """Always-on observability. Emits all lifecycle events as OTel spans."""
 
     def __init__(self, agent):
         super().__init__(agent)

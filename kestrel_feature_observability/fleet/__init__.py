@@ -2,48 +2,42 @@
 
 This subpackage ships the host-scoped ``FleetObservabilityHostFeature``
 (discovered via the ``kestrel_sovereign.host_features`` entry-point group) that
-owns the fleet-wide observability store, host-root ingest/query endpoints, a
-streamable live stream, and the orchestrator swimlane panel. It is the fleet
-*consumer*; the per-agent *producer* (the emitter hook) lives in the parent
-``kestrel_feature_observability`` package and carries **no** ``entities``
-dependency.
+ships the single "Observability" console panel embedding the host-supervised
+Phoenix UI. The per-agent *producer* (the emitter hook) lives in the parent
+``kestrel_feature_observability`` package.
 
-The store's heavy dependencies (``kestrel-feature-entities`` + SQLAlchemy) live
-behind the ``kestrel-feature-observability[fleet]`` extra. The imports below are
-**guarded**: on a base emitter install where the extra is absent, importing this
-subpackage degrades to ``FleetObservabilityHostFeature is None`` instead of
-raising, so the guarded ``host_features`` entry point simply resolves to ``None``
-and the host skips it.
+Since the custom store/entities were retired (issue #39), ``fleet/feature.py``
+imports only ``HostFeature``/``UIContributions`` from ``kestrel_sdk`` — so the
+host role is gated by the **SDK version**, not by an extra-only importable
+module. The ``[fleet]`` extra tightens the SDK pin (``>=0.30.0,<0.31``) to the
+range that exports that contract; the base install keeps a wider SDK floor
+(``>=0.14.1``). The import below is therefore **guarded**: on a modern SDK (the
+host env, or any base env whose SDK resolved to ``>=0.30``) it binds the real
+class, but if the resolved SDK is too old to export the HostFeature contract (or
+the symbols are moved/renamed) importing this subpackage degrades to
+``FleetObservabilityHostFeature is None`` — with a warning logged — instead of
+raising, so the ``host_features`` entry point resolves to ``None`` and the host
+simply skips the panel.
 """
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from kestrel_feature_observability.fleet.feature import (
-        FLEET_TENANT_ID,
         FleetObservabilityHostFeature,
     )
-    from kestrel_feature_observability.fleet.models import (
-        EVENT_TYPES,
-        GATE_EVENT_TYPES,
-        GATE_KINDS,
-        ObservabilityEvent,
-    )
-    from kestrel_feature_observability.fleet.redaction import redact_metadata
-    from kestrel_feature_observability.fleet.store import (
-        FleetObservabilityStore,
-        IngestError,
-    )
 
-    __all__ = [
-        "FleetObservabilityHostFeature",
-        "FLEET_TENANT_ID",
-        "FleetObservabilityStore",
-        "IngestError",
-        "ObservabilityEvent",
-        "EVENT_TYPES",
-        "GATE_EVENT_TYPES",
-        "GATE_KINDS",
-        "redact_metadata",
-    ]
-except ImportError:  # pragma: no cover - [fleet] extra (entities) not installed
+    __all__ = ["FleetObservabilityHostFeature"]
+except ImportError as exc:  # pragma: no cover - host SDK contract too old/absent
+    logger.warning(
+        "FleetObservabilityHostFeature unavailable: the host SDK contract "
+        "(kestrel_sdk.HostFeature/UIContributions) could not be imported (%s). "
+        "The Observability console panel will be skipped; install/upgrade to an "
+        "SDK that exports the HostFeature contract (kestrel-sovereign-sdk "
+        ">=0.30.0,<0.31, e.g. via the [fleet] extra).",
+        exc,
+    )
     FleetObservabilityHostFeature = None
     __all__ = ["FleetObservabilityHostFeature"]

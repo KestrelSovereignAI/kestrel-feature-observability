@@ -1,7 +1,7 @@
 [project]
 name = "kestrel-feature-observability"
-version = "0.12.0"
-description = "Observability feature for Kestrel Sovereign — a per-agent emitter that POSTs hook-driven lifecycle events to the fleet observability store, with a shared Prometheus registry"
+version = "0.13.0"
+description = "Observability feature for Kestrel Sovereign — a per-agent emitter that emits OTel spans for hook-driven lifecycle events, with a shared Prometheus registry"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
@@ -32,11 +32,11 @@ classifiers = [
 ]
 dependencies = [
     "kestrel-sovereign-sdk>=0.14.1,<1",
-    # Lightweight HTTP client for the fire-and-forget emitter POST to the
-    # fleet host's observability ingest. No entities/fleet dep.
+    # Lightweight HTTP client (used by tracing's OTLP/HTTP export transport). No
+    # fleet dep.
     "httpx>=0.27.0",
     # OTel-native instrumentation helper (OpenInference span builders + Kestrel
-    # attributes + OTLP/HTTP export). Lightweight — no entities/DB. Usable by the
+    # attributes + OTLP/HTTP export). Lightweight — no DB. Usable by the
     # per-agent hook and by talon; a no-op when no OTLP endpoint is configured.
     "opentelemetry-sdk>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
@@ -46,22 +46,18 @@ dependencies = [
 [project.optional-dependencies]
 # Pulls prometheus-client through the SDK's [metrics] extra so the
 # feature shares the framework's CollectorRegistry. Without this
-# extra installed, the feature still logs to the observability
-# store; only the Prometheus side becomes a no-op.
+# extra installed, the Prometheus side becomes a no-op.
 metrics = [
     "kestrel-sovereign-sdk[metrics]>=0.14.1,<1",
 ]
-# Host role: pulls the entities event store + the HostFeature contract so the
-# guarded `FleetObservabilityHostFeature` activates. Absent (a base emitter
-# install), the fleet subpackage degrades to a no-op and imports stay clean with
-# no `entities` pulled in.
+# Host role: pulls the HostFeature SDK contract so the guarded
+# `FleetObservabilityHostFeature` (the Phoenix-embed console panel) activates.
+# Absent (a base emitter install), the fleet subpackage degrades to a no-op.
 fleet = [
-    # HostFeature / HostContext / UIContributions contract. Tracks the host SDK
-    # range (kestrel-sovereign pins >=0.30.0,<0.31) so `[fleet]` installs into
-    # the host env without an unsatisfiable resolve.
+    # HostFeature / UIContributions contract. Tracks the host SDK range
+    # (kestrel-sovereign pins >=0.30.0,<0.31) so `[fleet]` installs into the host
+    # env without an unsatisfiable resolve.
     "kestrel-sovereign-sdk>=0.30.0,<0.31",
-    # Fleet event store: SQLAlchemy 2.0 async + Alembic, fail-closed tenant scoping.
-    "kestrel-feature-entities>=0.1,<1",
 ]
 test = [
     "pytest>=8.0.0",
@@ -70,10 +66,6 @@ test = [
     # the test env exercises both the emitter and the fleet role, so intersect
     # on it.
     "kestrel-sovereign-sdk[metrics]>=0.30.0,<0.31",
-    "kestrel-feature-entities>=0.1,<1",
-    # Host-root routers exercised via FastAPI TestClient; host-provided at runtime.
-    "fastapi>=0.110.0",
-    "httpx>=0.27.0",
 ]
 
 [project.urls]
@@ -87,18 +79,9 @@ ObservabilityFeature = "kestrel_feature_observability.feature:ObservabilityFeatu
 # Host-scoped feature discovery (the host runtime scans this group), NOT the
 # per-agent `kestrel_sovereign.features` group above. Guarded: the fleet
 # subpackage resolves this to `None` on a base install where the `[fleet]` extra
-# (entities) is absent, so the host simply skips it.
+# (the host SDK contract) is absent, so the host simply skips it.
 [project.entry-points."kestrel_sovereign.host_features"]
 FleetObservabilityHostFeature = "kestrel_feature_observability.fleet:FleetObservabilityHostFeature"
-
-# Entities discovery (only scanned by the entities CLI, which requires the
-# `[fleet]` extra): the ORM model module (so Alembic introspects it into the
-# merged metadata) and this package's local Alembic migration directory.
-[project.entry-points."kestrel_entities.models"]
-observability_fleet = "kestrel_feature_observability.fleet.models"
-
-[project.entry-points."kestrel_entities.migrations"]
-observability_fleet = "kestrel_feature_observability.fleet.migrations"
 
 [build-system]
 requires = ["hatchling"]
@@ -106,10 +89,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_observability"]
-# Ship the fleet console static bundle + Alembic revisions (non-.py package data).
+# Ship the fleet console static bundle (non-.py package data).
 artifacts = [
     "kestrel_feature_observability/fleet/static/**/*",
-    "kestrel_feature_observability/fleet/migrations/**/*",
 ]
 
 [tool.hatch.build.targets.sdist]

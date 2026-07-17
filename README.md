@@ -8,22 +8,28 @@ process boundaries):
 - **Base install** (`pip install kestrel-feature-observability`) — the
   lightweight per-agent **emitter** `Feature` (the `kestrel_sovereign.features`
   entry point). It attaches an `ObservabilityHook` to the agent's hook system;
-  every lifecycle event is POSTed to the fleet host's observability store
-  (`POST {KESTREL_OBSERVABILITY_URL}/api/host/observability/events`). No
-  `entities`, no DB — this is what every agent gets. Prometheus metrics emit
-  through the SDK's shared registry, so a single `/metrics` scrape stays
-  coherent across the framework + every feature package.
-- **Host extra** (`kestrel-feature-observability[fleet]`) — pulls
-  `kestrel-feature-entities` and enables the **`FleetObservabilityHostFeature`**
-  (tenant-scoped event store + query routes + orchestrator swimlane; the
-  `kestrel_sovereign.host_features` entry point). The HostFeature lives in the
-  `kestrel_feature_observability.fleet` subpackage and its import/entry point is
-  **guarded** — on a base install (extra absent) it resolves to `None` and the
-  host skips it, so the emitter path never imports `entities`.
+  every lifecycle event is emitted as an OpenTelemetry span (a session
+  `run_span` with child `tool_span`s) via `KestrelTracer`, exported over
+  OTLP/HTTP to whatever `OTEL_EXPORTER_OTLP_ENDPOINT` points at (e.g. a
+  host-supervised Phoenix). No DB — this is what every agent gets. Prometheus
+  metrics emit through the SDK's shared registry, so a single `/metrics` scrape
+  stays coherent across the framework + every feature package.
+- **Host extra** (`kestrel-feature-observability[fleet]`) — enables the
+  **`FleetObservabilityHostFeature`** (the `kestrel_sovereign.host_features`
+  entry point), which ships the single "Observability" console panel: a thin
+  embed of the host-supervised Phoenix UI. The HostFeature lives in the
+  `kestrel_feature_observability.fleet` subpackage. Since the custom
+  store/entities were retired, `fleet/feature.py` imports only the
+  `HostFeature`/`UIContributions` contract from `kestrel_sdk`, so the host role
+  is gated by the **SDK version**, not by an extra-only importable module: the
+  `[fleet]` extra tightens the SDK pin (`>=0.30.0,<0.31`) to the range that
+  exports that contract. The import/entry point stays **guarded** — if the
+  resolved SDK is too old to export the contract, it degrades to `None` (with a
+  warning logged) and the host skips the panel instead of crashing the feature
+  scan.
 
 > This package supersedes the separate `kestrel-feature-observability-fleet`
-> package, which is deprecated: its HostFeature, store, and swimlane now live
-> here behind the `[fleet]` extra.
+> package, which is deprecated.
 
 ## Installation
 
@@ -37,7 +43,7 @@ For real Prometheus output:
 uv pip install 'kestrel-feature-observability[metrics]'
 ```
 
-For the fleet host role (event store + swimlane):
+For the fleet host role (the Phoenix-embed console panel):
 
 ```bash
 uv pip install 'kestrel-feature-observability[fleet]'
@@ -50,37 +56,39 @@ on the host and `FleetObservabilityHostFeature` registers at host scope.
 
 ## Emitter transport
 
-The hook reads two **frozen** env vars (the same keys talon's emitter uses):
+The hook emits OpenTelemetry spans via `KestrelTracer`
+(`kestrel_feature_observability.tracing`), exported over OTLP/HTTP. Endpoint
+discovery is OTel-standard:
 
-- `KESTREL_OBSERVABILITY_URL` — the fleet host root. The hook POSTs to this URL
-  plus the path `/api/host/observability/events`. When unset, the emit path is a
-  **no-op** (the agent still runs; Prometheus counters still fire).
-- `KESTREL_OBSERVABILITY_KEY` — sent as the `X-API-Key` request header when set.
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` — a full traces endpoint (used as-is), or
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — a base endpoint (the exporter appends
+  `/v1/traces`), e.g. the host-supervised local Phoenix.
+- `OTEL_EXPORTER_OTLP_HEADERS` — honored for auth.
 
-Delivery is lightweight and best-effort: an `httpx.AsyncClient` POST,
-fire-and-forget with a short (~2s) timeout, **all failures swallowed, no
-buffering, no retry, no `entities` dependency**. Each event payload carries
-`orchestrator`/`session_id`/`tool_name`/lineage and friends; `orchestrator` is
-the agent itself when self-driven, else `null` (rendered "Direct" by the fleet
-store).
+When no OTLP endpoint is configured the tracer is a **no-op** — no provider, no
+exporter, no network — so the emit path costs nothing and the agent runs
+unaffected (Prometheus counters still fire locally). A session `run_span` is
+opened lazily on the first lifecycle event and closed on `Stop`/`AgentTerminate`;
+each `PostToolUse` emits a child `tool_span` carrying tool name, real duration,
+and success. `orchestrator` is the agent itself when self-driven, else inherited.
 
 ## Privacy
 
-The hook is observational — it never blocks, denies, or modifies. User-message content is **not** sent (only length); tool errors are truncated to 200 chars; exceptions in the hook are swallowed so they cannot affect agent operation.
+The hook is observational — it never blocks, denies, or modifies. User-message content is **not** recorded (never stamped on any span); tool errors are truncated to 200 chars; exceptions in the hook are swallowed so they cannot affect agent operation.
 
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `Hook`, and shared `metrics` module
-- `httpx>=0.27.0` — lightweight HTTP client for the emitter POST
+- `httpx>=0.27.0` — lightweight HTTP client (OTLP/HTTP export transport)
+- `opentelemetry-sdk` + `opentelemetry-exporter-otlp-proto-http` +
+  `openinference-semantic-conventions` — the OTel span builders + OTLP export
 - Optional `[metrics]` extra → `kestrel-sovereign-sdk[metrics]` → `prometheus-client`
-- Optional `[fleet]` extra → `kestrel-sovereign-sdk>=0.29.2,<0.30` (the HostFeature
-  contract) + `kestrel-feature-entities` (the tenant-scoped event store, pulling
-  SQLAlchemy 2.0 async + Alembic). Only this extra pulls `entities`.
+- Optional `[fleet]` extra → `kestrel-sovereign-sdk>=0.30.0,<0.31` (the HostFeature
+  contract for the Phoenix-embed console panel). No DB.
 
 The base emitter has **no** runtime dependency on `kestrel-sovereign` (or any
-`entities`/fleet package); the hook talks to the fleet host purely over HTTP.
-The store's heavy dependencies live entirely behind the `[fleet]` extra, so
-agents stay lightweight.
+fleet package); it emits OTel spans over OTLP/HTTP. The `[fleet]` extra adds only
+the host SDK contract for the embed panel, so agents stay lightweight.
 
 ## Development
 
