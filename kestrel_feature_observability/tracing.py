@@ -87,6 +87,14 @@ try:
 except Exception:  # noqa: BLE001 - fall back to the literal convention string
     _OI_PROJECT_NAME_KEY = "openinference.project.name"
 
+# Public OpenInference span-kind constants (stable across the SDK-present and
+# fallback paths above) so callers can emit an arbitrary-kind completed span via
+# :meth:`KestrelTracer.emit_span` without reaching into module-private names.
+KIND_AGENT = _KIND_AGENT
+KIND_CHAIN = _KIND_CHAIN
+KIND_TOOL = _KIND_TOOL
+KIND_LLM = _KIND_LLM
+
 # --- Standard Kestrel span/resource attribute keys. ``kestrel.repo`` is
 # --- first-class (grouping/filtering by repo), NOT a tenancy knob. -----------
 KESTREL_REPO = "kestrel.repo"
@@ -357,6 +365,28 @@ class KestrelTracer:
         """
         return self._start_span(name, _KIND_AGENT, **kwargs)
 
+    def emit_span(
+        self,
+        name: str,
+        kind: str,
+        *,
+        parent: Optional[Any] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Emit a completed span of an arbitrary OpenInference ``kind``.
+
+        Started and immediately ended (never made current), parented to
+        ``parent`` (a live *or already-ended* span — only its ``SpanContext``
+        is read, so referencing an already-exported root is valid). ``start_time``
+        / ``end_time`` are epoch-ns. Returns the ended span so the caller can
+        reuse its ``SpanContext`` as the parent of later children.
+        """
+        span = self._start_span(name, kind, parent=parent, start_time=start_time, **kwargs)
+        span.end(end_time=end_time)
+        return span
+
     def emit_tool_span(
         self,
         name: str,
@@ -373,11 +403,14 @@ class KestrelTracer:
         tool runtime (a correct Phoenix/waterfall) rather than ~0. The span is
         started and immediately ended; the caller does not manage its lifetime.
         """
-        span = self._start_span(
-            name, _KIND_TOOL, parent=parent, start_time=start_time, **kwargs
+        return self.emit_span(
+            name,
+            _KIND_TOOL,
+            parent=parent,
+            start_time=start_time,
+            end_time=end_time,
+            **kwargs,
         )
-        span.end(end_time=end_time)
-        return span
 
     # ------------------------------------------------------------------
     # Span builders — one ``with`` each, auto-nesting via OTel context.
@@ -525,4 +558,8 @@ __all__ = [
     "KESTREL_STAGE",
     "KESTREL_AGENT_NAME",
     "DEFAULT_OTEL_PROJECT",
+    "KIND_AGENT",
+    "KIND_CHAIN",
+    "KIND_TOOL",
+    "KIND_LLM",
 ]

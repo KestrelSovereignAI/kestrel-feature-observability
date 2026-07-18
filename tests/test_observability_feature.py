@@ -282,6 +282,385 @@ class TestToolSpanDuration:
 
 
 # ---------------------------------------------------------------------------
+# 3d. Negative durations — never emit start > end (#42 defect 2)
+# ---------------------------------------------------------------------------
+
+class TestNoNegativeDurations:
+    @pytest.mark.asyncio
+    async def test_duration_present_is_non_negative(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=42, tool_response={"success": True},
+            )
+        )
+        tool = _by_name(exporter.get_finished_spans())["Bash"]
+        assert tool.end_time >= tool.start_time
+        assert tool.end_time - tool.start_time == 42 * 1_000_000
+
+    @pytest.mark.asyncio
+    async def test_missing_duration_is_zero_duration_not_negative(self):
+        # The scheduler path never stamps execution_time_ms; the fallback must be
+        # a zero-duration point span (start == end), NEVER start > end (#42).
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=None, tool_response={"success": True},
+            )
+        )
+        tool = _by_name(exporter.get_finished_spans())["Bash"]
+        assert tool.end_time == tool.start_time
+        assert tool.end_time >= tool.start_time
+
+    @pytest.mark.asyncio
+    async def test_scheduler_work_tick_without_duration_is_non_negative(self):
+        # Real scheduler cron span: session_id="scheduler", no execution_time_ms,
+        # and the real serialized ToolResult envelope (counters under `data`).
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response={
+                    "status": "ok",
+                    "confirmation": "restart_coordinator: pending=1 executed=1",
+                    "data": {"pending": 1, "executed": [{"request_id": "r1"}]},
+                    "tool": "restart_coordinator",
+                    "success": True,
+                },
+            )
+        )
+        tool = _by_name(exporter.get_finished_spans())["restart_coordinator"]
+        assert tool.end_time >= tool.start_time
+
+
+# ---------------------------------------------------------------------------
+# 3e. Scheduler no-op tick noise filter (#42 defect 1)
+# ---------------------------------------------------------------------------
+
+class TestSchedulerNoiseFilter:
+    # These exercise the REAL production contract: the every-minute
+    # ``restart_coordinator`` cron ACTION goes through the scheduler's tool-lookup
+    # path (it is a feature @tool, not a builtin_handler), so it fires the
+    # PostToolUse hook with ``session_id="scheduler"`` and a serialized
+    # ``ToolResult`` envelope — outcome ``status`` at the top level, work counters
+    # nested under ``data`` (verified against kestrel-sovereign
+    # restart_coordinator/feature.py + the tool wrapper's ToolResult.to_dict()).
+
+    # The exact idle envelope restart_coordinator emits every idle minute — the
+    # 81%-noise no-op the issue targets.
+    IDLE_RESPONSE = {
+        "status": "ok",
+        "confirmation": "No pending restart requests",
+        "data": {"executed": False, "pending": 0},
+        "tool": "restart_coordinator",
+        "success": True,
+    }
+
+    @pytest.mark.asyncio
+    async def test_idle_restart_coordinator_tick_emits_no_spans(self):
+        # The real every-minute no-op: counters (executed) live under `data`, not
+        # at the top level. A top-level-only scan would miss them and emit — this
+        # asserts the nested-envelope filter actually drops the noise.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response=self.IDLE_RESPONSE,
+            )
+        )
+        assert exporter.get_finished_spans() == ()
+
+    @pytest.mark.asyncio
+    async def test_noop_tick_with_nested_idle_status_emits_no_spans(self):
+        # A tool that stamps an explicit idle marker inside its `data` payload.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="signal_dispatch",
+                tool_response={
+                    "status": "ok",
+                    "confirmation": "Nothing to dispatch",
+                    "data": {"outcome": "idle", "dispatched": 0},
+                    "tool": "signal_dispatch",
+                    "success": True,
+                },
+            )
+        )
+        assert exporter.get_finished_spans() == ()
+
+    @pytest.mark.asyncio
+    async def test_tick_that_executed_work_emits_span(self):
+        # restart_coordinator that actually executed a restart: `data.executed`
+        # is a non-empty list.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response={
+                    "status": "ok",
+                    "confirmation": "restart_coordinator: pending=1 executed=1 deferred=0",
+                    "data": {
+                        "pending": 1,
+                        "executed": [{"request_id": "r1"}],
+                        "deferred": [],
+                    },
+                    "tool": "restart_coordinator",
+                    "success": True,
+                },
+            )
+        )
+        assert (
+            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
+            is not None
+        )
+
+    @pytest.mark.asyncio
+    async def test_tick_that_only_deferred_emits_span(self):
+        # A tick that deferred (but executed nothing) still did work.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response={
+                    "status": "ok",
+                    "confirmation": "restart_coordinator: pending=1 executed=0 deferred=1",
+                    "data": {
+                        "pending": 1,
+                        "executed": [],
+                        "deferred": [{"request_id": "r1", "reason": "unsafe"}],
+                    },
+                    "tool": "restart_coordinator",
+                    "success": True,
+                },
+            )
+        )
+        assert (
+            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
+            is not None
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_tick_emits_span(self):
+        # A tick that "failed something" is always worth a span. The ERROR
+        # envelope carries status="error" (+ success=False from the in-tree
+        # wrapper); its data counters are zero but the failure still emits.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response={
+                    "status": "error",
+                    "error": "Restart coordinator storage unavailable",
+                    "data": {"executed": False, "pending": 0},
+                    "tool": "restart_coordinator",
+                    "success": False,
+                },
+            )
+        )
+        assert (
+            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
+            is not None
+        )
+
+    @pytest.mark.asyncio
+    async def test_external_error_without_top_level_success_emits_span(self):
+        # External features use the SDK tool wrapper, which spreads to_dict() but
+        # does NOT add a top-level `success` — only `status`. An errored tick must
+        # still emit (success derived from status="error"), and never be dropped
+        # as a zero-counter no-op.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="ext_action",
+                tool_response={
+                    "status": "error",
+                    "error": "boom",
+                    "data": {"executed": False},
+                    "tool": "ext_action",
+                },
+            )
+        )
+        assert _by_name(exporter.get_finished_spans()).get("ext_action") is not None
+
+    @pytest.mark.asyncio
+    async def test_env_opt_in_traces_noop_ticks(self):
+        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response=self.IDLE_RESPONSE,
+            )
+        )
+        assert (
+            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
+            is not None
+        )
+
+    @pytest.mark.asyncio
+    async def test_filter_is_scheduler_only(self):
+        # A normal agent tool call always emits, even with an idle no-op response.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="restart_coordinator",
+                tool_response=self.IDLE_RESPONSE,
+            )
+        )
+        assert (
+            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
+            is not None
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3e-bis. tool.success derived from ToolResult status (#42 P3)
+# ---------------------------------------------------------------------------
+
+class TestToolSuccessDerivation:
+    @pytest.mark.asyncio
+    async def test_error_envelope_without_success_key_stamps_false(self):
+        # External-feature ToolResult (SDK wrapper) has no top-level `success` —
+        # only `status`. tool.success must be derived from status="error", not
+        # default to True.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="ext_action",
+                tool_response={
+                    "status": "error",
+                    "error": "boom",
+                    "data": {},
+                    "tool": "ext_action",
+                },
+            )
+        )
+        tool = _by_name(exporter.get_finished_spans())["ext_action"]
+        assert tool.attributes["tool.success"] is False
+        assert tool.attributes["tool.error"] == "boom"
+
+    @pytest.mark.asyncio
+    async def test_partial_and_ok_status_are_success(self):
+        # PARTIAL succeeded enough to produce a confirmation → success=True.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="ext_action",
+                tool_response={
+                    "status": "partial",
+                    "confirmation": "Saved with degraded indexing",
+                    "error": "index lag",
+                    "tool": "ext_action",
+                },
+            )
+        )
+        tool = _by_name(exporter.get_finished_spans())["ext_action"]
+        assert tool.attributes["tool.success"] is True
+
+    @pytest.mark.asyncio
+    async def test_summary_success_ratio_reflects_status_only_envelopes(self):
+        # Two external ToolResult ticks (no top-level `success`): one ok, one
+        # error. The summary success_ratio must be 0.5, not 1.0.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="a",
+                tool_response={"status": "ok", "confirmation": "done", "tool": "a"},
+            )
+        )
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="b",
+                tool_response={"status": "error", "error": "nope", "tool": "b"},
+            )
+        )
+        await hook.execute(_make_input("Stop"))
+        summary = _by_name(exporter.get_finished_spans())["session summary"]
+        assert summary.attributes["kestrel.success_ratio"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# 3f. Session root exported immediately + summary span (#42 defect 3)
+# ---------------------------------------------------------------------------
+
+class TestSessionRootAndSummary:
+    @pytest.mark.asyncio
+    async def test_root_exported_immediately_before_children(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        # Root (session-marker) is exported right away — no held-open span.
+        assert [s.name for s in exporter.get_finished_spans()] == ["test-agent"]
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        spans = exporter.get_finished_spans()
+        names = [s.name for s in spans]
+        assert names.index("test-agent") < names.index("Bash")
+        root, child = _by_name(spans)["test-agent"], _by_name(spans)["Bash"]
+        assert child.parent.span_id == root.context.span_id
+        assert child.context.trace_id == root.context.trace_id
+
+    @pytest.mark.asyncio
+    async def test_child_exports_without_terminal_event(self):
+        # No held-open span: root + child are exported even with no Stop.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=1, tool_response={"success": True},
+            )
+        )
+        spans = _by_name(exporter.get_finished_spans())
+        assert spans.get("test-agent") is not None
+        assert spans.get("Bash") is not None
+
+    @pytest.mark.asyncio
+    async def test_summary_parented_to_root_carries_totals(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="a",
+                execution_time_ms=1, tool_response={"success": True},
+            )
+        )
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="b",
+                execution_time_ms=1, tool_response={"success": False},
+            )
+        )
+        await hook.execute(_make_input("Stop"))
+        spans = _by_name(exporter.get_finished_spans())
+        root, summary = spans["test-agent"], spans["session summary"]
+        assert summary.parent.span_id == root.context.span_id
+        assert summary.context.trace_id == root.context.trace_id
+        assert summary.attributes["kestrel.tool_count"] == 2
+        assert summary.attributes["kestrel.success_ratio"] == 0.5
+        assert summary.attributes["openinference.span.kind"] == "CHAIN"
+        assert summary.end_time >= summary.start_time
+
+
+# ---------------------------------------------------------------------------
 # 4. No-op when unconfigured
 # ---------------------------------------------------------------------------
 
@@ -360,7 +739,7 @@ class TestFeatureInitialization:
         assert feature.get_hooks() == []
 
     @pytest.mark.asyncio
-    async def test_shutdown_closes_open_run_spans(self):
+    async def test_shutdown_emits_summary_for_open_sessions(self):
         provider = TracerProvider()
         exporter = InMemorySpanExporter()
         provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -374,11 +753,15 @@ class TestFeatureInitialization:
             await feature.initialize()
         hook = feature.get_hooks()[0]
         await hook.execute(_make_input("SessionStart"))
-        # Run span still open → not yet exported.
-        assert exporter.get_finished_spans() == ()
-        await feature.shutdown()
-        # Defensive close on shutdown flushes the held run span.
+        # The session root (marker) is exported IMMEDIATELY — never held open.
         assert _by_name(exporter.get_finished_spans()).get("test-agent") is not None
+        # No summary yet (session still live).
+        assert _by_name(exporter.get_finished_spans()).get("session summary") is None
+        await feature.shutdown()
+        # Defensive close on shutdown flushes the session summary span.
+        assert (
+            _by_name(exporter.get_finished_spans()).get("session summary") is not None
+        )
 
     def test_feature_tool_description(self):
         feature = ObservabilityFeature(_make_agent())
