@@ -64,6 +64,10 @@ discovery is OTel-standard:
 - `OTEL_EXPORTER_OTLP_ENDPOINT` — a base endpoint (the exporter appends
   `/v1/traces`), e.g. the host-supervised local Phoenix.
 - `OTEL_EXPORTER_OTLP_HEADERS` — honored for auth.
+- `KESTREL_OTEL_PROJECT` — the Phoenix project spans land in, stamped as the
+  `openinference.project.name` Resource attribute. Defaults to `kestrel-fleet`,
+  which the fleet console's curated Observability panel deep-links to — so
+  per-agent hook traces show up there instead of Phoenix's "default" project.
 
 When no OTLP endpoint is configured the tracer is a **no-op** — no provider, no
 exporter, no network — so the emit path costs nothing and the agent runs

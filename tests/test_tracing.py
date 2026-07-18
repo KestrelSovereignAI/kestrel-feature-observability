@@ -10,6 +10,8 @@ Covers:
 6. LLM span carries input.value / output.value / llm.model_name.
 """
 
+import pathlib
+import re
 from unittest.mock import patch
 
 from opentelemetry.sdk.trace import TracerProvider
@@ -17,6 +19,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from kestrel_feature_observability.tracing import (
+    DEFAULT_OTEL_PROJECT,
     KESTREL_AGENT_NAME,
     KESTREL_ORCHESTRATOR,
     KESTREL_REPO,
@@ -25,6 +28,8 @@ from kestrel_feature_observability.tracing import (
     KestrelTracer,
     configure,
 )
+
+_PROJECT_NAME_ATTR = "openinference.project.name"
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +259,76 @@ class TestAttributeResolution:
 # ---------------------------------------------------------------------------
 # 6. LLM span I/O attributes
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 7. openinference.project.name Resource attribute (obs#41)
+# ---------------------------------------------------------------------------
+
+class TestProjectName:
+    def _resource_attrs(self, t):
+        """Resource attributes on the configured tracer's provider."""
+        return dict(t._tracer.resource.attributes)
+
+    def test_defaults_to_kestrel_fleet_when_unset(self):
+        # No KESTREL_OTEL_PROJECT → the shared default so the emitter and the
+        # fleet embed's deep-link agree out of the box.
+        assert DEFAULT_OTEL_PROJECT == "kestrel-fleet"
+        with patch.dict(
+            "os.environ",
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:6006"},
+            clear=True,
+        ):
+            t = configure()
+        assert self._resource_attrs(t)[_PROJECT_NAME_ATTR] == "kestrel-fleet"
+
+    def test_env_var_overrides_default(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:6006",
+                "KESTREL_OTEL_PROJECT": "team-alpha",
+            },
+            clear=True,
+        ):
+            t = configure()
+        assert self._resource_attrs(t)[_PROJECT_NAME_ATTR] == "team-alpha"
+
+    def test_explicit_resource_attribute_wins(self):
+        # Canonical key passed via resource_attributes beats env + default.
+        with patch.dict(
+            "os.environ",
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:6006",
+                "KESTREL_OTEL_PROJECT": "from-env",
+            },
+            clear=True,
+        ):
+            t = configure(resource_attributes={_PROJECT_NAME_ATTR: "explicit"})
+        assert self._resource_attrs(t)[_PROJECT_NAME_ATTR] == "explicit"
+
+    def test_project_is_not_stamped_as_span_attribute(self):
+        # It's a Resource attribute (how Phoenix routes projects), not per-span.
+        t, exporter = _memory_tracer()
+        with t.run_span("run"):
+            pass
+        span = exporter.get_finished_spans()[0]
+        assert _PROJECT_NAME_ATTR not in span.attributes
+
+    def test_js_deep_link_default_matches_python_default(self):
+        # Single source of truth guard: the fleet embed's DEFAULT_PROJECT must
+        # match tracing.DEFAULT_OTEL_PROJECT or the curated panel deep-links to a
+        # different (empty) Phoenix project than the hook writes to.
+        js = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "kestrel_feature_observability"
+            / "fleet"
+            / "static"
+            / "observability.js"
+        ).read_text(encoding="utf-8")
+        m = re.search(r'const\s+DEFAULT_PROJECT\s*=\s*"([^"]+)"', js)
+        assert m is not None, "DEFAULT_PROJECT constant not found in observability.js"
+        assert m.group(1) == DEFAULT_OTEL_PROJECT
+
 
 class TestLLMSpan:
     def test_llm_span_carries_io_and_model(self):

@@ -77,6 +77,16 @@ except Exception:  # noqa: BLE001 - fall back to the literal convention strings
     _KIND_TOOL = "TOOL"
     _KIND_LLM = "LLM"
 
+# --- OpenInference project-name Resource attribute. Phoenix routes traces into
+# --- projects by this Resource attribute; stamping it keeps per-agent hook
+# --- traces in the named project the fleet embed deep-links to (obs#41). ------
+try:
+    from openinference.semconv.resource import ResourceAttributes as _OIResource
+
+    _OI_PROJECT_NAME_KEY = _OIResource.PROJECT_NAME
+except Exception:  # noqa: BLE001 - fall back to the literal convention string
+    _OI_PROJECT_NAME_KEY = "openinference.project.name"
+
 # --- Standard Kestrel span/resource attribute keys. ``kestrel.repo`` is
 # --- first-class (grouping/filtering by repo), NOT a tenancy knob. -----------
 KESTREL_REPO = "kestrel.repo"
@@ -89,6 +99,16 @@ KESTREL_AGENT_NAME = "kestrel.agent_name"
 _REPO_ENV = "KESTREL_REPO"
 _RUN_ID_ENV = "KESTREL_RUN_ID"
 _ORCHESTRATOR_ENV = "KESTREL_ORCHESTRATOR"
+
+# --- Phoenix project selection. ``KESTREL_OTEL_PROJECT`` picks the Phoenix
+# --- project the emitter writes into (stamped as the ``openinference.project.name``
+# --- Resource attribute). Defaults to ``DEFAULT_OTEL_PROJECT`` so per-agent hook
+# --- traces land in the same named project as everything else instead of
+# --- Phoenix's "default". This MUST match the deep-link default in the fleet
+# --- embed (``fleet/static/observability.js`` → ``DEFAULT_PROJECT``) so the
+# --- curated Observability panel opens the very project these spans populate.
+_OTEL_PROJECT_ENV = "KESTREL_OTEL_PROJECT"
+DEFAULT_OTEL_PROJECT = "kestrel-fleet"
 
 # --- Standard OTLP endpoint env vars (drive the no-op-when-unset behavior). --
 _TRACES_ENDPOINT_ENV = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
@@ -114,6 +134,22 @@ def _resolve_endpoint(endpoint: Optional[str]) -> Optional[str]:
         or os.environ.get(_ENDPOINT_ENV)
         or None
     )
+
+
+def _resolve_project(resource_attributes: Optional[Mapping[str, str]]) -> str:
+    """Resolve the Phoenix project name: explicit override → env → default.
+
+    An explicit ``resource_attributes`` value wins (accepted under the canonical
+    ``openinference.project.name`` key or the ``project`` shorthand), else
+    ``KESTREL_OTEL_PROJECT``, else :data:`DEFAULT_OTEL_PROJECT` (``kestrel-fleet``)
+    so the emitter and the curated fleet embed agree out of the box.
+    """
+    if resource_attributes:
+        for key in (_OI_PROJECT_NAME_KEY, "project", "project_name"):
+            value = resource_attributes.get(key)
+            if value:
+                return value
+    return os.environ.get(_OTEL_PROJECT_ENV) or DEFAULT_OTEL_PROJECT
 
 
 def _env_defaults() -> Dict[str, str]:
@@ -397,8 +433,12 @@ def configure(
 
     Process-global identity (``KESTREL_REPO`` / ``KESTREL_RUN_ID`` /
     ``KESTREL_ORCHESTRATOR``) becomes Resource + default span attributes;
-    ``resource_attributes`` overrides those. Auth headers come from
-    ``OTEL_EXPORTER_OTLP_HEADERS`` (read by the exporter) or the ``headers`` arg.
+    ``resource_attributes`` overrides those. The Phoenix project is stamped as the
+    ``openinference.project.name`` Resource attribute from ``KESTREL_OTEL_PROJECT``
+    (default :data:`DEFAULT_OTEL_PROJECT` — ``kestrel-fleet``), so traces land in
+    the named project the fleet embed deep-links to rather than Phoenix's
+    "default". Auth headers come from ``OTEL_EXPORTER_OTLP_HEADERS`` (read by the
+    exporter) or the ``headers`` arg.
     """
     defaults = _env_defaults()
     if resource_attributes:
@@ -456,13 +496,19 @@ def _resource_attrs(
         attrs[KESTREL_ORCHESTRATOR] = defaults["orchestrator"]
     if defaults.get("run_id"):
         attrs[KESTREL_RUN_ID] = defaults["run_id"]
+    # Phoenix routes traces into projects by this Resource attribute; stamp it
+    # (KESTREL_OTEL_PROJECT → default "kestrel-fleet") so per-agent hook traces
+    # land in the same named project the fleet embed deep-links to (obs#41).
+    attrs[_OI_PROJECT_NAME_KEY] = _resolve_project(resource_attributes)
     if resource_attributes:
         # Pass through any extra caller-supplied resource attributes verbatim
         # (skip the identity keys — shorthand *and* canonical — already resolved
-        # into ``defaults`` above and stamped from there).
+        # into ``defaults`` above and stamped from there, plus the project keys
+        # already resolved into ``openinference.project.name``).
         _identity_keys = frozenset(
             ("repo", "run_id", "orchestrator",
-             KESTREL_REPO, KESTREL_RUN_ID, KESTREL_ORCHESTRATOR)
+             KESTREL_REPO, KESTREL_RUN_ID, KESTREL_ORCHESTRATOR,
+             _OI_PROJECT_NAME_KEY, "project", "project_name")
         )
         for key, value in resource_attributes.items():
             if key not in _identity_keys and value is not None:
@@ -478,4 +524,5 @@ __all__ = [
     "KESTREL_RUN_ID",
     "KESTREL_STAGE",
     "KESTREL_AGENT_NAME",
+    "DEFAULT_OTEL_PROJECT",
 ]
