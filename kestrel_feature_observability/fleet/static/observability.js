@@ -1,9 +1,18 @@
-// Fleet observability — "Observability" console panel (embedded Phoenix).
+// Fleet observability — "Observability" console panel.
 //
-// Part of the OTel-native pivot (#32): the console no longer renders traces
-// itself. The Observability tab is now a thin embed of the self-hosted Phoenix
-// UI that the host serves same-origin at `/phoenix/`.
+// Part of the OTel pivot (#32): a single top-level host panel with a two-item
+// sub-nav (#46, reintroducing the pre-#37 subtab container pattern minimally):
 //
+//   Navigator (default) — the hierarchical fleet drill-down
+//     (Tenant → Fleet → Agent → Subagent → Session → Turn → Events) rendered
+//     kestrel-native over Phoenix's GraphQL (see ./navigator.js).
+//   Phoenix — the curated same-origin Phoenix embed (unchanged from #41),
+//     which the navigator's per-trace "open in Phoenix" links deep-link into.
+//
+// Selection persists (URL hash `#observability/<id>` wins so links are
+// shareable; localStorage is the fallback; else Navigator).
+//
+// ── Phoenix embed subtab ──
 // On mount we probe availability by minting an embed session:
 //   POST /api/host/phoenix/session  (authenticated via the console's standard
 //   header auth) sets an HttpOnly cookie scoped to `/phoenix` — no credentials
@@ -37,14 +46,16 @@
 //
 // The old Swimlane/Runs sub-views and the custom event store they read from are
 // gone: the emitters emit OTel only (hook 0.11.0 + talon#69) and the store/routes
-// were retired in the store-deprecation issue. This embed is the only UI module.
+// were retired in the store-deprecation issue.
 //
 // Registered via HostFeature.get_ui_contributions() as the single module in
-// UIContributions.modules. `capability: null` → host-always-on (sovereign
-// #2460), so the nav tab always renders.
+// UIContributions.modules (navigator.js is imported here, not separately
+// registered). `capability: null` → host-always-on (sovereign #2460), so the
+// nav tab always renders.
 
 import { registerPanel } from "/js/ui-ext/panels.js";
 import API from "/js/api.js";
+import { mount as mountNavigator } from "./navigator.js";
 
 const PHOENIX_SESSION_PATH = "/api/host/phoenix/session";
 const PHOENIX_URL = "/phoenix/";
@@ -254,19 +265,25 @@ function observeNav(doc, apply) {
   return observer;
 }
 
-// ── View / mount ──────────────────────────────────────────────
+// ── Phoenix embed sub-view ────────────────────────────────────
+//
+// The curated embed, unchanged in behavior (#41) beyond one wiring point for
+// the navigator (#46): `opts.traceUrl` overrides the project deep-link so
+// "open in Phoenix" lands on a specific trace. The in-app-not-found fallback
+// applies to that URL exactly as it does to the project deep-link.
 
-export function mount(container) {
+function mountPhoenix(container, opts = {}) {
   ensureStyles();
 
   let destroyed = false;
   let observer = null;
 
   const curate = curationEnabled();
-  const project = projectName(container);
+  const project = ((opts.project || "").trim()) || DEFAULT_PROJECT;
+  const traceUrl = opts.traceUrl || null;
 
-  container.innerHTML = `<div class="obs-panel"><div class="obs-notice">Connecting to Phoenix…</div></div>`;
-  const panelEl = container.querySelector(".obs-panel");
+  container.innerHTML = `<div class="obs-embed"><div class="obs-notice">Connecting to Phoenix…</div></div>`;
+  const panelEl = container.querySelector(".obs-embed");
 
   function curateIframe(iframe) {
     // Best-effort, non-fatal: same-origin access can throw (cross-origin edge,
@@ -321,7 +338,9 @@ export function mount(container) {
       curateIframe(iframe);
     });
 
-    const src = await chooseSrc(project, curate);
+    // A navigator-provided trace deep-link (#46) wins over project resolution;
+    // it is subject to the same load-time not-found fallback above.
+    const src = traceUrl || (await chooseSrc(project, curate));
     if (destroyed || !panelEl) return;
     iframe.src = src;
     panelEl.replaceChildren(iframe);
@@ -360,6 +379,151 @@ export function mount(container) {
   };
 }
 
+// ── Sub-views (#46: subtab container, reintroduced minimally) ─
+//
+// Extensible registry: adding a view = one entry (id + label + mount). Each
+// view module exports `mount(container, opts)` returning a handle with
+// `destroy()`; the container mounts the active view and unmounts it on
+// switch/teardown, so only one view is live at a time. Navigator is first →
+// the default on a fresh console load.
+
+const VIEWS = [
+  { id: "navigator", label: "Navigator", mount: mountNavigator },
+  { id: "phoenix", label: "Phoenix", mount: mountPhoenix },
+];
+
+const STORAGE_KEY = "kestrel.observability.subtab";
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Persisted selection survives reloads. URL hash (#observability/<id>) wins so a
+// link is shareable; localStorage is the fallback; else the first view
+// (Navigator).
+function readPersistedViewId() {
+  try {
+    const hash = (typeof location !== "undefined" && location.hash) || "";
+    const m = /#observability\/([\w-]+)/.exec(hash);
+    if (m && VIEWS.some((v) => v.id === m[1])) return m[1];
+  } catch (_e) {
+    /* ignore */
+  }
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored && VIEWS.some((v) => v.id === stored)) return stored;
+  } catch (_e) {
+    /* ignore */
+  }
+  return VIEWS[0].id;
+}
+
+function persistViewId(id) {
+  try {
+    localStorage.setItem(STORAGE_KEY, id);
+  } catch (_e) {
+    /* ignore */
+  }
+  try {
+    if (typeof location !== "undefined") {
+      location.hash = `observability/${id}`;
+    }
+  } catch (_e) {
+    /* ignore */
+  }
+}
+
+// ── View / mount ──────────────────────────────────────────────
+
+export function mount(container) {
+  ensureStyles();
+
+  const project = projectName(container);
+  let activeId = readPersistedViewId();
+  let handle = null; // handle returned by the active view's mount()
+  let destroyed = false;
+  let pendingTraceUrl = null; // set by the navigator's "open in Phoenix" (#46)
+
+  container.innerHTML = `
+    <div class="obs-panel">
+      <nav class="obs-subnav" role="tablist">
+        ${VIEWS.map(
+          (v) => `
+          <button type="button" class="obs-subnav__tab" role="tab" data-view="${escapeHtml(v.id)}">
+            ${escapeHtml(v.label)}
+          </button>`,
+        ).join("")}
+      </nav>
+      <div class="obs-content" data-obs-content></div>
+    </div>`;
+
+  const contentEl = container.querySelector("[data-obs-content]");
+
+  function unmountActive() {
+    try {
+      handle?.destroy?.();
+    } catch (_e) {
+      /* ignore */
+    }
+    handle = null;
+    if (contentEl) contentEl.innerHTML = "";
+  }
+
+  function mountView(id) {
+    const view = VIEWS.find((v) => v.id === id) || VIEWS[0];
+    activeId = view.id;
+    unmountActive();
+    // Reflect the active tab.
+    container.querySelectorAll("[data-view]").forEach((btn) => {
+      btn.classList.toggle("obs-subnav__tab--active", btn.dataset.view === activeId);
+    });
+    const opts = { project };
+    if (view.id === "phoenix") {
+      // One-shot: a pending navigator deep-link rides along on this mount only.
+      opts.traceUrl = pendingTraceUrl;
+      pendingTraceUrl = null;
+    } else if (view.id === "navigator") {
+      opts.openTrace = openTrace;
+    }
+    handle = view.mount(contentEl, opts);
+  }
+
+  function switchTo(id) {
+    if (destroyed || id === activeId) return;
+    persistViewId(id);
+    mountView(id);
+  }
+
+  // Navigator → Phoenix trace deep-link (#46): land the Phoenix subtab on the
+  // exact trace the navigator row points at.
+  function openTrace(traceUrl) {
+    if (destroyed || !traceUrl) return;
+    pendingTraceUrl = traceUrl;
+    if (activeId === "phoenix") {
+      mountView("phoenix"); // already on Phoenix → remount onto the trace
+    } else {
+      switchTo("phoenix");
+    }
+  }
+
+  container.querySelectorAll("[data-view]").forEach((btn) => {
+    btn.addEventListener("click", () => switchTo(btn.dataset.view));
+  });
+
+  mountView(activeId);
+
+  return {
+    destroy() {
+      destroyed = true;
+      unmountActive();
+    },
+  };
+}
+
 export default { id: "observability", title: "Observability", capability: null, mount };
 
 // ── Styles (scoped, theme-aware) ──────────────────────────────
@@ -371,6 +535,16 @@ function ensureStyles() {
   style.setAttribute("data-observability", "");
   style.textContent = `
     .obs-panel { display:flex; flex-direction:column; height:100%; color:var(--color-text,#e2e8f0); }
+    .obs-subnav { display:flex; align-items:center; gap:4px; padding:6px 12px;
+                  border-bottom:1px solid var(--color-border,#334155); }
+    .obs-subnav__tab { background:transparent; color:var(--color-text-muted,#94a3b8);
+                       border:1px solid transparent; border-radius:999px; padding:4px 14px;
+                       cursor:pointer; font-size:13px; font-weight:600; }
+    .obs-subnav__tab:hover { background:var(--color-surface,#1e293b); color:var(--color-text,#e2e8f0); }
+    .obs-subnav__tab--active { background:var(--color-accent,#818cf8); color:#0b1120;
+                               border-color:var(--color-accent,#818cf8); }
+    .obs-content { flex:1; min-height:0; overflow:hidden; }
+    .obs-embed { display:flex; flex-direction:column; height:100%; }
     .obs-frame { flex:1; min-height:0; width:100%; border:0; }
     .obs-notice { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
                   gap:8px; padding:24px; text-align:center; color:var(--color-text-muted,#94a3b8); }
@@ -387,7 +561,7 @@ function ensureStyles() {
 //
 // A single always-on top-level panel. `registerPanel` expects a `panelId` and a
 // lazy `render(bodyEl)` callback; `mount(container)` fills the panel body and
-// embeds Phoenix (or the notice) on first activation.
+// renders the sub-nav (Navigator | Phoenix) on first activation.
 
 registerPanel({
   panelId: "observability",

@@ -16,8 +16,14 @@ process boundaries):
   stays coherent across the framework + every feature package.
 - **Host extra** (`kestrel-feature-observability[fleet]`) — enables the
   **`FleetObservabilityHostFeature`** (the `kestrel_sovereign.host_features`
-  entry point), which ships the single "Observability" console panel: a thin
-  embed of the host-supervised Phoenix UI. The HostFeature lives in the
+  entry point), which ships the single "Observability" console panel with a
+  two-item sub-nav: **Navigator** (default) — the hierarchical fleet drill-down
+  (Tenant → Fleet → Agent → Subagent → Session → Turn → Events) rendered
+  kestrel-native as a lazily-expanding virtualized tree, a pure read-model over
+  Phoenix's GraphQL through the same-origin `/phoenix/graphql` proxy (no store,
+  no new host routes) — and **Phoenix**, the curated thin embed of the
+  host-supervised Phoenix UI, which the navigator's per-trace "open in Phoenix"
+  links deep-link into. The HostFeature lives in the
   `kestrel_feature_observability.fleet` subpackage. Since the custom
   store/entities were retired, `fleet/feature.py` imports only the
   `HostFeature`/`UIContributions` contract from `kestrel_sdk`, so the host role
