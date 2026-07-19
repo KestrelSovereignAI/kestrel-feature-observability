@@ -1,0 +1,129 @@
+{
+  "_comment": [
+    "Span nodes exactly as Phoenix GraphQL returns them to navigator.js",
+    "(`attributes` is the JSON string Phoenix serializes, nested/unflattened;",
+    "`parentId` is the parent's OTel span id, null on roots).",
+    "",
+    "talon_trace models a real Talon run (producer: kestrel-talon via",
+    "tracing.py KestrelTracer): the run ROOT carries kestrel.agent_name=='talon'",
+    "and kestrel.run_id; the worker split lives ONLY on child stage spans —",
+    "as kestrel.stage (gate), a prefixed agent-name variant (talon/review), or",
+    "both (talon/implement) — and NO talon span stamps kestrel.session_id or",
+    "session.id. The run id is the only session identity available.",
+    "",
+    "emitter_session models a hook.py session: root marker + summary carry",
+    "kestrel.session_id; the tool child carries the agent name only."
+  ],
+  "talon_trace": [
+    {
+      "id": "U3BhbjoxMDE=",
+      "name": "UncleSaurus/widget#7",
+      "spanKind": "agent",
+      "startTime": "2026-07-18T20:00:00+00:00",
+      "endTime": "2026-07-18T20:14:03+00:00",
+      "latencyMs": 843000.0,
+      "statusCode": "OK",
+      "parentId": null,
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"AGENT\"}}, \"kestrel\": {\"agent_name\": \"talon\", \"run_id\": \"UncleSaurus/widget#7\", \"repo\": \"UncleSaurus/widget\", \"orchestrator\": \"talon\"}}",
+      "context": { "spanId": "aaaa000000000001", "traceId": "ffff0000000000000000000000000001" }
+    },
+    {
+      "id": "U3BhbjoxMDI=",
+      "name": "talon/implement",
+      "spanKind": "chain",
+      "startTime": "2026-07-18T20:00:01+00:00",
+      "endTime": "2026-07-18T20:09:30+00:00",
+      "latencyMs": 569000.0,
+      "statusCode": "OK",
+      "parentId": "aaaa000000000001",
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"CHAIN\"}}, \"kestrel\": {\"agent_name\": \"talon/implement\", \"stage\": \"implement\", \"run_id\": \"UncleSaurus/widget#7\", \"repo\": \"UncleSaurus/widget\"}}",
+      "context": { "spanId": "aaaa000000000002", "traceId": "ffff0000000000000000000000000001" }
+    },
+    {
+      "id": "U3BhbjoxMDM=",
+      "name": "talon/review",
+      "spanKind": "chain",
+      "startTime": "2026-07-18T20:09:31+00:00",
+      "endTime": "2026-07-18T20:12:00+00:00",
+      "latencyMs": 149000.0,
+      "statusCode": "OK",
+      "parentId": "aaaa000000000001",
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"CHAIN\"}}, \"kestrel\": {\"agent_name\": \"talon/review\", \"run_id\": \"UncleSaurus/widget#7\", \"repo\": \"UncleSaurus/widget\"}}",
+      "context": { "spanId": "aaaa000000000003", "traceId": "ffff0000000000000000000000000001" }
+    },
+    {
+      "id": "U3BhbjoxMDQ=",
+      "name": "gate",
+      "spanKind": "chain",
+      "startTime": "2026-07-18T20:12:01+00:00",
+      "endTime": "2026-07-18T20:14:00+00:00",
+      "latencyMs": 119000.0,
+      "statusCode": "ERROR",
+      "parentId": "aaaa000000000001",
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"CHAIN\"}}, \"kestrel\": {\"agent_name\": \"talon\", \"stage\": \"gate\", \"run_id\": \"UncleSaurus/widget#7\", \"repo\": \"UncleSaurus/widget\"}}",
+      "context": { "spanId": "aaaa000000000004", "traceId": "ffff0000000000000000000000000001" }
+    },
+    {
+      "id": "U3BhbjoxMDU=",
+      "name": "Bash",
+      "spanKind": "tool",
+      "startTime": "2026-07-18T20:00:05+00:00",
+      "endTime": "2026-07-18T20:00:09+00:00",
+      "latencyMs": 4000.0,
+      "statusCode": "OK",
+      "parentId": "aaaa000000000002",
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"TOOL\"}}, \"tool\": {\"success\": true, \"duration_ms\": 4000}, \"kestrel\": {\"agent_name\": \"talon/implement\", \"stage\": \"implement\", \"run_id\": \"UncleSaurus/widget#7\"}}",
+      "context": { "spanId": "aaaa000000000005", "traceId": "ffff0000000000000000000000000001" }
+    },
+    {
+      "id": "U3BhbjoxMDY=",
+      "name": "chat",
+      "spanKind": "llm",
+      "startTime": "2026-07-18T20:00:10+00:00",
+      "endTime": "2026-07-18T20:00:42+00:00",
+      "latencyMs": 32000.0,
+      "statusCode": "OK",
+      "parentId": "aaaa000000000002",
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"LLM\"}}, \"input\": {\"value\": \"Implement issue #7\"}, \"output\": {\"value\": \"Done: patched widget.py\"}, \"llm\": {\"model_name\": \"claude-fable-5\"}, \"kestrel\": {\"agent_name\": \"talon/implement\", \"stage\": \"implement\", \"run_id\": \"UncleSaurus/widget#7\"}}",
+      "context": { "spanId": "aaaa000000000006", "traceId": "ffff0000000000000000000000000001" }
+    }
+  ],
+  "emitter_session": [
+    {
+      "id": "U3BhbjoyMDE=",
+      "name": "Meridian",
+      "spanKind": "agent",
+      "startTime": "2026-07-18T21:00:00+00:00",
+      "endTime": "2026-07-18T21:00:00.001000+00:00",
+      "latencyMs": 1.0,
+      "statusCode": "OK",
+      "parentId": null,
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"AGENT\"}}, \"kestrel\": {\"agent_name\": \"Meridian\", \"session_id\": \"sess-42\", \"orchestrator\": \"Meridian\", \"agent_did\": \"did:kestrel:meridian\"}}",
+      "context": { "spanId": "bbbb000000000001", "traceId": "ffff0000000000000000000000000002" }
+    },
+    {
+      "id": "U3BhbjoyMDI=",
+      "name": "web_search",
+      "spanKind": "tool",
+      "startTime": "2026-07-18T21:00:05+00:00",
+      "endTime": "2026-07-18T21:00:07+00:00",
+      "latencyMs": 2000.0,
+      "statusCode": "OK",
+      "parentId": "bbbb000000000001",
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"TOOL\"}}, \"tool\": {\"success\": true, \"duration_ms\": 2000}, \"kestrel\": {\"agent_name\": \"Meridian\", \"feature_name\": \"search\"}}",
+      "context": { "spanId": "bbbb000000000002", "traceId": "ffff0000000000000000000000000002" }
+    },
+    {
+      "id": "U3BhbjoyMDM=",
+      "name": "session summary",
+      "spanKind": "chain",
+      "startTime": "2026-07-18T21:00:00+00:00",
+      "endTime": "2026-07-18T21:05:00+00:00",
+      "latencyMs": 300000.0,
+      "statusCode": "OK",
+      "parentId": "bbbb000000000001",
+      "attributes": "{\"openinference\": {\"span\": {\"kind\": \"CHAIN\"}}, \"kestrel\": {\"agent_name\": \"Meridian\", \"session_id\": \"sess-42\", \"tool_count\": 1, \"success_ratio\": 1.0, \"session_duration_ms\": 300000}}",
+      "context": { "spanId": "bbbb000000000003", "traceId": "ffff0000000000000000000000000002" }
+    }
+  ]
+}

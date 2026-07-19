@@ -16,7 +16,8 @@ kestrel-feature-observability/
 │   └── fleet/                   # [fleet] extra — host role, guarded import
 │       ├── __init__.py          # Guarded export (None when host SDK contract absent)
 │       ├── feature.py           # FleetObservabilityHostFeature (host_features)
-│       └── static/              # observability.js (Phoenix embed panel)
+│       └── static/              # observability.js (sub-nav container: Navigator | Phoenix embed)
+│                                # + navigator.js (fleet drill-down over Phoenix GraphQL)
 └── tests/
     ├── test_observability_feature.py   # emitter
     ├── test_tracing.py                 # KestrelTracer
@@ -46,8 +47,12 @@ uv run pytest
   (`kestrel_feature_observability.feature`/`hook`) emits OTel spans (session `run_span` → child
   `tool_span`s) via `KestrelTracer` (`tracing.py`), exported over OTLP/HTTP to whatever
   `OTEL_EXPORTER_OTLP_ENDPOINT` points at (e.g. a host-supervised Phoenix). The **fleet host role**
-  (`kestrel_feature_observability.fleet`) owns the single "Observability" console panel — a thin embed of
-  the host-supervised Phoenix UI — behind the `[fleet]` extra.
+  (`kestrel_feature_observability.fleet`) owns the single "Observability" console panel — a two-item
+  sub-nav: **Navigator** (default; the hierarchical Tenant→Fleet→Agent→Subagent→Session→Turn→Events
+  drill-down in `navigator.js`, a pure read-model over Phoenix's GraphQL through the same-origin
+  `/phoenix/graphql` proxy — no store, no backend routes) | **Phoenix** (the curated thin embed of the
+  host-supervised Phoenix UI, which the navigator's "open in Phoenix" trace links deep-link into) —
+  behind the `[fleet]` extra.
 - Keep the emitter path lightweight and DB-free: the emitter package (`feature.py`, `hook.py`, `tracing.py`,
   the top-level `__init__.py`) must never import `kestrel_feature_observability.fleet`. The fleet
   subpackage's import stays **guarded** (`fleet/__init__.py` → `FleetObservabilityHostFeature is None`), but

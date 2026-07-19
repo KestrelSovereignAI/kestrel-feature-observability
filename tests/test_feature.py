@@ -49,6 +49,59 @@ def test_ui_module_paths_are_mount_relative_and_shipped():
         assert os.path.isfile(shipped), shipped
 
 
+def test_navigator_subview_ships_and_is_wired():
+    """The Fleet Navigator sub-view (#46) ships on disk and is wired in.
+
+    The container (``observability.js``) renders the two-item sub-nav
+    (Navigator | Phoenix) and imports the navigator module relatively, so
+    ``navigator.js`` must ship in the same static dir WITHOUT being registered
+    as a second top-level module (the host imports only the container).
+    """
+    import os
+
+    feature = FleetObservabilityHostFeature()
+    contributions = feature.get_ui_contributions()
+    assert contributions is not None
+    navigator = os.path.join(contributions.static_dir, "navigator.js")
+    assert os.path.isfile(navigator)
+    container_src = open(
+        os.path.join(contributions.static_dir, "observability.js"),
+        encoding="utf-8",
+    ).read()
+    assert "./navigator.js" in container_src
+    assert "Navigator" in container_src
+    assert contributions.modules == ["observability.js"]
+
+
+def test_navigator_reads_the_emitter_attribute_contract():
+    """``navigator.js`` drills down over the span attributes the emitter stamps.
+
+    Pure read-model over Phoenix GraphQL (same-origin proxy) — the hierarchy is
+    keyed on the exact attribute names ``tracing.py``/``hook.py`` emit, so pin
+    them here: renaming an attribute on either side must fail this test.
+    """
+    import os
+
+    feature = FleetObservabilityHostFeature()
+    contributions = feature.get_ui_contributions()
+    assert contributions is not None
+    src = open(
+        os.path.join(contributions.static_dir, "navigator.js"), encoding="utf-8"
+    ).read()
+    for needle in (
+        "/phoenix/graphql",
+        "openinference.project.name",
+        "openinference.span.kind",
+        "kestrel.agent_name",
+        "kestrel.stage",
+        "kestrel.session_id",
+        "kestrel.run_id",
+        "input.value",
+        "output.value",
+    ):
+        assert needle in src, needle
+
+
 def test_entry_point_registered():
     """``FleetObservabilityHostFeature`` stays on the ``host_features`` group.
 

@@ -66,6 +66,9 @@ test = [
     # the test env exercises both the emitter and the fleet role, so intersect
     # on it.
     "kestrel-sovereign-sdk[metrics]>=0.30.0,<0.31",
+    # Validates the navigator's GraphQL documents against the vendored Phoenix
+    # 17.7.0 schema (tests/fixtures/phoenix_schema_17.7.0.graphql).
+    "graphql-core>=3.2",
 ]
 
 [project.urls]
