@@ -39,7 +39,7 @@
 // Turns), all spans where the split lives on children (Subagent / Session
 // under an agent). "Load more" merges further pages; span ids are deduped so
 // overlapping pages never double-count. Tenant is a single static root until
-// Castle tenancy lands (label read from host config when available).
+// Castle tenancy lands.
 //
 // The whole tree lives in ONE virtualized scroll container (windowed rows with
 // per-row offsets — hundreds of sessions stay smooth); expanded levels append
@@ -54,8 +54,6 @@ import API from "/js/api.js";
 const PHOENIX_SESSION_PATH = "/api/host/phoenix/session";
 const PHOENIX_URL = "/phoenix/";
 const PHOENIX_GRAPHQL_URL = "/phoenix/graphql";
-// Best-effort tenant label source; any failure keeps the static root label.
-const HOST_CONFIG_PATH = "/api/host/config";
 
 // The agents' project (tracing.py DEFAULT_OTEL_PROJECT) — pinned first at the
 // Fleet level; repo projects (`owner/repo`, the talon claims) follow by name.
@@ -204,9 +202,17 @@ function getAttr(attrs, key) {
   return cur;
 }
 
-// Phoenix span-filter DSL building blocks (Python-expression syntax).
-function attrRef(key) {
-  return `attributes[${JSON.stringify(key)}]`;
+// Phoenix span-filter DSL building blocks (Python-expression syntax). Phoenix
+// stores dotted OTel attribute keys NESTED (see getAttr above) and the filter
+// DSL matches only nested subscripts — verified live on 17.7.0, a flat
+// `attributes["kestrel.agent_name"]` ref silently matches nothing (#50) — so
+// each dot segment becomes its own subscript (`kestrel.agent_name` →
+// `attributes["kestrel"]["agent_name"]`); dotless keys are unchanged.
+export function attrRef(key) {
+  const parts = String(key).split(".");
+  let ref = `attributes[${JSON.stringify(parts[0])}]`;
+  for (const part of parts.slice(1)) ref += `[${JSON.stringify(part)}]`;
+  return ref;
 }
 
 function dslString(value) {
@@ -424,7 +430,7 @@ export function mount(container, opts = {}) {
   }
 
   // Single static tenant root until Castle tenancy lands; then roots enumerate
-  // tenants. Label upgraded from host config below when available.
+  // tenants.
   const tenant = makeNode("tenant", "This deployment", {});
   tenant.expanded = true;
 
@@ -1258,17 +1264,6 @@ export function mount(container, opts = {}) {
     if (destroyed) return;
     // Root is pre-expanded: Tenant → Fleet with real counts on first paint.
     loadChildren(tenant, "initial");
-    // Best-effort tenant label from host config; static root label otherwise.
-    try {
-      const cfg = await API.requestHost(HOST_CONFIG_PATH);
-      const label = cfg && (cfg.deployment_name || cfg.host_name || cfg.name);
-      if (label && !destroyed) {
-        tenant.label = String(label);
-        scheduleRebuild();
-      }
-    } catch (_e) {
-      /* no host label — keep the static root */
-    }
   }
 
   rebuildRows();

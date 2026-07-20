@@ -44,6 +44,22 @@ def _navigator_source() -> str:
     return (STATIC / "navigator.js").read_text(encoding="utf-8")
 
 
+def _navigator_module(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Write navigator.js as a node-importable module.
+
+    navigator.js imports the console's API client from an absolute URL only a
+    browser can resolve; stub it — the code under test never touches it.
+    """
+    src = _navigator_source().replace(
+        'import API from "/js/api.js";',
+        "const API = { requestHost: async () => ({}) };",
+    )
+    assert "const API" in src, "API import stub failed — import line changed?"
+    module = tmp_path / "navigator.mjs"
+    module.write_text(src, encoding="utf-8")
+    return module
+
+
 def _graphql_documents() -> list[str]:
     """Every GraphQL document the fleet static bundle sends to Phoenix.
 
@@ -114,16 +130,7 @@ def test_navigator_aggregates_a_real_talon_trace(tmp_path):
     unreachable. This drives the shipped code — not a source-string proxy —
     over the fixture and asserts every level of the drill path resolves.
     """
-    # navigator.js imports the console's API client from an absolute URL only
-    # a browser can resolve; stub it — the aggregation under test never
-    # touches it.
-    src = _navigator_source().replace(
-        'import API from "/js/api.js";',
-        "const API = { requestHost: async () => ({}) };",
-    )
-    assert "const API" in src, "API import stub failed — import line changed?"
-    module = tmp_path / "navigator.mjs"
-    module.write_text(src, encoding="utf-8")
+    module = _navigator_module(tmp_path)
 
     harness = tmp_path / "harness.mjs"
     harness.write_text(
@@ -205,8 +212,87 @@ process.stdout.write(
     # exact base name — this is what made talon's subtree unreachable.
     talon_filter = result["filters"]["talon"]
     assert "== 'talon'" in talon_filter
-    assert "'talon/' in attributes[\"kestrel.agent_name\"]" in talon_filter
+    assert "'talon/' in attributes[\"kestrel\"][\"agent_name\"]" in talon_filter
     # And the worker filter matches both stamping styles.
     worker_filter = result["filters"]["talonImplement"]
-    assert "attributes[\"kestrel.stage\"] == 'implement'" in worker_filter
+    assert "attributes[\"kestrel\"][\"stage\"] == 'implement'" in worker_filter
     assert "== 'talon/implement'" in worker_filter
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_filter_dsl_emits_nested_attribute_subscripts(tmp_path):
+    """The emitted span-filter strings must use NESTED attribute subscripts.
+
+    Phoenix stores dotted OTel attribute keys nested and its filter DSL only
+    matches nested subscripts — verified live against 17.7.0 (#50):
+    ``attributes["kestrel.agent_name"] == 'Claw'`` returns 0 spans with no
+    error, while ``attributes["kestrel"]["agent_name"] == 'Claw'`` matches, so
+    a flat ref silently empties every drill. The schema-validation tests above
+    check document validity, not DSL semantics; this runs the shipped
+    ``attrRef`` / filter builders (every level filter — agent, worker,
+    session, turn — goes through ``attrRef``) and pins the emitted strings.
+    """
+    module = _navigator_module(tmp_path)
+
+    harness = tmp_path / "harness.mjs"
+    harness.write_text(
+        """
+import { pathToFileURL } from "node:url";
+
+const [modPath] = process.argv.slice(2);
+const { attrRef, exactAgentFilter, agentFilter, workerFilter } = await import(
+  pathToFileURL(modPath).href
+);
+
+process.stdout.write(
+  JSON.stringify({
+    refs: {
+      agentName: attrRef("kestrel.agent_name"),
+      stage: attrRef("kestrel.stage"),
+      sessionId: attrRef("kestrel.session_id"),
+      oiSessionId: attrRef("session.id"),
+      runId: attrRef("kestrel.run_id"),
+      dotless: attrRef("dotless"),
+    },
+    filters: {
+      exact: exactAgentFilter("Claw"),
+      agent: agentFilter("talon"),
+      worker: workerFilter("talon", "implement"),
+    },
+  }),
+);
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [NODE, str(harness), str(module)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    result = json.loads(proc.stdout)
+
+    # attrRef: one subscript per dot segment; dotless keys unchanged. Covers
+    # every attribute the level filters reference — the turn filter is
+    # attrRef(sessionAttr) == '<id>' over the three session-key attributes.
+    assert result["refs"] == {
+        "agentName": 'attributes["kestrel"]["agent_name"]',
+        "stage": 'attributes["kestrel"]["stage"]',
+        "sessionId": 'attributes["kestrel"]["session_id"]',
+        "oiSessionId": 'attributes["session"]["id"]',
+        "runId": 'attributes["kestrel"]["run_id"]',
+        "dotless": 'attributes["dotless"]',
+    }
+
+    # The verified-live agent-drill shape, end to end.
+    assert result["filters"]["exact"] == "attributes[\"kestrel\"][\"agent_name\"] == 'Claw'"
+
+    # No emitted filter may contain a flat dotted subscript — the exact form
+    # Phoenix silently matches nothing on.
+    flat_subscript = re.compile(r'attributes\["[^"]*\.[^"]*"\]')
+    for name, emitted in result["filters"].items():
+        assert not flat_subscript.search(emitted), (
+            f"flat dotted attribute subscript in {name} filter: {emitted}"
+        )
