@@ -273,6 +273,21 @@ function observeNav(doc, apply) {
 // "open in Phoenix" lands on a specific trace. The in-app-not-found fallback
 // applies to that URL exactly as it does to the project deep-link.
 
+// Nudge the embedded Phoenix (its bundled recharts) to re-measure its chart
+// containers by dispatching a synthetic `resize` into the same-origin frame
+// window (issue #49). Best-effort and non-fatal in the file's existing style:
+// `contentWindow` can be null or cross-origin during navigation/teardown, so any
+// throw is swallowed. Fired on subtab activation AND after each frame load so
+// recharts never latches a 0-size container regardless of when the flex settles.
+function dispatchIframeResize(iframe) {
+  try {
+    const win = iframe && iframe.contentWindow;
+    if (win) win.dispatchEvent(new Event("resize"));
+  } catch (_e) {
+    /* non-fatal: cross-origin / detached frame during navigation or teardown */
+  }
+}
+
 function mountPhoenix(container, opts = {}) {
   ensureStyles();
 
@@ -312,6 +327,13 @@ function mountPhoenix(container, opts = {}) {
     const iframe = document.createElement("iframe");
     iframe.className = "obs-frame";
     iframe.setAttribute("title", "Phoenix");
+    // Explicit full-bleed dimensions set BEFORE `src` (issue #49): the frame must
+    // have a concrete, non-zero box the instant Phoenix — and its bundled
+    // recharts — first measures, even while the flex container is still
+    // resolving. Relying on `.obs-frame`'s `flex:1` alone lets recharts sample a
+    // 0×0 container (the "width(0) and height(0)…" console spam / blank charts).
+    iframe.style.width = "100%";
+    iframe.style.height = "100%";
     // Fires at most once: the deep-link → bare-entry fallback is one-way, and the
     // guard stops a pathological not-found on the bare entry from looping.
     let fellBack = false;
@@ -337,6 +359,9 @@ function mountPhoenix(container, opts = {}) {
         }
       }
       curateIframe(iframe);
+      // Now that Phoenix has fully loaded and laid out at its explicit full-bleed
+      // size, nudge its recharts to re-measure (issue #49).
+      dispatchIframeResize(iframe);
     });
 
     // A navigator-provided trace deep-link (#46) wins over project resolution;
@@ -345,6 +370,12 @@ function mountPhoenix(container, opts = {}) {
     if (destroyed || !panelEl) return;
     iframe.src = src;
     panelEl.replaceChildren(iframe);
+    // Activation nudge (issue #49): the frame just entered the now-visible
+    // Phoenix subtab. Dispatch a resize so recharts re-measures against the real
+    // container size even if it sampled a hidden/0-size box first; the load
+    // handler dispatches again once Phoenix finishes loading. Belt-and-suspenders
+    // so recharts never latches a 0-size container whichever frame flex settles.
+    dispatchIframeResize(iframe);
   }
 
   function renderNotice() {
