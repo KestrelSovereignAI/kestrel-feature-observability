@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-observability"
-version = "0.16.1"
+version = "0.16.2"
 description = "Observability feature for Kestrel Sovereign — a per-agent emitter that emits OTel spans for hook-driven lifecycle events, with a shared Prometheus registry"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -55,17 +55,17 @@ metrics = [
 # Absent (a base emitter install), the fleet subpackage degrades to a no-op.
 fleet = [
     # HostFeature / UIContributions contract. Tracks the host SDK range
-    # (kestrel-sovereign pins >=0.30.0,<0.31) so `[fleet]` installs into the host
+    # (kestrel-sovereign pins >=0.31.1,<0.32) so `[fleet]` installs into the host
     # env without an unsatisfiable resolve.
-    "kestrel-sovereign-sdk>=0.30.0,<0.31",
+    "kestrel-sovereign-sdk>=0.30.0,<0.32",
 ]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
-    # The fleet HostFeature contract tracks the host SDK range (>=0.30.0,<0.31);
+    # The fleet HostFeature contract tracks the host SDK range (now <0.32);
     # the test env exercises both the emitter and the fleet role, so intersect
     # on it.
-    "kestrel-sovereign-sdk[metrics]>=0.30.0,<0.31",
+    "kestrel-sovereign-sdk[metrics]>=0.30.0,<0.32",
     # Validates the navigator's GraphQL documents against the vendored Phoenix
     # 17.7.0 schema (tests/fixtures/phoenix_schema_17.7.0.graphql).
     "graphql-core>=3.2",
