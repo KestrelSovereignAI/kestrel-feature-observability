@@ -56,6 +56,7 @@
 import { registerPanel } from "/js/ui-ext/panels.js";
 import API from "/js/api.js";
 import { mount as mountNavigator } from "./navigator.js";
+import { mount as mountTimeline } from "./timeline.js";
 
 const PHOENIX_SESSION_PATH = "/api/host/phoenix/session";
 const PHOENIX_URL = "/phoenix/";
@@ -388,6 +389,7 @@ function mountPhoenix(container, opts = {}) {
 // the default on a fresh console load.
 
 const VIEWS = [
+  { id: "timeline", label: "Timeline", mount: mountTimeline },
   { id: "navigator", label: "Navigator", mount: mountNavigator },
   { id: "phoenix", label: "Phoenix", mount: mountPhoenix },
 ];
