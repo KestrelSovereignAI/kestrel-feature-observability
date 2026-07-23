@@ -96,25 +96,387 @@ const OPEN_EDGE_COLOR = "#22d3ee"; // live/provisional bar right-edge cap
 const ATTR_MARKER = "kestrel.marker";
 const MARKER_START = "start";
 
+// A non-sensitive per-call correlation id (the Claude hook's `tool_use_id`)
+// stamped on BOTH the "<tool> (started)" marker and its completed tool span, so
+// concurrent same-name tools (parallel `Bash`) pair one-to-one instead of the
+// first close hiding every same-name marker (#62 P2).
+const ATTR_TOOL_CALL_ID = "tool.call_id";
+
 function kindColor(kind) {
   return KIND_COLORS[kind] || KIND_DEFAULT;
 }
 
 // A span still "running" for layout/paint: no closed end yet (null endTime), or
 // a provisional start-marker whose real closed span hasn't arrived. Open spans
-// paint as a band from their start to the current right edge.
+// paint as a band from their start to the current right edge. `annotateRenderModel`
+// resolves this per span (`rOpen`) — a marker whose twin/close signal has arrived
+// is NOT open; a genuinely live tail is — so prefer the annotation when present.
 function isOpen(s) {
+  if (s.rOpen != null) return s.rOpen;
   return s.openEnded || s.marker === MARKER_START;
 }
 
-// Effective end for layout/paint: an open span extends to `nowMs` (right edge).
+// Effective end for layout/paint: an open span extends to `nowMs` (right edge);
+// a closed span uses its annotated end (`rEnd` folds in a turn's summary/next-turn
+// close), falling back to the raw span end before annotation.
 function effEnd(s, nowMs) {
-  return isOpen(s) ? nowMs : s.end;
+  if (isOpen(s)) return nowMs;
+  return s.rEnd != null ? s.rEnd : s.end;
 }
 
 // The base name a "<name> (started)" marker pairs with its real closed span on.
 function startedBase(name) {
   return String(name).replace(/\s*\(started\)\s*$/i, "");
+}
+
+// ── Render-model resolution (marker↔parent pairing, turn extents, summaries) ──
+//
+// The producers (hook.py / kestrel_obs_claude_hook.py / talon via tracing.py)
+// emit three span shapes the raw geometry can't paint directly (#62):
+//
+//   - "<x> (started)" markers — instant points whose REAL bar is a SIBLING (the
+//     emitter/Claude tool-start marker, paired with its PostToolUse span) OR a
+//     PARENT (talon parents the marker UNDER the span it marks). A marker must
+//     never draw its own open-ended bar when its twin exists: the twin is the
+//     bar; the marker is dropped. Only a genuinely orphaned/in-flight marker
+//     survives as the single provisional open band (#54.5).
+//   - turn roots ("<agent> turn <n>", kestrel.marker=start) — instant points that
+//     ARE the turn's start; their close signal is the "turn <n> summary" CHILD
+//     span, else the next turn's start in the session, else session end, else
+//     (live tail only) the right edge. A closed turn never renders open-ended.
+//   - "turn <n> summary" / "session summary" spans — folded into their owning
+//     band (never their own bar): the band end + click stats come from them.
+//
+// Annotates each span in place with the fields the layout/draw read:
+//   rHide    — never render (paired marker / folded summary)
+//   rOpen    — render open-ended (out to the live right edge)
+//   rEnd     — effective closed end (== start for a true instant)
+//   rSummary — folded summary stats {kind, turnCount, toolCount, successRatio, durationMs, end}
+//   rLabel   — informative band label ("turn 16 · 12 tools · 3m 40s"), else the bare name
+const TURN_SUMMARY_RE = /^turn\s+\d+\s+summary$/i;
+const SESSION_SUMMARY_RE = /^session\s+summary$/i;
+const STARTED_RE = /\(started\)\s*$/i;
+
+function isMarker(s) {
+  return s.marker === MARKER_START;
+}
+function isNamedStartMarker(s) {
+  return isMarker(s) && STARTED_RE.test(String(s.name || ""));
+}
+// A marker=start span that is NOT a "(started)" twin marker is a turn root — it
+// IS the turn's start (its close signal is the summary child), never a paired bar.
+function isTurnRoot(s) {
+  return isMarker(s) && !isNamedStartMarker(s);
+}
+function isTurnSummary(s) {
+  return TURN_SUMMARY_RE.test(String(s.name || ""));
+}
+function isSessionSummary(s) {
+  return SESSION_SUMMARY_RE.test(String(s.name || ""));
+}
+function isSummary(s) {
+  return isTurnSummary(s) || isSessionSummary(s);
+}
+
+// The session grouping key for turn-ordering / session-end lookup — the session
+// id when stamped (emitter / Claude), else the trace (a lone talon-style run).
+function sessionKeyFor(s) {
+  return s.sessionId != null ? `s:${s.sessionId}` : `t:${s.traceId || s.id}`;
+}
+
+function numAttr(s, key) {
+  const v = getAttr(s.attrs, key);
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// The per-call correlation id (`tool.call_id`) stamped on a marker + its twin,
+// or null when absent (the in-process emitter has no per-call id, so those pair
+// by name-order instead).
+function toolCallId(s) {
+  const v = getAttr(s.attrs, ATTR_TOOL_CALL_ID);
+  return v != null && v !== "" ? String(v) : null;
+}
+
+// Read the folded summary stats off a "turn <n> summary" / "session summary" span.
+function summaryStats(sum) {
+  const turnDur = numAttr(sum, "kestrel.turn_duration_ms");
+  return {
+    kind: isSessionSummary(sum) ? "session" : "turn",
+    turnCount: numAttr(sum, "kestrel.turn_count"),
+    toolCount: numAttr(sum, "kestrel.tool_count"),
+    successRatio: numAttr(sum, "kestrel.success_ratio"),
+    durationMs: turnDur != null ? turnDur : numAttr(sum, "kestrel.session_duration_ms"),
+    end: sum.end,
+  };
+}
+
+function turnIndexOf(s) {
+  const v = getAttr(s.attrs, "kestrel.turn_index");
+  if (v != null && v !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  const m = /turn\s+(\d+)/i.exec(String(s.name || ""));
+  return m ? Number(m[1]) : null;
+}
+
+// "turn 16 · 12 tools · 3m 40s" composed from the summary attrs; bare name fallback.
+function turnLabel(s, stats) {
+  const idx = turnIndexOf(s);
+  const parts = [idx != null ? `turn ${idx}` : String(s.name || "")];
+  if (stats) {
+    if (stats.toolCount != null) {
+      parts.push(`${stats.toolCount} tool${stats.toolCount === 1 ? "" : "s"}`);
+    }
+    if (stats.durationMs != null) {
+      const d = fmtDuration(stats.durationMs);
+      if (d) parts.push(d);
+    }
+  }
+  return parts.join(" · ");
+}
+
+// Human duration for a span's own bar (folded summary duration wins for turn
+// bands; a zero-width closed span is "instant"; an open span is "running").
+function durText(s) {
+  if (isOpen(s)) return "running";
+  if (s.rSummary && s.rSummary.durationMs != null) {
+    const d = fmtDuration(s.rSummary.durationMs);
+    if (d) return d;
+  }
+  const end = s.rEnd != null ? s.rEnd : s.end;
+  if (end <= s.start) return "instant";
+  return fmtDuration(end - s.start);
+}
+
+// Resolve the render model over a set of normalized spans (see block comment
+// above). Mutates each span in place and returns the materialized list. Pure and
+// self-contained (builds its own parent index) so it's unit-testable under node.
+export function annotateRenderModel(spanIter, nowMs) {
+  const list = [...spanIter];
+  const bySpanId = new Map();
+  for (const s of list) if (s.spanId) bySpanId.set(s.spanId, s);
+  const childrenOf = new Map(); // parent OTel spanId → [child records]
+  for (const s of list) {
+    if (!s.parentId || !bySpanId.has(s.parentId)) continue;
+    let arr = childrenOf.get(s.parentId);
+    if (!arr) {
+      arr = [];
+      childrenOf.set(s.parentId, arr);
+    }
+    arr.push(s);
+  }
+  const parentOf = (s) => (s.parentId ? bySpanId.get(s.parentId) || null : null);
+
+  // Reset annotations. Default: a real span with no closed end is open-ended.
+  for (const s of list) {
+    s.rHide = false;
+    s.rOpen = s.openEnded === true;
+    s.rEnd = s.end;
+    s.rSummary = null;
+    s.rLabel = null;
+  }
+
+  // 1. Fold summaries into their owning root. A turn root absorbs the summary
+  //    end (renders as a closed, labeled band); a session root keeps its instant
+  //    marker tick but carries the session stats for the session band. The
+  //    summary span itself never draws a bar.
+  const sessionEnd = new Map(); // session key → session-summary end
+  for (const s of list) {
+    if (!isSummary(s)) continue;
+    s.rHide = true;
+    const stats = summaryStats(s);
+    if (isSessionSummary(s)) sessionEnd.set(sessionKeyFor(s), s.end);
+    const p = parentOf(s);
+    if (!p) continue;
+    p.rSummary = stats;
+    if (isTurnRoot(p)) {
+      p.rOpen = false;
+      p.rEnd = Math.max(p.end, s.end);
+      p.rLabel = turnLabel(p, stats);
+    }
+  }
+
+  // 2. "<x> (started)" markers pair ONE-TO-ONE with their real twin so
+  //    concurrent same-name calls never collapse into one bar. A twin is the
+  //    marker's PARENT (talon parents the marker UNDER the marked span) or a
+  //    SIBLING of the same base name (emitter / Claude tool-start ↔ the
+  //    PostToolUse span). Sibling twins match by a stamped correlation id
+  //    (`tool.call_id`) when both carry one, else are consumed in start-time
+  //    order — so two live `Bash (started)` markers with only ONE completed
+  //    `Bash` drop exactly one marker and leave the still-running one open
+  //    (never hide EVERY same-name marker, the P2 bug). Only a genuinely
+  //    unpaired marker survives as the single provisional open band (#62).
+
+  // 2a. Parent-paired markers (talon): the marker's own PARENT is the real span.
+  for (const s of list) {
+    if (!isNamedStartMarker(s)) continue;
+    const p = parentOf(s);
+    if (p && p.name === startedBase(s.name)) s.rHide = true; // twin is the parent
+  }
+
+  // 2b. Sibling pairing, one-to-one within each parent group.
+  for (const kids of childrenOf.values()) {
+    const markers = [];
+    const reals = [];
+    for (const c of kids) {
+      if (isSummary(c)) continue;
+      if (isNamedStartMarker(c)) {
+        if (!c.rHide) markers.push(c); // not already parent-paired
+      } else if (!isMarker(c)) {
+        reals.push(c);
+      }
+    }
+    if (!markers.length || !reals.length) continue;
+    const consumed = new Set();
+    // (i) Exact correlation-id pairing (Claude's tool_use_id → tool.call_id).
+    const realsById = new Map();
+    for (const r of reals) {
+      const id = toolCallId(r);
+      if (id == null) continue;
+      let arr = realsById.get(id);
+      if (!arr) {
+        arr = [];
+        realsById.set(id, arr);
+      }
+      arr.push(r);
+    }
+    const rest = [];
+    for (const m of markers) {
+      const id = toolCallId(m);
+      const arr = id != null ? realsById.get(id) : null;
+      const hit = arr && arr.find((r) => !consumed.has(r));
+      if (hit) {
+        consumed.add(hit);
+        m.rHide = true;
+      } else {
+        rest.push(m);
+      }
+    }
+    // (ii) Name-order pairing for the rest: consume one unclaimed real per
+    //      marker in start-time order; leftover markers stay open (running).
+    if (rest.length) {
+      const realsByName = new Map();
+      for (const r of reals) {
+        if (consumed.has(r)) continue;
+        let arr = realsByName.get(r.name);
+        if (!arr) {
+          arr = [];
+          realsByName.set(r.name, arr);
+        }
+        arr.push(r);
+      }
+      const markersByBase = new Map();
+      for (const m of rest) {
+        const base = startedBase(m.name);
+        let arr = markersByBase.get(base);
+        if (!arr) {
+          arr = [];
+          markersByBase.set(base, arr);
+        }
+        arr.push(m);
+      }
+      for (const [base, ms] of markersByBase) {
+        ms.sort((a, b) => a.start - b.start);
+        const rs = realsByName.get(base) || [];
+        const n = Math.min(ms.length, rs.length);
+        for (let i = 0; i < n; i++) ms[i].rHide = true; // paired → drop the marker
+      }
+    }
+  }
+
+  // 2c. Any named start marker still unpaired is the single provisional open
+  //     band out to the live edge until its twin arrives.
+  for (const s of list) {
+    if (!isNamedStartMarker(s) || s.rHide) continue;
+    s.rOpen = true;
+    s.rEnd = s.end;
+  }
+
+  // 3. Turn roots: close at the summary child (step 1), else the next turn's
+  //    start in the same session, else session end, else — live tail only — the
+  //    right edge. A closed turn must never render open-ended.
+  const turnsBySession = new Map();
+  for (const s of list) {
+    if (!isTurnRoot(s)) continue;
+    const key = sessionKeyFor(s);
+    let arr = turnsBySession.get(key);
+    if (!arr) {
+      arr = [];
+      turnsBySession.set(key, arr);
+    }
+    arr.push(s);
+  }
+  for (const [key, turns] of turnsBySession) {
+    turns.sort((a, b) => a.start - b.start);
+    for (let i = 0; i < turns.length; i++) {
+      const t = turns[i];
+      if (t.rSummary) {
+        t.rOpen = false; // closed by its own summary
+        continue;
+      }
+      const next = turns[i + 1];
+      if (next) {
+        t.rOpen = false;
+        t.rEnd = Math.max(t.end, next.start);
+        continue;
+      }
+      const ended = sessionEnd.get(key);
+      if (ended != null) {
+        t.rOpen = false;
+        t.rEnd = Math.max(t.end, ended);
+      } else {
+        t.rOpen = true; // genuinely the live tail
+      }
+    }
+  }
+
+  // 4. Invariant: no descendant of a CLOSED turn root may extend past its end.
+  //    A descendant still open (or closing later) is pinned to the turn end — an
+  //    open child of a closed turn would otherwise paint to the live right edge.
+  for (const t of list) {
+    if (!isTurnRoot(t) || t.rOpen) continue;
+    const limit = t.rEnd;
+    const stack = (childrenOf.get(t.spanId) || []).slice();
+    const seen = new Set();
+    while (stack.length) {
+      const d = stack.pop();
+      if (seen.has(d)) continue;
+      seen.add(d);
+      const eff = d.rOpen ? nowMs : d.rEnd;
+      if (eff > limit) {
+        d.rOpen = false;
+        d.rEnd = Math.max(d.start, limit);
+      }
+      for (const c of childrenOf.get(d.spanId) || []) stack.push(c);
+    }
+  }
+
+  return list;
+}
+
+// Live-poll re-fetch floor per project: the EARLIEST start among still-open
+// spans (as resolved by `annotateRenderModel` — call it first). The producers
+// backdate every close/summary/twin to an earlier start — a completed tool span
+// starts at its pre-tool marker's timestamp, a turn/session summary at its
+// turn/session start — so a forward-only `startTime > watermark` poll, whose
+// watermark already passed those anchors, would NEVER re-fetch them and the turn
+// would stay open / the marker unpaired until a reload. Backing the next poll's
+// startTime down to this floor (an open anchor's start ≤ its awaited close's
+// start) guarantees the close is pulled; once it lands the anchor resolves
+// (rOpen=false) and drops out of the floor, so polling stops re-fetching it
+// (#62 P1). Pure + exported for the render-model tests.
+export function openStartFloors(spanIter) {
+  const floors = new Map(); // projectId → earliest still-open span start
+  for (const s of spanIter) {
+    if (s.rOpen !== true) continue;
+    const key = s.projectId != null ? s.projectId : null;
+    const cur = floors.get(key);
+    if (cur == null || s.start < cur) floors.set(key, s.start);
+  }
+  return floors;
 }
 
 // Local wall-clock HH:MM:SS for the ruler ticks and tooltips.
@@ -166,6 +528,7 @@ export function mount(container, opts = {}) {
   const projects = []; // [{id, name}] — DEFAULT_PROJECT first
   const watermarks = new Map(); // projectId → newest startTime ms fetched (live)
   const historyFloor = new Map(); // projectId → oldest startTime ms fetched
+  const openFloors = new Map(); // projectId → earliest still-open span start (live re-fetch floor, #62 P1)
   const projectFetching = new Set(); // projectId → history fetch in flight
 
   // ── Layout cache (rebuilt on data / collapse change, projected each frame) ──
@@ -387,7 +750,16 @@ export function mount(container, opts = {}) {
   async function pollProject(projectId, projectName) {
     let startMs = watermarks.get(projectId);
     if (startMs == null) startMs = viewStart();
-    else startMs += 1; // startTime > watermark (right-open), avoid re-pulling it
+    else {
+      startMs += 1; // startTime > watermark (right-open), avoid re-pulling it
+      // Back the cursor down to this project's earliest still-open span so the
+      // poll re-fetches BACKDATED closes/summaries/twins (their start ≤ that
+      // open anchor's start, ≤ the watermark) that a forward-only walk skips —
+      // else live turns stay open and markers unpaired until reload (#62 P1).
+      // Re-merges are idempotent; only genuinely new closes count as `added`.
+      const floor = openFloors.get(projectId);
+      if (floor != null && floor < startMs) startMs = floor;
+    }
     let after = null;
     let added = 0;
     for (let page = 0; page < MAX_POLL_PAGES; page++) {
@@ -611,6 +983,17 @@ export function mount(container, opts = {}) {
       if (e > end) end = e;
       if (isOpen(s)) open = true;
     }
+    // Fold the session summary (parented to the session root, hidden as a bar)
+    // into the band: its stats power the band click popover and its end closes
+    // the band even when the last turn's own summary landed earlier (#62).
+    let summary = null;
+    for (const s of members) {
+      if (s.rSummary && s.rSummary.kind === "session") {
+        summary = s.rSummary;
+        break;
+      }
+    }
+    if (summary && !open && summary.end > end) end = summary.end;
     const rep = roots[0] || members[0];
     return {
       tracks: total || 1,
@@ -619,39 +1002,11 @@ export function mount(container, opts = {}) {
       start,
       end,
       open,
+      summary,
       sessionId: rep ? rep.sessionId : null,
       traceId: rep ? rep.traceId : null,
       count: members.length,
     };
-  }
-
-  // Drop provisional "<name> (started)" markers once their real closed span has
-  // arrived under the same parent (name-pairing dedupe); survivors stay and
-  // render open-ended (#54.5).
-  function suppressStartedMarkers(laneItems) {
-    let hasMarker = false;
-    const realNames = new Map(); // parentId → Set(real span names)
-    for (const it of laneItems) {
-      const s = it.span;
-      if (s.marker === MARKER_START) {
-        hasMarker = true;
-        continue;
-      }
-      const key = s.parentId || "";
-      let set = realNames.get(key);
-      if (!set) {
-        set = new Set();
-        realNames.set(key, set);
-      }
-      set.add(s.name);
-    }
-    if (!hasMarker) return laneItems;
-    return laneItems.filter((it) => {
-      const s = it.span;
-      if (s.marker !== MARKER_START) return true;
-      const set = realNames.get(s.parentId || "");
-      return !(set && set.has(startedBase(s.name)));
-    });
   }
 
   // Group a lane's spans into session bands keyed by each span's lane-local ROOT
@@ -662,7 +1017,10 @@ export function mount(container, opts = {}) {
   // start-time order — concurrent sessions own disjoint track ranges and can
   // never interleave (the bug this kills). Lane height = Σ per-session tracks.
   function laneBands(laneItems, nowMs) {
-    const items = suppressStartedMarkers(laneItems);
+    // Marker↔twin pairing and summary folding are resolved up front in
+    // `annotateRenderModel` (rHide spans are already filtered out in buildLayout),
+    // so a lane's items are just what should paint.
+    const items = laneItems;
     const bySpanId = new Map();
     for (const it of items) if (it.span.spanId) bySpanId.set(it.span.spanId, it.span);
     const laneRoot = (s) => {
@@ -720,6 +1078,7 @@ export function mount(container, opts = {}) {
         start: band.start,
         end: band.end,
         open: band.open,
+        summary: band.summary,
         trackTop: offset,
         trackCount: band.tracks,
         count: band.count,
@@ -731,9 +1090,18 @@ export function mount(container, opts = {}) {
 
   function buildLayout() {
     const nowMs = Date.now();
+    // Resolve the render model first: pair "(started)" markers with their twin,
+    // close turn bands at their summary/next-turn, fold summaries. rHide spans
+    // (paired markers, summary bars) are then excluded from every lane (#62).
+    annotateRenderModel(spans.values(), nowMs);
+    // Recompute the live re-fetch floors from the just-resolved openness so the
+    // next poll pulls backdated closes for still-open work (#62 P1).
+    openFloors.clear();
+    for (const [k, v] of openStartFloors(spans.values())) openFloors.set(k, v);
     // Bucket by project → agent → worker(null = the agent's own band).
     const byProject = new Map();
     for (const s of spans.values()) {
+      if (s.rHide) continue;
       let pm = byProject.get(s.projectName);
       if (!pm) {
         pm = new Map();
@@ -1022,8 +1390,11 @@ export function mount(container, opts = {}) {
       };
       for (const s of list) {
         const open = isOpen(s);
-        const sEnd = open ? rightT : s.end;
-        const tick = !open && s.instant;
+        const closedEnd = s.rEnd != null ? s.rEnd : s.end;
+        const sEnd = open ? rightT : closedEnd;
+        // A true instant (zero-width) is a tick; a turn root whose band end was
+        // folded in from its summary (rEnd > start) paints as a labeled bar.
+        const tick = !open && closedEnd <= s.start;
         const x = timeToX(s.start);
         const rawW = tick ? 2 : (sEnd - s.start) * pxPerMs();
         const cx = Math.max(GUTTER_W, x);
@@ -1061,7 +1432,9 @@ export function mount(container, opts = {}) {
           ctx.fillRect(cx + w - 2, ry, 2, bh);
           ctx.globalAlpha = 1;
         }
-        // Label the block when it's wide enough to read.
+        // Label the block when it's wide enough to read — an informative band
+        // label ("turn 16 · 12 tools · 3m 40s") when folded from a summary, else
+        // the bare span name. Clipped to the bar; truncation is the clip.
         if (w > 46) {
           ctx.fillStyle = "#0b1120";
           ctx.font = "10px system-ui, sans-serif";
@@ -1069,7 +1442,7 @@ export function mount(container, opts = {}) {
           ctx.beginPath();
           ctx.rect(cx, ry, w, bh);
           ctx.clip();
-          ctx.fillText(s.name, cx + 3, ry + bh / 2);
+          ctx.fillText(s.rLabel || s.name, cx + 3, ry + bh / 2);
           ctx.restore();
         }
         drawn.push({ x: cx, y: ry, w, h: bh, span: s });
@@ -1131,17 +1504,25 @@ export function mount(container, opts = {}) {
           ? `trace ${b.traceId}`
           : "session";
       const dur = b.end > b.start ? fmtDuration((b.open ? viewEnd : b.end) - b.start) : "";
+      // Fold the session summary stats (tool count, success ratio) into the
+      // band hover when present (#62).
+      const sum = b.summary;
+      const stats = sum
+        ? `${sum.toolCount != null ? `${sum.toolCount} tool${sum.toolCount === 1 ? "" : "s"}` : ""}${
+            sum.successRatio != null ? ` · ${Math.round(sum.successRatio * 100)}% ok` : ""
+          }`
+        : "";
       html =
         `<b>${escapeHtml(title)}</b>` +
         `<div class="obs-tl__tipdim">${b.count} span${b.count === 1 ? "" : "s"}${
           dur ? ` · ${escapeHtml(dur)}` : ""
-        }${b.open ? " · live" : ""}</div>`;
+        }${b.open ? " · live" : ""}</div>` +
+        (stats.trim() ? `<div class="obs-tl__tipdim">${escapeHtml(stats.trim())}</div>` : "");
     } else if (d.span) {
       const s = d.span;
-      const dur = isOpen(s) ? "running" : s.instant ? "instant" : fmtDuration(s.end - s.start);
       html =
-        `<b>${escapeHtml(s.name)}</b>` +
-        `<div class="obs-tl__tipdim">${escapeHtml(s.kind)} · ${escapeHtml(dur)} · ${escapeHtml(s.status)}</div>` +
+        `<b>${escapeHtml(s.rLabel || s.name)}</b>` +
+        `<div class="obs-tl__tipdim">${escapeHtml(s.kind)} · ${escapeHtml(durText(s))} · ${escapeHtml(s.status)}</div>` +
         (s.model ? `<div class="obs-tl__tipdim">model: ${escapeHtml(s.model)}</div>` : "");
     } else {
       hideTip();
@@ -1202,9 +1583,17 @@ export function mount(container, opts = {}) {
     add("kind", s.kind);
     add("agent", s.agent);
     if (s.worker) add("worker", s.worker);
-    add("duration", isOpen(s) ? "running" : s.instant ? "instant" : fmtDuration(s.end - s.start));
+    add("duration", durText(s));
     add("status", s.status);
     add("started", `${fmtClock(s.start, true)} · ${relTime(s.start)}`);
+    // Folded summary stats — a turn/session band answers "what was this turn":
+    // tool count, success ratio, turn count (read off the summary attrs, #62).
+    if (s.rSummary) {
+      const sum = s.rSummary;
+      if (sum.turnCount != null) add("turns", sum.turnCount);
+      if (sum.toolCount != null) add("tools", sum.toolCount);
+      if (sum.successRatio != null) add("success", `${Math.round(sum.successRatio * 100)}%`);
+    }
     if (s.model) add("model", s.model);
     if (sessionId) add("session", sessionId);
     if (s.traceId) add("trace", s.traceId);
@@ -1225,7 +1614,7 @@ export function mount(container, opts = {}) {
     const canPhx = Boolean(openTrace && s.traceId && s.projectId);
     popEl.innerHTML = `
       <div class="obs-tl__phead">
-        <span class="obs-tl__ptitle" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
+        <span class="obs-tl__ptitle" title="${escapeHtml(s.name)}">${escapeHtml(s.rLabel || s.name)}</span>
         <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
       </div>
       <div class="obs-tl__pbody">${rows.join("")}${io}</div>
@@ -1271,6 +1660,47 @@ export function mount(container, opts = {}) {
   function hidePopover() {
     popEl.hidden = true;
     popEl.innerHTML = "";
+  }
+
+  // The session band's click popover: the folded `session summary` stats (turn /
+  // tool count, success ratio, duration) so the band answers "what was this
+  // session" without a duplicate summary bar (#62).
+  function showBandPopover(b, clientX, clientY) {
+    const sum = b.summary;
+    if (!sum) return;
+    const rows = [];
+    const add = (k, v) => {
+      if (v == null || v === "") return;
+      rows.push(
+        `<div class="obs-tl__prow"><span class="obs-tl__pk">${escapeHtml(k)}</span>` +
+          `<span class="obs-tl__pv">${escapeHtml(String(v))}</span></div>`,
+      );
+    };
+    if (sum.turnCount != null) add("turns", sum.turnCount);
+    if (sum.toolCount != null) add("tools", sum.toolCount);
+    if (sum.successRatio != null) add("success", `${Math.round(sum.successRatio * 100)}%`);
+    add("duration", fmtDuration((b.open ? viewEnd : b.end) - b.start));
+    if (b.sessionId) add("session", b.sessionId);
+    if (b.traceId) add("trace", b.traceId);
+    const title = b.sessionId ? `session ${b.sessionId}` : "session";
+    popEl.innerHTML = `
+      <div class="obs-tl__phead">
+        <span class="obs-tl__ptitle" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+        <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
+      </div>
+      <div class="obs-tl__pbody">${rows.join("")}</div>`;
+    popEl.hidden = false;
+    const rect = bodyEl.getBoundingClientRect();
+    let x = clientX - rect.left + 12;
+    let y = clientY - rect.top + 12;
+    const pw = popEl.offsetWidth;
+    const ph = popEl.offsetHeight;
+    if (x + pw > cssW) x = Math.max(2, cssW - pw - 4);
+    if (y + ph > cssH) y = Math.max(2, cssH - ph - 4);
+    popEl.style.left = `${x}px`;
+    popEl.style.top = `${y}px`;
+    const closeBtn = popEl.querySelector("[data-pclose]");
+    if (closeBtn) closeBtn.addEventListener("click", hidePopover);
   }
 
   // ── Interaction ──
@@ -1361,7 +1791,9 @@ export function mount(container, opts = {}) {
       canvas.style.cursor = "pointer";
       showTip(d, e.clientX, e.clientY);
     } else if (d && d.band) {
-      canvas.style.cursor = "default"; // session envelope: informational, not clickable
+      // A band with folded summary stats is clickable (session popover); a bare
+      // grouping envelope stays informational.
+      canvas.style.cursor = d.band.summary ? "pointer" : "default";
       showTip(d, e.clientX, e.clientY);
     } else {
       canvas.style.cursor = d && d.project ? "pointer" : "default";
@@ -1399,7 +1831,13 @@ export function mount(container, opts = {}) {
       requestDraw();
       return;
     }
-    if (d.band) return; // session envelope: decorative, no popover
+    if (d.band) {
+      // A band with folded summary stats opens a session popover; a bare
+      // grouping envelope stays decorative.
+      if (d.band.summary) showBandPopover(d.band, clientX, clientY);
+      else hidePopover();
+      return;
+    }
     if (d.density) {
       // Zoom in centered on the density strip so its spans separate out.
       pauseLive();

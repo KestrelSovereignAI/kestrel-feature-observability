@@ -25,7 +25,9 @@ markers, one trace per turn):
   ``kestrel.marker=start``.
 - ``PreToolUse`` → an instant ``<tool> (started)`` ``TOOL`` marker
   (``kestrel.marker=start``) parented to the current turn; its start is recorded
-  keyed by ``tool_use_id`` so parallel same-name tools pair correctly.
+  keyed by ``tool_use_id`` so parallel same-name tools pair correctly. The
+  ``tool_use_id`` is also stamped as ``tool.call_id`` on the marker AND its
+  completed span so the Timeline pairs concurrent same-name calls one-to-one.
 - ``PostToolUse`` / ``PostToolUseFailure`` → a completed ``TOOL`` span parented to
   the current turn (``tool.name`` / ``tool.success`` / truncated ``tool.error``).
   ``PostToolUse`` derives success from ``tool_response``; ``PostToolUseFailure``
@@ -93,6 +95,11 @@ KESTREL_TURN_ID = "kestrel.turn_id"
 KESTREL_TURN_INDEX = "kestrel.turn_index"
 KESTREL_MARKER = "kestrel.marker"
 KESTREL_TOOL_NAME = "tool.name"
+# Non-sensitive per-call correlation id (Claude Code's ``tool_use_id``) stamped
+# on BOTH the ``<tool> (started)`` marker and its completed span so the Timeline
+# pairs concurrent same-name tools one-to-one instead of the first close hiding
+# every same-name marker (#62 P2).
+KESTREL_TOOL_CALL_ID = "tool.call_id"
 _MARKER_START = "start"
 # OpenInference INPUT_VALUE key — the user prompt stamped on the turn root when
 # opt-in prompt capture is enabled (see ``_CAPTURE_PROMPTS_ENV``).
@@ -562,9 +569,14 @@ def _start_turn(
 def _emit_tool_start(tracer: Any, state: Dict[str, Any], payload: Dict[str, Any], now_ns: int) -> None:
     """``PreToolUse`` → an instant ``<tool> (started)`` marker parented to the current turn."""
     tool_name = str(payload.get("tool_name") or "tool")
+    tool_use_id = payload.get("tool_use_id")
     attrs = _scope_attrs(state)
     attrs[KESTREL_MARKER] = _MARKER_START
     attrs[KESTREL_TOOL_NAME] = tool_name
+    # Stamp the per-call id so the Timeline pairs THIS marker with its own
+    # completed span even when concurrent same-name tools share the turn (#62 P2).
+    if tool_use_id:
+        attrs[KESTREL_TOOL_CALL_ID] = str(tool_use_id)
     tracer.emit_span(
         f"{tool_name} (started)",
         _KIND_TOOL,
@@ -578,7 +590,7 @@ def _emit_tool_start(tracer: Any, state: Dict[str, Any], payload: Dict[str, Any]
     # Key by tool_use_id when Claude Code provides one so concurrent same-name
     # tools (parallel Bash calls) pair to their OWN start; fall back to the name.
     pending = state.setdefault("pending_tools", {})
-    key = _pending_key(tool_name, payload.get("tool_use_id"))
+    key = _pending_key(tool_name, tool_use_id)
     pending.setdefault(key, []).append(now_ns)
 
 
@@ -682,6 +694,10 @@ def _emit_tool_span(
         extra["tool.duration_ms"] = duration_ms
 
     attrs = _scope_attrs(state)
+    # Same per-call id as the marker so the Timeline pairs this completed span to
+    # its own "(started)" marker among concurrent same-name calls (#62 P2).
+    if tool_use_id:
+        attrs[KESTREL_TOOL_CALL_ID] = str(tool_use_id)
     if not success:
         err = _error_text(payload)
         if err:
