@@ -77,10 +77,17 @@ discovery is OTel-standard:
 
 When no OTLP endpoint is configured the tracer is a **no-op** — no provider, no
 exporter, no network — so the emit path costs nothing and the agent runs
-unaffected (Prometheus counters still fire locally). A session `run_span` is
-opened lazily on the first lifecycle event and closed on `Stop`/`AgentTerminate`;
-each `PostToolUse` emits a child `tool_span` carrying tool name, real duration,
-and success. `orchestrator` is the agent itself when self-driven, else inherited.
+unaffected (Prometheus counters still fire locally). The span shape is the nested
+doll **session ⊃ turn ⊃ tool ⊃ tool-start markers**, one trace per turn (the
+session band is an attribute grouping — `kestrel.session_id` is stamped on every
+span — not a trace). A session-marker root is exported lazily on the first
+lifecycle event; each `UserPromptSubmit` starts a turn (a new trace root
+`<agent> turn <n>`, tagged `kestrel.turn_id`/`kestrel.turn_index`); each
+`PreToolUse` emits an instant `<tool> (started)` marker and each `PostToolUse` a
+child `tool_span` (tool name, real duration, success) parented to the current
+turn; `Stop` emits a `turn <n> summary` (the session stays live), and
+`AgentTerminate`/teardown emits the true `session summary` aggregating turns.
+`orchestrator` is the agent itself when self-driven, else inherited.
 
 ## Privacy
 
