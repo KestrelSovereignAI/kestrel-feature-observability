@@ -34,6 +34,13 @@ process boundaries):
   warning logged) and the host skips the panel instead of crashing the feature
   scan.
 
+> **Embed note:** the browser console may log `No HydrateFallback element
+> provided to render during initial hydration` on the Phoenix subtab — this
+> comes from Phoenix's own React Router bundle (vendor-streamdown chunk) during
+> SPA hydration and is expected upstream noise (cosmetic, no functional impact);
+> the arize-phoenix bump that resolves it is blocked by kestrel-sovereign's
+> `fastapi` pin.
+
 > This package supersedes the separate `kestrel-feature-observability-fleet`
 > package, which is deprecated.
 

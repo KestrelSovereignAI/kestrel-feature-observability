@@ -293,6 +293,7 @@ function mountPhoenix(container, opts = {}) {
 
   let destroyed = false;
   let observer = null;
+  let sizeObserver = null;
 
   const curate = curationEnabled();
   const project = ((opts.project || "").trim()) || DEFAULT_PROJECT;
@@ -318,6 +319,62 @@ function mountPhoenix(container, opts = {}) {
     } catch (_e) {
       /* non-fatal: uncurated embed */
     }
+  }
+
+  // Defer a callback until `el` has real (non-zero) layout dimensions (issue
+  // #60). Assigning the iframe `src` while the panel's flex layout is still
+  // resolving lets Phoenix's first render pass (its bundled recharts) measure a
+  // not-yet-laid-out 0-size container and log `width(-1)/height(-1)` — the #49
+  // resize nudge fixes the render after the fact, but the first-measure warning
+  // has already printed. We hold `src` until the panel reports a real box: fire
+  // synchronously when it already has one, else wait on a `ResizeObserver` (with
+  // a bounded ~1s rAF fallback where unsupported) and run once on the first
+  // non-zero measurement, then disconnect. Teardown-safe: no-op after destroy,
+  // and the observer is also disconnected from the destroy path.
+  function whenPanelSized(el, cb) {
+    if (destroyed) return;
+    const sized = () => el.offsetWidth > 0 && el.offsetHeight > 0;
+    if (sized()) {
+      cb();
+      return;
+    }
+    const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const Observer = win && win.ResizeObserver;
+    if (typeof Observer === "function") {
+      sizeObserver = new Observer(() => {
+        if (destroyed || !sized()) return;
+        if (sizeObserver) {
+          try {
+            sizeObserver.disconnect();
+          } catch (_e) {
+            /* ignore */
+          }
+          sizeObserver = null;
+        }
+        cb();
+      });
+      sizeObserver.observe(el);
+      return;
+    }
+    // Fallback where ResizeObserver is unavailable: a bounded rAF loop capped at
+    // ~1s (≈60 frames). If the panel never reports a real box within the budget
+    // we assign `src` anyway on the final tick so the embed still loads.
+    const raf =
+      typeof win.requestAnimationFrame === "function"
+        ? win.requestAnimationFrame.bind(win)
+        : null;
+    let tries = 0;
+    const MAX_TRIES = 60;
+    const tick = () => {
+      if (destroyed) return;
+      if (sized() || !raf || tries >= MAX_TRIES) {
+        cb();
+        return;
+      }
+      tries += 1;
+      raf(tick);
+    };
+    tick();
   }
 
   async function renderIframe() {
@@ -368,14 +425,21 @@ function mountPhoenix(container, opts = {}) {
     // it is subject to the same load-time not-found fallback above.
     const src = traceUrl || (await chooseSrc(project, curate));
     if (destroyed || !panelEl) return;
-    iframe.src = src;
+    // Attach the (still src-less) frame so the panel lays out, then hold `src`
+    // until the panel reports a real box (issue #60) — Phoenix's first recharts
+    // measure then never samples a 0-size container (`width(-1)/height(-1)`).
     panelEl.replaceChildren(iframe);
-    // Activation nudge (issue #49): the frame just entered the now-visible
-    // Phoenix subtab. Dispatch a resize so recharts re-measures against the real
-    // container size even if it sampled a hidden/0-size box first; the load
-    // handler dispatches again once Phoenix finishes loading. Belt-and-suspenders
-    // so recharts never latches a 0-size container whichever frame flex settles.
-    dispatchIframeResize(iframe);
+    whenPanelSized(panelEl, () => {
+      if (destroyed) return;
+      iframe.src = src;
+      // Activation nudge (issue #49): the frame just entered the now-visible
+      // Phoenix subtab. Dispatch a resize so recharts re-measures against the
+      // real container size even if it sampled a hidden/0-size box first; the
+      // load handler dispatches again once Phoenix finishes loading.
+      // Belt-and-suspenders so recharts never latches a 0-size container
+      // whichever frame flex settles.
+      dispatchIframeResize(iframe);
+    });
   }
 
   function renderNotice() {
@@ -406,6 +470,17 @@ function mountPhoenix(container, opts = {}) {
           /* ignore */
         }
         observer = null;
+      }
+      // Disconnect the deferred-src size observer too (issue #60): a teardown
+      // mid-wait must not leave a live ResizeObserver, and the `destroyed` guard
+      // makes any pending `src` assignment a no-op.
+      if (sizeObserver) {
+        try {
+          sizeObserver.disconnect();
+        } catch (_e) {
+          /* ignore */
+        }
+        sizeObserver = null;
       }
     },
   };
