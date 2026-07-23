@@ -89,6 +89,97 @@ turn; `Stop` emits a `turn <n> summary` (the session stays live), and
 `AgentTerminate`/teardown emits the true `session summary` aggregating turns.
 `orchestrator` is the agent itself when self-driven, else inherited.
 
+## Claude Code hook emitter
+
+The same package ships a **`kestrel-obs-claude-hook`** console script so that
+**Claude Code** sessions land in the fleet Observability Timeline exactly like
+kestrel agents and talon runs. Claude Code's hooks system runs a shell command
+per lifecycle event with a JSON payload on stdin; this script turns those events
+into the identical span shape as the in-process emitter above — session ⊃ turn ⊃
+tool ⊃ tool-start markers, one trace per turn — posted over OTLP/HTTP:
+
+- `SessionStart` → an immediately-ended `AGENT` session-marker root
+  (`kestrel.session_id` = the Claude session id, `kestrel.agent_name` =
+  `claude-code`, `kestrel.orchestrator` = `$KESTREL_OBSERVABILITY_ORCHESTRATOR`
+  else `Direct`).
+- `UserPromptSubmit` → a labeled `claude-code turn <n>` root (a new trace).
+- `PreToolUse` → an instant `<tool> (started)` marker under the current turn.
+- `PostToolUse` / `PostToolUseFailure` → a completed `tool_span` under the current
+  turn. `PostToolUse` fires after a tool **succeeds**; failed tools fire the
+  separate `PostToolUseFailure` event (top-level `error` / `duration_ms`), which
+  is recorded as a failed span. Duration prefers the payload's own `duration_ms`,
+  else the gap to the paired `PreToolUse`.
+- `Stop` → a `turn <n> summary` (the session stays live); `SessionEnd` (and a
+  defensive staleness sweep) → the true `session summary` and state cleanup.
+
+A `SessionStart` with `source` `compact`/`resume`/`fork` preserves the live
+session (Claude Code reuses the `session_id`), so compaction never resets the
+turn counter or duplicates turn ids.
+
+Each hook invocation is its own process, so a tiny per-session state file
+(`$KESTREL_OBS_CLAUDE_STATE_DIR`, else `$XDG_STATE_HOME/kestrel-obs-claude`, else
+`$TMPDIR/kestrel-obs-claude/<session_id>.json`, written atomically) carries the
+session/turn trace + span ids so spans across invocations share traces with no
+daemon. The `openinference.project.name` (project = repo) is resolved from the
+payload `cwd`'s git remote (`owner/repo`), else `$KESTREL_OTEL_PROJECT`, else
+omitted, and cached per session. The script **always exits 0, prints nothing to
+stdout** (Claude Code interprets `PreToolUse`/`Stop` stdout for gating), never
+records the user prompt, and is an **instant no-op** — OpenTelemetry is never even
+imported — when neither `OTEL_EXPORTER_OTLP_ENDPOINT` nor
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set.
+
+### Wiring it into Claude Code
+
+Hooks live in `~/.claude/hooks/` by convention; add a thin wrapper that pins the
+endpoint and execs the console script (keeping the endpoint out of your global
+env), matching the existing hook-directory layout:
+
+```bash
+# ~/.claude/hooks/obs-emit.sh
+#!/usr/bin/env bash
+exec env OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:6006 kestrel-obs-claude-hook
+```
+
+```bash
+chmod +x ~/.claude/hooks/obs-emit.sh
+```
+
+Then register the wrapper on the lifecycle events in `~/.claude/settings.json`.
+`settings.json` supports **multiple** hooks per event, so these are **added
+alongside** any existing entries (e.g. a `PreToolUse` guard) — never replace or
+reorder them. Note `PostToolUseFailure` alongside `PostToolUse`: failed tools
+fire a **separate** event, so without it errored tool calls would go unrecorded:
+
+```jsonc
+{
+  "hooks": {
+    "SessionStart":       [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
+    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
+    "PreToolUse":         [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
+    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
+    "Stop":               [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
+    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }]
+  }
+}
+```
+
+### Making the console script reachable
+
+The script must be on `PATH` (or invoked by absolute path) from **any** cwd,
+since Claude Code runs hooks from the project directory. Two options:
+
+- **Host venv (absolute path).** If the host installs this package into a venv,
+  point the wrapper at the absolute console-script path, e.g.
+  `exec env OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:6006 /opt/kestrel/venv/bin/kestrel-obs-claude-hook`.
+- **`uv tool install`.** `uv tool install kestrel-feature-observability` puts
+  `kestrel-obs-claude-hook` on the uv tools `PATH` (`~/.local/bin`). Note that a
+  `uv tool` venv is **isolated**: editing this package's source (or bumping a
+  dependency) does **not** update an already-installed tool — re-run
+  `uv tool install --reinstall kestrel-feature-observability` (or, for local
+  development, `uv tool install --editable .` and reinstall after dependency
+  changes) to pick up changes.
+
 ## Privacy
 
 The hook is observational — it never blocks, denies, or modifies. User-message content is **not** recorded (never stamped on any span); tool errors are truncated to 200 chars; exceptions in the hook are swallowed so they cannot affect agent operation.

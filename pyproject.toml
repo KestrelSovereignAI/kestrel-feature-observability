@@ -76,6 +76,13 @@ Homepage = "https://kestrelsovereign.com"
 Source = "https://github.com/KestrelSovereignAI/kestrel-feature-observability"
 Issues = "https://github.com/KestrelSovereignAI/kestrel-feature-observability/issues"
 
+[project.scripts]
+# Claude Code hook emitter — posts Claude Code session/turn/tool spans to the
+# OTLP endpoint. A standalone top-level module (NOT under the package) so the
+# disabled path never imports OpenTelemetry / kestrel_sdk (instant no-op when no
+# OTLP endpoint is configured).
+kestrel-obs-claude-hook = "kestrel_obs_claude_hook:main"
+
 [project.entry-points."kestrel_sovereign.features"]
 ObservabilityFeature = "kestrel_feature_observability.feature:ObservabilityFeature"
 
@@ -96,9 +103,18 @@ packages = ["kestrel_feature_observability"]
 artifacts = [
     "kestrel_feature_observability/fleet/static/**/*",
 ]
+# Ship the standalone Claude Code hook emitter module (the ``kestrel-obs-claude-hook``
+# console script) — a top-level module, so include it explicitly alongside the package.
+force-include = { "kestrel_obs_claude_hook.py" = "kestrel_obs_claude_hook.py" }
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_feature_observability/**/*", "README.md", "LICENSE", "pyproject.toml"]
+include = [
+    "kestrel_feature_observability/**/*",
+    "kestrel_obs_claude_hook.py",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
