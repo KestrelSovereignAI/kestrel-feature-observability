@@ -72,6 +72,9 @@ def emitter(monkeypatch, tmp_path):
     monkeypatch.setenv("KESTREL_OBS_CLAUDE_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("KESTREL_OBSERVABILITY_ORCHESTRATOR", raising=False)
     monkeypatch.delenv("KESTREL_OTEL_PROJECT", raising=False)
+    # Prompt capture is opt-in; keep it off by default so tests are deterministic.
+    monkeypatch.delenv("KESTREL_OTEL_CAPTURE_PROMPTS", raising=False)
+    monkeypatch.delenv("KESTREL_OTEL_MAX_IO_CHARS", raising=False)
     monkeypatch.setattr(chook, "_build_tracer", _memory_build_tracer(exporter))
     monkeypatch.setattr(chook, "_git_remote_slug", lambda cwd: None)
     return exporter
@@ -665,3 +668,72 @@ class TestParallelTools:
         chook._handle(_payload("Stop"), now_ns=ns + 6)
         summary = _by_name(emitter.get_finished_spans())["turn 1 summary"]
         assert summary.attributes["kestrel.tool_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 13. Turn-root prompt capture (opt-in) + complete summary stats (#63)
+# ---------------------------------------------------------------------------
+
+class TestTurnPromptCapture:
+    def test_prompt_not_captured_by_default(self, emitter):
+        ns = 11_000_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit", prompt="hello world"), now_ns=ns + 1)
+        turn = _by_name(emitter.get_finished_spans())["claude-code turn 1"]
+        assert "input.value" not in turn.attributes
+
+    def test_prompt_captured_when_opted_in(self, emitter, monkeypatch):
+        monkeypatch.setenv("KESTREL_OTEL_CAPTURE_PROMPTS", "1")
+        ns = 11_100_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit", prompt="hello world"), now_ns=ns + 1)
+        turn = _by_name(emitter.get_finished_spans())["claude-code turn 1"]
+        assert turn.attributes["input.value"] == "hello world"
+
+    def test_prompt_truncated_to_env_cap(self, emitter, monkeypatch):
+        monkeypatch.setenv("KESTREL_OTEL_CAPTURE_PROMPTS", "1")
+        monkeypatch.setenv("KESTREL_OTEL_MAX_IO_CHARS", "5")
+        ns = 11_200_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit", prompt="x" * 40), now_ns=ns + 1)
+        turn = _by_name(emitter.get_finished_spans())["claude-code turn 1"]
+        assert turn.attributes["input.value"] == "x" * 5
+
+    def test_prompt_default_cap_is_20000(self, emitter, monkeypatch):
+        monkeypatch.setenv("KESTREL_OTEL_CAPTURE_PROMPTS", "1")
+        ns = 11_300_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit", prompt="x" * 25_000), now_ns=ns + 1)
+        turn = _by_name(emitter.get_finished_spans())["claude-code turn 1"]
+        assert len(turn.attributes["input.value"]) == 20_000
+
+
+class TestSummaryStats:
+    def test_summaries_carry_error_count_and_duration(self, emitter):
+        ns = 11_400_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(
+            _payload("PostToolUse", tool_name="a", tool_response={"stdout": "ok"}),
+            now_ns=ns + 2,
+        )
+        chook._handle(
+            _payload("PostToolUseFailure", tool_name="b", error="boom"), now_ns=ns + 3
+        )
+        chook._handle(_payload("Stop"), now_ns=ns + 4)
+        chook._handle(_payload("SessionEnd"), now_ns=ns + 5)
+        spans = _by_name(emitter.get_finished_spans())
+        turn = spans["turn 1 summary"]
+        assert turn.attributes["kestrel.tool_count"] == 2
+        assert turn.attributes["kestrel.error_count"] == 1
+        assert (
+            turn.attributes["kestrel.duration_ms"]
+            == turn.attributes["kestrel.turn_duration_ms"]
+        )
+        sess = spans["session summary"]
+        assert sess.attributes["kestrel.tool_count"] == 2
+        assert sess.attributes["kestrel.error_count"] == 1
+        assert (
+            sess.attributes["kestrel.duration_ms"]
+            == sess.attributes["kestrel.session_duration_ms"]
+        )

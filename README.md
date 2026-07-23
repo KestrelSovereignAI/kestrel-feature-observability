@@ -96,6 +96,16 @@ turn; `Stop` emits a `turn <n> summary` (the session stays live), and
 `AgentTerminate`/teardown emits the true `session summary` aggregating turns.
 `orchestrator` is the agent itself when self-driven, else inherited.
 
+The `turn <n> summary` carries the per-turn stats — `kestrel.tool_count`,
+`kestrel.error_count`, `kestrel.success_ratio`, and `kestrel.duration_ms` (the
+go-forward unified key; the legacy `kestrel.turn_duration_ms` is still emitted
+alongside for back-compat) — and the `session summary` aggregates them across the
+session (`kestrel.turn_count` plus the same totals, with `kestrel.duration_ms`
+alongside the legacy `kestrel.session_duration_ms`). By default the turn root
+carries no prompt text; setting `KESTREL_OTEL_CAPTURE_PROMPTS=1` opts in to
+stamping the turn's user prompt on its root span as `input.value`, truncated to
+`KESTREL_OTEL_MAX_IO_CHARS` (default `20000`) characters.
+
 ## Claude Code hook emitter
 
 The same package ships a **`kestrel-obs-claude-hook`** console script so that
@@ -109,7 +119,10 @@ tool ⊃ tool-start markers, one trace per turn — posted over OTLP/HTTP:
   (`kestrel.session_id` = the Claude session id, `kestrel.agent_name` =
   `claude-code`, `kestrel.orchestrator` = `$KESTREL_OBSERVABILITY_ORCHESTRATOR`
   else `Direct`).
-- `UserPromptSubmit` → a labeled `claude-code turn <n>` root (a new trace).
+- `UserPromptSubmit` → a labeled `claude-code turn <n>` root (a new trace). By
+  default the root carries no prompt text; setting `KESTREL_OTEL_CAPTURE_PROMPTS=1`
+  opts in to stamping the payload's `prompt` on the turn root as `input.value`,
+  truncated to `KESTREL_OTEL_MAX_IO_CHARS` (default `20000`) characters.
 - `PreToolUse` → an instant `<tool> (started)` marker under the current turn.
 - `PostToolUse` / `PostToolUseFailure` → a completed `tool_span` under the current
   turn. `PostToolUse` fires after a tool **succeeds**; failed tools fire the
@@ -117,7 +130,12 @@ tool ⊃ tool-start markers, one trace per turn — posted over OTLP/HTTP:
   is recorded as a failed span. Duration prefers the payload's own `duration_ms`,
   else the gap to the paired `PreToolUse`.
 - `Stop` → a `turn <n> summary` (the session stays live); `SessionEnd` (and a
-  defensive staleness sweep) → the true `session summary` and state cleanup.
+  defensive staleness sweep) → the true `session summary` and state cleanup. The
+  turn summary carries `kestrel.tool_count`, `kestrel.error_count`,
+  `kestrel.success_ratio`, and `kestrel.duration_ms` (with the legacy
+  `kestrel.turn_duration_ms` alongside); the session summary aggregates them
+  (`kestrel.turn_count` plus the same totals, `kestrel.duration_ms` alongside the
+  legacy `kestrel.session_duration_ms`).
 
 A `SessionStart` with `source` `compact`/`resume`/`fork` preserves the live
 session (Claude Code reuses the `session_id`), so compaction never resets the
@@ -190,6 +208,8 @@ since Claude Code runs hooks from the project directory. Two options:
 ## Privacy
 
 The hook is observational — it never blocks, denies, or modifies. User-message content is **not** recorded (never stamped on any span); tool errors are truncated to 200 chars; exceptions in the hook are swallowed so they cannot affect agent operation.
+
+Prompt capture is strictly opt-in: setting `KESTREL_OTEL_CAPTURE_PROMPTS=1` (off by default) stamps the turn's user prompt on the turn-root span as `input.value`, truncated to `KESTREL_OTEL_MAX_IO_CHARS` (default `20000`) characters — nothing changes unless an operator explicitly enables it at their own wiring point.
 
 ## Dependencies
 
