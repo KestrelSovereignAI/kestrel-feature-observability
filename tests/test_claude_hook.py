@@ -642,6 +642,36 @@ class TestParallelTools:
         # A: 4ms - 1ms = 3ms; B: 6ms - 2ms = 4ms. LIFO-by-name would give 2/5ms.
         assert durations == pytest.approx([3.0, 4.0])
 
+    def test_tool_use_id_stamped_as_call_id_on_marker_and_span(self, emitter):
+        # The Timeline pairs concurrent same-name tools one-to-one by tool.call_id,
+        # so BOTH the "(started)" marker and the completed span must carry it (#62).
+        ns = 9_500_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="tc-1"), now_ns=ns + 2)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_use_id="tc-1", tool_response={"stdout": "ok"}),
+            now_ns=ns + 3,
+        )
+        by_name = _by_name(emitter.get_finished_spans())
+        assert by_name["Bash (started)"].attributes["tool.call_id"] == "tc-1"
+        assert by_name["Bash"].attributes["tool.call_id"] == "tc-1"
+
+    def test_missing_tool_use_id_omits_call_id(self, emitter):
+        # No id (the in-process emitter path shape) → no tool.call_id stamped; the
+        # Timeline falls back to name-order pairing.
+        ns = 9_700_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash"), now_ns=ns + 2)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_response={"stdout": "ok"}),
+            now_ns=ns + 3,
+        )
+        by_name = _by_name(emitter.get_finished_spans())
+        assert "tool.call_id" not in by_name["Bash (started)"].attributes
+        assert "tool.call_id" not in by_name["Bash"].attributes
+
     def test_session_lock_is_clean_and_counts_accumulate(self, emitter):
         # The per-session lock must acquire + release cleanly (sequential events
         # unaffected, counters accumulate across separate invocations).
