@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # --- dep degrades to a pure no-op rather than breaking the agent import path.
 try:
     from opentelemetry import trace as _trace
+    from opentelemetry.context import Context as _Context
     from opentelemetry.trace import set_span_in_context as _set_span_in_context
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import Resource
@@ -49,6 +50,7 @@ try:
 
     _OTEL_AVAILABLE = True
 except Exception:  # noqa: BLE001 - degrade to no-op tracing when SDK absent
+    _Context = None
     _set_span_in_context = None
     _OTEL_AVAILABLE = False
 
@@ -307,6 +309,7 @@ class KestrelTracer:
         kind: str,
         *,
         parent: Optional[Any] = None,
+        root: bool = False,
         start_time: Optional[int] = None,
         agent_name: Optional[str] = None,
         stage: Optional[str] = None,
@@ -325,6 +328,13 @@ class KestrelTracer:
 
         - ``parent`` (a live span) sets explicit nesting — required because the
           span is never current, so implicit-context parenting won't apply.
+        - ``root=True`` (with no ``parent``) forces a brand-new trace root by
+          passing a fresh empty OTel ``Context``. Without it, OTel's
+          ``start_span(context=None)`` reads the *ambient* context, so a span
+          created while the hook runs inside an instrumented request/span would
+          silently inherit that span as its parent — merging a turn/session
+          marker into an unrelated host trace. An explicit parent always wins
+          over ``root``.
         - ``start_time`` (epoch-ns) backdates the span start (e.g. to reflect a
           tool's real runtime on a completed event).
         """
@@ -346,11 +356,15 @@ class KestrelTracer:
         if self._tracer is None:
             return _NoopSpan()
 
-        ctx = (
-            _set_span_in_context(parent)
-            if parent is not None and _set_span_in_context is not None
-            else None
-        )
+        if parent is not None and _set_span_in_context is not None:
+            # Explicit nesting under a live/already-ended parent's SpanContext.
+            ctx = _set_span_in_context(parent)
+        elif root and _Context is not None:
+            # Fresh empty context → a new trace root, immune to any ambient span
+            # the caller happens to be running inside (never inherits it).
+            ctx = _Context()
+        else:
+            ctx = None
         return self._tracer.start_span(
             name, context=ctx, start_time=start_time, attributes=span_attrs
         )
@@ -371,6 +385,7 @@ class KestrelTracer:
         kind: str,
         *,
         parent: Optional[Any] = None,
+        root: bool = False,
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         **kwargs: Any,
@@ -382,8 +397,13 @@ class KestrelTracer:
         is read, so referencing an already-exported root is valid). ``start_time``
         / ``end_time`` are epoch-ns. Returns the ended span so the caller can
         reuse its ``SpanContext`` as the parent of later children.
+
+        Pass ``root=True`` (with no ``parent``) to force a new trace root that
+        never inherits an ambient/instrumented span — see :meth:`_start_span`.
         """
-        span = self._start_span(name, kind, parent=parent, start_time=start_time, **kwargs)
+        span = self._start_span(
+            name, kind, parent=parent, root=root, start_time=start_time, **kwargs
+        )
         span.end(end_time=end_time)
         return span
 

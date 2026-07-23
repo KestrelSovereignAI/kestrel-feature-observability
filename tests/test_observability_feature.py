@@ -28,7 +28,13 @@ from kestrel_sdk.hooks.base import (
     HookInput,
     PermissionDecision,
 )
-from kestrel_feature_observability.hook import ObservabilityHook, KESTREL_SESSION_ID
+from kestrel_feature_observability.hook import (
+    ObservabilityHook,
+    KESTREL_SESSION_ID,
+    KESTREL_TURN_ID,
+    KESTREL_TURN_INDEX,
+    KESTREL_MARKER,
+)
 from kestrel_feature_observability.feature import ObservabilityFeature
 from kestrel_feature_observability.tracing import (
     KESTREL_AGENT_NAME,
@@ -257,6 +263,42 @@ class TestNoAmbientContextLeak:
 
         unrelated = _by_name(exporter.get_finished_spans())["unrelated"]
         assert unrelated.parent is None
+
+    @pytest.mark.asyncio
+    async def test_markers_are_roots_even_inside_ambient_span(self):
+        """Session/turn markers must be fresh trace roots even when the hook runs
+        inside an instrumented (ambient) span — never swallowed into a host trace.
+
+        Regression for #55 P1: ``emit_span`` used ``context=None``, so OTel parented
+        the marker to whatever span was current. The session marker AND the turn
+        root must each start a distinct trace with no parent.
+        """
+        provider = TracerProvider()
+        exporter = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = KestrelTracer(tracer=provider.get_tracer("test"))
+        with patch(
+            "kestrel_feature_observability.hook.configure_tracing", return_value=tracer
+        ):
+            hook = ObservabilityHook(agent=_make_agent())
+
+        # Drive the lifecycle while an unrelated host span is current, as would
+        # happen if the host request handler is itself OTel-instrumented.
+        with provider.get_tracer("host").start_as_current_span("host-request") as host:
+            host_trace_id = host.get_span_context().trace_id
+            await hook.execute(_make_input("SessionStart"))
+            await hook.execute(_make_input("UserPromptSubmit"))
+
+        spans = _by_name(exporter.get_finished_spans())
+        session_root = spans["test-agent"]
+        turn_root = spans["test-agent turn 1"]
+        # Neither marker inherits the ambient host span…
+        assert session_root.parent is None
+        assert turn_root.parent is None
+        # …and each is its own trace, distinct from the host and from each other.
+        assert session_root.context.trace_id != host_trace_id
+        assert turn_root.context.trace_id != host_trace_id
+        assert turn_root.context.trace_id != session_root.context.trace_id
 
 
 # ---------------------------------------------------------------------------
@@ -574,9 +616,10 @@ class TestToolSuccessDerivation:
     @pytest.mark.asyncio
     async def test_summary_success_ratio_reflects_status_only_envelopes(self):
         # Two external ToolResult ticks (no top-level `success`): one ok, one
-        # error. The summary success_ratio must be 0.5, not 1.0.
+        # error. The per-turn summary success_ratio must be 0.5, not 1.0.
         hook, exporter = _memory_hook()
         await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
         await hook.execute(
             _make_input(
                 "PostToolUse", tool_name="a",
@@ -590,7 +633,7 @@ class TestToolSuccessDerivation:
             )
         )
         await hook.execute(_make_input("Stop"))
-        summary = _by_name(exporter.get_finished_spans())["session summary"]
+        summary = _by_name(exporter.get_finished_spans())["turn 1 summary"]
         assert summary.attributes["kestrel.success_ratio"] == 0.5
 
 
@@ -634,9 +677,13 @@ class TestSessionRootAndSummary:
         assert spans.get("Bash") is not None
 
     @pytest.mark.asyncio
-    async def test_summary_parented_to_root_carries_totals(self):
+    async def test_summary_parented_to_turn_root_carries_totals(self):
+        # On Stop the per-cycle summary is a `turn <n> summary` parented to the
+        # turn root (NOT the misnamed "session summary" of old), carrying the
+        # per-turn totals.
         hook, exporter = _memory_hook()
         await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
         await hook.execute(
             _make_input(
                 "PostToolUse", tool_name="a",
@@ -651,13 +698,227 @@ class TestSessionRootAndSummary:
         )
         await hook.execute(_make_input("Stop"))
         spans = _by_name(exporter.get_finished_spans())
-        root, summary = spans["test-agent"], spans["session summary"]
-        assert summary.parent.span_id == root.context.span_id
-        assert summary.context.trace_id == root.context.trace_id
+        turn_root, summary = spans["test-agent turn 1"], spans["turn 1 summary"]
+        assert summary.parent.span_id == turn_root.context.span_id
+        assert summary.context.trace_id == turn_root.context.trace_id
         assert summary.attributes["kestrel.tool_count"] == 2
         assert summary.attributes["kestrel.success_ratio"] == 0.5
         assert summary.attributes["openinference.span.kind"] == "CHAIN"
         assert summary.end_time >= summary.start_time
+
+
+# ---------------------------------------------------------------------------
+# 3g. First-class turn spans: session ⊃ turn ⊃ tool ⊃ markers (#55)
+# ---------------------------------------------------------------------------
+
+class TestTurnSpans:
+    async def _drive_turn(self, hook, *, prompt_session="sess-1"):
+        """SessionStart → UserPromptSubmit → PreToolUse → PostToolUse → Stop."""
+        await hook.execute(_make_input("SessionStart", session_id=prompt_session))
+        await hook.execute(_make_input("UserPromptSubmit", session_id=prompt_session))
+        await hook.execute(
+            _make_input("PreToolUse", session_id=prompt_session, tool_name="Bash")
+        )
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id=prompt_session, tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        await hook.execute(_make_input("Stop", session_id=prompt_session))
+
+    @pytest.mark.asyncio
+    async def test_user_prompt_submit_emits_labeled_turn_root(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        turn = _by_name(exporter.get_finished_spans()).get("test-agent turn 1")
+        assert turn is not None
+        assert turn.attributes["openinference.span.kind"] == "AGENT"
+        assert turn.attributes[KESTREL_MARKER] == "start"
+        assert turn.attributes[KESTREL_SESSION_ID] == "sess-1"
+        assert turn.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        assert turn.attributes[KESTREL_TURN_INDEX] == 1
+
+    @pytest.mark.asyncio
+    async def test_turn_root_is_a_new_trace_root(self):
+        # One-trace-per-turn: the turn root has no parent and a distinct trace
+        # from the session-marker root.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        spans = _by_name(exporter.get_finished_spans())
+        session_root, turn_root = spans["test-agent"], spans["test-agent turn 1"]
+        assert turn_root.parent is None
+        assert turn_root.context.trace_id != session_root.context.trace_id
+
+    @pytest.mark.asyncio
+    async def test_tool_span_parents_to_current_turn(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        spans = _by_name(exporter.get_finished_spans())
+        turn_root, tool = spans["test-agent turn 1"], spans["Bash"]
+        assert tool.parent.span_id == turn_root.context.span_id
+        assert tool.context.trace_id == turn_root.context.trace_id
+
+    @pytest.mark.asyncio
+    async def test_pre_tool_use_emits_start_marker(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        spans = _by_name(exporter.get_finished_spans())
+        marker, turn_root = spans["Bash (started)"], spans["test-agent turn 1"]
+        assert marker.attributes["openinference.span.kind"] == "TOOL"
+        assert marker.attributes[KESTREL_MARKER] == "start"
+        assert marker.attributes["tool.name"] == "Bash"
+        assert marker.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        # Point span (instant), parented to the current turn.
+        assert marker.end_time == marker.start_time
+        assert marker.parent.span_id == turn_root.context.span_id
+
+    @pytest.mark.asyncio
+    async def test_start_marker_is_attribute_light(self):
+        # Keep it lean: no duration/feature/error, just name + session/turn ids.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(
+            _make_input("PreToolUse", tool_name="Bash", feature_name="Sec")
+        )
+        marker = _by_name(exporter.get_finished_spans())["Bash (started)"]
+        assert "tool.duration_ms" not in marker.attributes
+        assert "kestrel.feature_name" not in marker.attributes
+
+    @pytest.mark.asyncio
+    async def test_session_id_on_every_span(self):
+        hook, exporter = _memory_hook()
+        await self._drive_turn(hook)
+        spans = exporter.get_finished_spans()
+        # session marker root, turn root, tool-start marker, tool span, turn summary.
+        assert len(spans) >= 5
+        for span in spans:
+            assert span.attributes[KESTREL_SESSION_ID] == "sess-1"
+
+    @pytest.mark.asyncio
+    async def test_turn_ids_on_every_span_of_a_turn(self):
+        hook, exporter = _memory_hook()
+        await self._drive_turn(hook)
+        spans = _by_name(exporter.get_finished_spans())
+        # Every span EXCEPT the pre-turn session-marker root carries turn ids.
+        for name in ("test-agent turn 1", "Bash (started)", "Bash", "turn 1 summary"):
+            attrs = spans[name].attributes
+            assert attrs[KESTREL_TURN_ID] == "sess-1#1"
+            assert attrs[KESTREL_TURN_INDEX] == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_emits_turn_summary_not_session_summary(self):
+        hook, exporter = _memory_hook()
+        await self._drive_turn(hook)
+        spans = _by_name(exporter.get_finished_spans())
+        assert "turn 1 summary" in spans
+        # The session is NOT popped on Stop → no session summary yet.
+        assert "session summary" not in spans
+
+    @pytest.mark.asyncio
+    async def test_monotonic_turn_counter_across_turns(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("Stop"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("Stop"))
+        spans = _by_name(exporter.get_finished_spans())
+        assert spans["test-agent turn 2"].attributes[KESTREL_TURN_ID] == "sess-1#2"
+        assert spans["test-agent turn 2"].attributes[KESTREL_TURN_INDEX] == 2
+        # Two distinct per-turn traces.
+        assert (
+            spans["test-agent turn 1"].context.trace_id
+            != spans["test-agent turn 2"].context.trace_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_terminate_emits_session_summary_aggregating_turns(self):
+        hook, exporter = _memory_hook()
+        # Two turns, one tool each, then terminate.
+        for _ in range(2):
+            await hook.execute(_make_input("UserPromptSubmit"))
+            await hook.execute(
+                _make_input(
+                    "PostToolUse", tool_name="Bash",
+                    execution_time_ms=1, tool_response={"success": True},
+                )
+            )
+            await hook.execute(_make_input("Stop"))
+        await hook.execute(_make_input("AgentTerminate"))
+        spans = _by_name(exporter.get_finished_spans())
+        summary = spans["session summary"]
+        session_root = spans["test-agent"]
+        assert summary.parent.span_id == session_root.context.span_id
+        assert summary.attributes["openinference.span.kind"] == "CHAIN"
+        assert summary.attributes["kestrel.turn_count"] == 2
+        assert summary.attributes["kestrel.tool_count"] == 2
+        assert summary.attributes[KESTREL_SESSION_ID] == "sess-1"
+        # Session summary is session-scoped, not turn-scoped.
+        assert KESTREL_TURN_ID not in summary.attributes
+
+    @pytest.mark.asyncio
+    async def test_stop_does_not_pop_session(self):
+        # After Stop the session stays live: a following turn reuses the same
+        # session-marker root (one root, stable session id across turns).
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("Stop"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("Stop"))
+        roots = [s for s in exporter.get_finished_spans() if s.name == "test-agent"]
+        assert len(roots) == 1
+
+    @pytest.mark.asyncio
+    async def test_tool_before_prompt_falls_back_to_session_root(self):
+        # Events arriving before any prompt parent to the session-marker root.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=1, tool_response={"success": True},
+            )
+        )
+        spans = _by_name(exporter.get_finished_spans())
+        session_root, tool = spans["test-agent"], spans["Bash"]
+        assert tool.parent.span_id == session_root.context.span_id
+        assert KESTREL_TURN_ID not in tool.attributes
+
+    @pytest.mark.asyncio
+    async def test_scheduler_pre_tool_use_emits_no_start_marker(self):
+        # The scheduler pseudo-session must not emit a start marker for every
+        # (idle) tick — that would re-introduce the #42 noise and orphan the marker.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
+        )
+        assert exporter.get_finished_spans() == ()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_start_marker_opt_in(self):
+        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
+        )
+        assert (
+            _by_name(exporter.get_finished_spans()).get("restart_coordinator (started)")
+            is not None
+        )
 
 
 # ---------------------------------------------------------------------------
