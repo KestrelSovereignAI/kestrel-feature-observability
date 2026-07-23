@@ -922,6 +922,142 @@ class TestTurnSpans:
 
 
 # ---------------------------------------------------------------------------
+# 3h. Turn-root prompt capture (opt-in) + complete summary stats (#63)
+# ---------------------------------------------------------------------------
+
+class TestTurnPromptCapture:
+    @pytest.mark.asyncio
+    async def test_prompt_not_captured_by_default(self):
+        # Default OFF: the turn root carries no prompt text (privacy invariant).
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input("UserPromptSubmit", user_message="hello world")
+        )
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert "input.value" not in turn.attributes
+
+    @pytest.mark.asyncio
+    async def test_prompt_captured_when_opted_in(self):
+        with patch.dict("os.environ", {"KESTREL_OTEL_CAPTURE_PROMPTS": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input("UserPromptSubmit", user_message="hello world")
+        )
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert turn.attributes["input.value"] == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_prompt_truncated_to_env_cap(self):
+        with patch.dict(
+            "os.environ",
+            {"KESTREL_OTEL_CAPTURE_PROMPTS": "1", "KESTREL_OTEL_MAX_IO_CHARS": "10"},
+        ):
+            hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit", user_message="x" * 50))
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert turn.attributes["input.value"] == "x" * 10
+
+    @pytest.mark.asyncio
+    async def test_prompt_default_cap_is_20000(self):
+        with patch.dict("os.environ", {"KESTREL_OTEL_CAPTURE_PROMPTS": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit", user_message="x" * 25_000))
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert len(turn.attributes["input.value"]) == 20_000
+
+    @pytest.mark.asyncio
+    async def test_prompt_capture_prefers_rewritten_prompt(self):
+        # An earlier UserPromptSubmit hook can rewrite/redact the prompt via
+        # HookOutput.modify(updated_input={"user_message": ...}); the host merges
+        # that into HookInput.tool_input before this (last-priority) emitter runs.
+        # Capture must export the rewritten prompt the model actually saw — not the
+        # stale original in ``user_message``.
+        with patch.dict("os.environ", {"KESTREL_OTEL_CAPTURE_PROMPTS": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "UserPromptSubmit",
+                user_message="my password is hunter2",
+                tool_input={"user_message": "my password is [REDACTED]"},
+            )
+        )
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert turn.attributes["input.value"] == "my password is [REDACTED]"
+
+    @pytest.mark.asyncio
+    async def test_prompt_capture_falls_back_to_user_message(self):
+        # No upstream rewrite (tool_input carries no user_message) → the original
+        # prompt is captured unchanged.
+        with patch.dict("os.environ", {"KESTREL_OTEL_CAPTURE_PROMPTS": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(
+            _make_input(
+                "UserPromptSubmit",
+                user_message="hello world",
+                tool_input={"unrelated": "value"},
+            )
+        )
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert turn.attributes["input.value"] == "hello world"
+
+
+class TestSummaryStats:
+    @pytest.mark.asyncio
+    async def test_turn_summary_carries_error_count_and_duration(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="a",
+                execution_time_ms=1, tool_response={"success": True},
+            )
+        )
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="b",
+                execution_time_ms=1, tool_response={"success": False},
+            )
+        )
+        await hook.execute(_make_input("Stop"))
+        summary = _by_name(exporter.get_finished_spans())["turn 1 summary"]
+        assert summary.attributes["kestrel.tool_count"] == 2
+        assert summary.attributes["kestrel.error_count"] == 1
+        assert summary.attributes["kestrel.success_ratio"] == 0.5
+        # Unified go-forward key mirrors the legacy per-scope key.
+        assert (
+            summary.attributes["kestrel.duration_ms"]
+            == summary.attributes["kestrel.turn_duration_ms"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_summary_carries_error_count_and_duration(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="a",
+                execution_time_ms=1, tool_response={"success": False},
+            )
+        )
+        await hook.execute(_make_input("Stop"))
+        await hook.execute(_make_input("AgentTerminate"))
+        summary = _by_name(exporter.get_finished_spans())["session summary"]
+        assert summary.attributes["kestrel.tool_count"] == 1
+        assert summary.attributes["kestrel.error_count"] == 1
+        assert (
+            summary.attributes["kestrel.duration_ms"]
+            == summary.attributes["kestrel.session_duration_ms"]
+        )
+
+
+# ---------------------------------------------------------------------------
 # 4. No-op when unconfigured
 # ---------------------------------------------------------------------------
 

@@ -94,6 +94,9 @@ KESTREL_TURN_INDEX = "kestrel.turn_index"
 KESTREL_MARKER = "kestrel.marker"
 KESTREL_TOOL_NAME = "tool.name"
 _MARKER_START = "start"
+# OpenInference INPUT_VALUE key — the user prompt stamped on the turn root when
+# opt-in prompt capture is enabled (see ``_CAPTURE_PROMPTS_ENV``).
+_INPUT_VALUE_KEY = "input.value"
 
 # OpenInference span-kind values (uppercase literals — identical to
 # ``tracing.KIND_*`` on both the SDK-present and fallback paths).
@@ -111,6 +114,19 @@ _ENDPOINT_ENVS = (
 _ORCHESTRATOR_ENV = "KESTREL_OBSERVABILITY_ORCHESTRATOR"
 _PROJECT_ENV = "KESTREL_OTEL_PROJECT"
 _DEFAULT_ORCHESTRATOR = "Direct"
+
+# Turn-root prompt capture (opt-in; default OFF). When
+# ``KESTREL_OTEL_CAPTURE_PROMPTS`` is truthy the ``UserPromptSubmit`` prompt is
+# stamped on the turn-root span as OpenInference ``input.value``, truncated to
+# ``KESTREL_OTEL_MAX_IO_CHARS`` chars. Default OFF preserves the "user-message
+# content is never recorded" posture unless an operator opts in.
+_CAPTURE_PROMPTS_ENV = "KESTREL_OTEL_CAPTURE_PROMPTS"
+_MAX_IO_CHARS_ENV = "KESTREL_OTEL_MAX_IO_CHARS"
+# Default prompt truncation cap when ``KESTREL_OTEL_MAX_IO_CHARS`` is unset.
+# Source of truth: kestrel-talon's ``DEFAULT_MAX_IO_CHARS = 20000`` in
+# ``kestreltalon/observability.py`` (the #71 capture convention) — kept in sync
+# by reference.
+_DEFAULT_MAX_IO_CHARS = 20000
 
 # State + staleness knobs.
 _STATE_DIR_ENV = "KESTREL_OBS_CLAUDE_STATE_DIR"
@@ -150,6 +166,30 @@ def _endpoint() -> Optional[str]:
 def _orchestrator() -> str:
     """``$KESTREL_OBSERVABILITY_ORCHESTRATOR`` else ``Direct``."""
     return os.environ.get(_ORCHESTRATOR_ENV) or _DEFAULT_ORCHESTRATOR
+
+
+def _capture_prompts() -> bool:
+    """True when ``KESTREL_OTEL_CAPTURE_PROMPTS`` is truthy (opt-in; default OFF)."""
+    return os.environ.get(_CAPTURE_PROMPTS_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def _max_io_chars() -> int:
+    """The prompt truncation cap — ``KESTREL_OTEL_MAX_IO_CHARS`` else the default.
+
+    Mirrors kestrel-talon's ``DEFAULT_MAX_IO_CHARS`` (20000); a non-numeric or
+    negative value falls back to :data:`_DEFAULT_MAX_IO_CHARS`.
+    """
+    raw = os.environ.get(_MAX_IO_CHARS_ENV)
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            return _DEFAULT_MAX_IO_CHARS
+        if val >= 0:
+            return val
+    return _DEFAULT_MAX_IO_CHARS
 
 
 def _debug(msg: Any) -> None:
@@ -473,11 +513,33 @@ def _ensure_session(
     return _new_session(tracer, session_id, project, now_ns)
 
 
-def _start_turn(tracer: Any, state: Dict[str, Any], session_id: str, now_ns: int) -> None:
-    """``UserPromptSubmit`` → an immediately-ended ``<agent> turn <n>`` root (a new trace)."""
+def _start_turn(
+    tracer: Any,
+    state: Dict[str, Any],
+    session_id: str,
+    now_ns: int,
+    prompt: Optional[str] = None,
+) -> None:
+    """``UserPromptSubmit`` → an immediately-ended ``<agent> turn <n>`` root (a new trace).
+
+    When opt-in prompt capture is enabled (``KESTREL_OTEL_CAPTURE_PROMPTS=1``) the
+    ``prompt`` is stamped on the turn root as OpenInference ``input.value``
+    (truncated to the IO cap); default OFF records nothing.
+    """
     state["turn_count"] = int(state.get("turn_count", 0)) + 1
     index = state["turn_count"]
     turn_id = f"{session_id}#{index}"
+    attrs: Dict[str, Any] = {
+        KESTREL_SESSION_ID: session_id,
+        KESTREL_TURN_ID: turn_id,
+        KESTREL_TURN_INDEX: index,
+        KESTREL_MARKER: _MARKER_START,
+    }
+    # Opt-in (KESTREL_OTEL_CAPTURE_PROMPTS=1): stamp the user prompt as
+    # OpenInference ``input.value``, truncated to the IO cap. Off by default so
+    # user-message content is never recorded unless an operator enables it.
+    if prompt and _capture_prompts():
+        attrs[_INPUT_VALUE_KEY] = str(prompt)[: _max_io_chars()]
     span = tracer.emit_span(
         f"{_AGENT_NAME} turn {index}",
         _KIND_AGENT,
@@ -485,12 +547,7 @@ def _start_turn(tracer: Any, state: Dict[str, Any], session_id: str, now_ns: int
         start_time=now_ns,
         end_time=now_ns,
         agent_name=_AGENT_NAME,
-        attributes={
-            KESTREL_SESSION_ID: session_id,
-            KESTREL_TURN_ID: turn_id,
-            KESTREL_TURN_INDEX: index,
-            KESTREL_MARKER: _MARKER_START,
-        },
+        attributes=attrs,
     )
     state["current_turn"] = {
         "root": _ids_of(span),
@@ -670,7 +727,9 @@ def _close_turn(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
     if not turn:
         return
     tool_count = int(turn.get("tool_count", 0))
-    success_ratio = (turn.get("success_count", 0) / tool_count) if tool_count else 1.0
+    success_count = int(turn.get("success_count", 0))
+    success_ratio = (success_count / tool_count) if tool_count else 1.0
+    duration_ms = (now_ns - int(turn["started_ns"])) / 1_000_000
     tracer.emit_span(
         f"turn {turn['index']} summary",
         _KIND_CHAIN,
@@ -680,8 +739,13 @@ def _close_turn(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
         agent_name=_AGENT_NAME,
         extra={
             "kestrel.tool_count": tool_count,
+            "kestrel.error_count": tool_count - success_count,
             "kestrel.success_ratio": success_ratio,
-            "kestrel.turn_duration_ms": (now_ns - int(turn["started_ns"])) / 1_000_000,
+            # Unified go-forward duration key across turn + session summaries.
+            "kestrel.duration_ms": duration_ms,
+            # Legacy per-scope duration key, emitted alongside for back-compat
+            # with existing dashboards / the #62 renderer; drop in a future major.
+            "kestrel.turn_duration_ms": duration_ms,
         },
         attributes=_scope_attrs(state),
     )
@@ -694,8 +758,10 @@ def _close_session(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
     if not root:
         return
     tool_count = int(state.get("tool_count", 0))
-    success_ratio = (state.get("success_count", 0) / tool_count) if tool_count else 1.0
+    success_count = int(state.get("success_count", 0))
+    success_ratio = (success_count / tool_count) if tool_count else 1.0
     started = int(state.get("session_started_ns") or now_ns)
+    duration_ms = (now_ns - started) / 1_000_000
     tracer.emit_span(
         "session summary",
         _KIND_CHAIN,
@@ -706,8 +772,12 @@ def _close_session(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
         extra={
             "kestrel.turn_count": int(state.get("turn_count", 0)),
             "kestrel.tool_count": tool_count,
+            "kestrel.error_count": tool_count - success_count,
             "kestrel.success_ratio": success_ratio,
-            "kestrel.session_duration_ms": (now_ns - started) / 1_000_000,
+            # Unified go-forward duration key across turn + session summaries.
+            "kestrel.duration_ms": duration_ms,
+            # Legacy per-scope duration key (back-compat); drop in a future major.
+            "kestrel.session_duration_ms": duration_ms,
         },
         attributes={KESTREL_SESSION_ID: state["session_id"]},
     )
@@ -794,7 +864,7 @@ def _dispatch(
         return _new_session(tracer, session_id, project, now_ns)
     if event == "UserPromptSubmit":
         state = _ensure_session(tracer, state, session_id, project, now_ns)
-        _start_turn(tracer, state, session_id, now_ns)
+        _start_turn(tracer, state, session_id, now_ns, prompt=payload.get("prompt"))
         return state
     if event == "PreToolUse":
         state = _ensure_session(tracer, state, session_id, project, now_ns)

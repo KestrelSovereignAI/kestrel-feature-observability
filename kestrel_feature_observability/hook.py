@@ -98,6 +98,24 @@ KESTREL_TOOL_NAME = "tool.name"
 # ``kestrel.marker`` value stamped on the instant turn-root and tool-start spans.
 _MARKER_START = "start"
 
+# OpenInference INPUT_VALUE attribute key — the user prompt stamped on the turn
+# root when opt-in prompt capture is enabled (see ``_CAPTURE_PROMPTS_ENV``).
+_INPUT_VALUE_KEY = "input.value"
+
+# Turn-root prompt capture (opt-in; default OFF). When
+# ``KESTREL_OTEL_CAPTURE_PROMPTS`` is truthy the turn's user prompt is stamped on
+# the turn-root span as OpenInference ``input.value``, truncated to
+# ``KESTREL_OTEL_MAX_IO_CHARS`` chars. Default OFF preserves the package's
+# default-safe posture: user-message content is not recorded unless an operator
+# explicitly opts in at their own wiring point.
+_CAPTURE_PROMPTS_ENV = "KESTREL_OTEL_CAPTURE_PROMPTS"
+_MAX_IO_CHARS_ENV = "KESTREL_OTEL_MAX_IO_CHARS"
+# Default prompt truncation cap when ``KESTREL_OTEL_MAX_IO_CHARS`` is unset.
+# Source of truth: kestrel-talon's ``DEFAULT_MAX_IO_CHARS = 20000`` in
+# ``kestreltalon/observability.py`` (the #71 prompt/response capture convention
+# this env var comes from) — kept in sync by reference.
+_DEFAULT_MAX_IO_CHARS = 20000
+
 # OTel service name for the per-agent emitter's spans.
 _SERVICE_NAME = "kestrel-agent"
 
@@ -136,6 +154,43 @@ _WORK_KEYS = (
 def _env_flag(name: str) -> bool:
     """True when env var ``name`` is set to a truthy value (1/true/yes/on)."""
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _max_io_chars() -> int:
+    """The prompt truncation cap — ``KESTREL_OTEL_MAX_IO_CHARS`` else the default.
+
+    Mirrors kestrel-talon's ``DEFAULT_MAX_IO_CHARS`` (20000); a non-numeric or
+    negative value falls back to :data:`_DEFAULT_MAX_IO_CHARS`.
+    """
+    raw = os.environ.get(_MAX_IO_CHARS_ENV)
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            return _DEFAULT_MAX_IO_CHARS
+        if val >= 0:
+            return val
+    return _DEFAULT_MAX_IO_CHARS
+
+
+def _effective_prompt(input: HookInput) -> Optional[str]:
+    """The user prompt as it will actually reach the LLM — honoring earlier rewrites.
+
+    A ``UserPromptSubmit`` hook can rewrite/redact the prompt via
+    ``HookOutput.modify(updated_input={"user_message": ...})``; the host hook
+    manager merges that ``updated_input`` into ``HookInput.tool_input`` before the
+    next hook runs. This emitter runs last (priority 999), so a rewritten prompt
+    lives in ``tool_input["user_message"]`` while ``input.user_message`` still holds
+    the ORIGINAL text. Prefer the rewritten value so opt-in capture never exports a
+    prompt the model never saw (e.g. a redacted secret); fall back to
+    ``user_message`` when no upstream hook rewrote it.
+    """
+    tool_input = input.tool_input
+    if isinstance(tool_input, dict):
+        rewritten = tool_input.get("user_message")
+        if rewritten is not None:
+            return rewritten
+    return input.user_message
 
 
 def _tick_success(tool_response: Any) -> bool:
@@ -255,6 +310,9 @@ class ObservabilityHook(Hook):
         self._tracer: KestrelTracer = configure_tracing(service_name=_SERVICE_NAME)
         # Frozen at construction: whether to trace no-op scheduler ticks too.
         self._trace_scheduler: bool = _env_flag(_TRACE_SCHEDULER_ENV)
+        # Frozen at construction: opt-in turn-root prompt capture + its cap.
+        self._capture_prompts: bool = _env_flag(_CAPTURE_PROMPTS_ENV)
+        self._max_io_chars: int = _max_io_chars()
         # Per-session state keyed by session_id. Each holds the ALREADY-EXPORTED
         # session-marker root (for its SpanContext) plus running totals — no
         # held-open span anywhere, so nothing can arrive orphaned (#42).
@@ -341,7 +399,11 @@ class ObservabilityHook(Hook):
         return state
 
     def _start_turn(
-        self, session: _SessionState, session_id: Optional[str], agent_name: str
+        self,
+        session: _SessionState,
+        session_id: Optional[str],
+        agent_name: str,
+        user_message: Optional[str] = None,
     ) -> None:
         """Begin a turn on ``UserPromptSubmit`` — mint a new per-turn trace root.
 
@@ -351,6 +413,10 @@ class ObservabilityHook(Hook):
         ambient host span), keeping its ``SpanContext`` in session state so the
         turn's tool spans/markers/summary parent to it. Keeps the #42 invariant:
         nothing is held open — the root is exported right away.
+
+        When opt-in prompt capture is enabled (``KESTREL_OTEL_CAPTURE_PROMPTS=1``)
+        the ``user_message`` prompt is stamped on the turn root as OpenInference
+        ``input.value`` (truncated to the IO cap); default OFF records nothing.
         """
         session.turn_count += 1
         index = session.turn_count
@@ -365,6 +431,12 @@ class ObservabilityHook(Hook):
         }
         if session_id:
             attributes[KESTREL_SESSION_ID] = session_id
+
+        # Opt-in (KESTREL_OTEL_CAPTURE_PROMPTS=1): stamp the user prompt on the
+        # turn root as OpenInference ``input.value``, truncated to the IO cap. Off
+        # by default so user-message content is not recorded unless enabled.
+        if self._capture_prompts and user_message:
+            attributes[_INPUT_VALUE_KEY] = str(user_message)[: self._max_io_chars]
 
         turn_marker_ns = time.time_ns()
         root = self._tracer.emit_span(
@@ -510,12 +582,19 @@ class ObservabilityHook(Hook):
             return
         end_ns = time.time_ns()
         tool_count = turn.tool_count
-        success_ratio = (turn.success_count / tool_count) if tool_count else 1.0
+        success_count = turn.success_count
+        success_ratio = (success_count / tool_count) if tool_count else 1.0
+        duration_ms = (end_ns - turn.started_ns) / 1_000_000
 
         extra: Dict[str, Any] = {
             "kestrel.tool_count": tool_count,
+            "kestrel.error_count": tool_count - success_count,
             "kestrel.success_ratio": success_ratio,
-            "kestrel.turn_duration_ms": (end_ns - turn.started_ns) / 1_000_000,
+            # Unified go-forward duration key across turn + session summaries.
+            "kestrel.duration_ms": duration_ms,
+            # Legacy per-scope duration key, emitted alongside for back-compat
+            # with existing dashboards / the #62 renderer; drop in a future major.
+            "kestrel.turn_duration_ms": duration_ms,
         }
         # Session + turn ids on the summary too (every span of the turn carries them).
         attributes = self._scope_attrs(session, session_id)
@@ -559,13 +638,19 @@ class ObservabilityHook(Hook):
         """Emit a ``session summary`` span (parented to the root) aggregating turns + totals."""
         end_ns = time.time_ns()
         tool_count = state.tool_count
-        success_ratio = (state.success_count / tool_count) if tool_count else 1.0
+        success_count = state.success_count
+        success_ratio = (success_count / tool_count) if tool_count else 1.0
+        duration_ms = (end_ns - state.started_ns) / 1_000_000
 
         extra: Dict[str, Any] = {
             "kestrel.turn_count": state.turn_count,
             "kestrel.tool_count": tool_count,
+            "kestrel.error_count": tool_count - success_count,
             "kestrel.success_ratio": success_ratio,
-            "kestrel.session_duration_ms": (end_ns - state.started_ns) / 1_000_000,
+            # Unified go-forward duration key across turn + session summaries.
+            "kestrel.duration_ms": duration_ms,
+            # Legacy per-scope duration key (back-compat); drop in a future major.
+            "kestrel.session_duration_ms": duration_ms,
         }
         attributes: Dict[str, Any] = {}
         if session_id:
@@ -635,8 +720,13 @@ class ObservabilityHook(Hook):
                         )
                 elif event_type == "UserPromptSubmit":
                     # Start a turn: a new per-turn trace root under the session.
+                    # Use the post-rewrite prompt (an earlier hook may have
+                    # redacted/rewritten it into ``tool_input``) so capture never
+                    # exports a prompt the model never saw.
                     session = self._ensure_session(session_id, agent_name, input)
-                    self._start_turn(session, session_id, agent_name)
+                    self._start_turn(
+                        session, session_id, agent_name, _effective_prompt(input)
+                    )
                 elif event_type == "Stop":
                     # End the turn (turn summary) — but keep the session live.
                     self._close_turn(session_id, agent_name)
