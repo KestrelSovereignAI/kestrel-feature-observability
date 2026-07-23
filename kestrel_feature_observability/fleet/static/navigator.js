@@ -391,6 +391,10 @@ export function mount(container, opts = {}) {
   ensureStyles();
 
   const openTrace = typeof opts.openTrace === "function" ? opts.openTrace : null;
+  // A one-shot reveal target from the Timeline's "open in Navigator" (#54):
+  // {projectId, projectName, agentName, worker, sessionId, traceId}. Consumed
+  // once on boot to expand+scroll the tree to that session/turn, best-effort.
+  const revealTarget = opts.revealTarget || null;
 
   let destroyed = false;
   let liveFollow = false; // off by default — noise-free
@@ -1217,6 +1221,92 @@ export function mount(container, opts = {}) {
   liveBtn.addEventListener("click", () => setLive(!liveFollow));
   refreshBtn.addEventListener("click", () => pollTick(true));
 
+  // ── Timeline → Navigator reveal (#54) ──
+  //
+  // Best-effort drill-down to a Timeline span's location: expand the tree along
+  // project → agent → session → trace and scroll it into view, going only as far
+  // as the loaded data allows. Missing nodes fail soft (no error UI).
+
+  function pickChild(node, kind, pred) {
+    if (!node) return null;
+    for (const child of node.children) {
+      if (child.kind === kind && pred(child)) return child;
+    }
+    return null;
+  }
+
+  // Expand a node and await its lazy load (idempotent — a node already loaded or
+  // loading is left as-is). The loaders populate `node.children` synchronously
+  // before their promise resolves, so callers can descend right after awaiting.
+  async function ensureLoaded(node) {
+    if (!node || !node.expandable) return;
+    node.expanded = true;
+    if (!node.loaded && !node.loading) {
+      await loadChildren(node, "initial");
+    }
+  }
+
+  async function reveal(target) {
+    if (!target || destroyed) return;
+    let deepest = tenant;
+    try {
+      await ensureLoaded(tenant);
+      const project = pickChild(
+        tenant,
+        "project",
+        (n) =>
+          (target.projectId != null && n.data.projectId === target.projectId) ||
+          (target.projectName != null && n.data.projectName === target.projectName),
+      );
+      if (!project) return;
+      deepest = project;
+      await ensureLoaded(project);
+
+      const agent = pickChild(project, "agent", (n) => n.data.agentName === target.agentName);
+      if (!agent) return;
+      deepest = agent;
+      await ensureLoaded(agent);
+
+      // Sessions sit directly under the agent (pass-through: no worker split) or
+      // under a worker subagent. Prefer the span's own worker, then scan the
+      // rest — a session lives under exactly one of them.
+      let session = null;
+      if (agent.passThrough) {
+        session = pickChild(agent, "session", (n) => n.data.sessionId === target.sessionId);
+      } else {
+        const subs = agent.children.filter((c) => c.kind === "subagent");
+        subs.sort(
+          (a, b) =>
+            Number(b.data.worker === target.worker) - Number(a.data.worker === target.worker),
+        );
+        for (const sub of subs) {
+          if (destroyed) return;
+          await ensureLoaded(sub);
+          const found = pickChild(sub, "session", (n) => n.data.sessionId === target.sessionId);
+          if (found) {
+            session = found;
+            break;
+          }
+        }
+      }
+      if (!session) return;
+      deepest = session;
+      await ensureLoaded(session);
+
+      if (target.traceId) {
+        const turn = pickChild(session, "turn", (n) => n.data.traceId === target.traceId);
+        if (turn) deepest = turn;
+      }
+    } catch (_e) {
+      /* best-effort: reveal as far as the loaded data allows */
+    } finally {
+      if (!destroyed) {
+        rebuildRows();
+        focusNode(deepest);
+      }
+    }
+  }
+
   // ── Boot ──
 
   function teardown() {
@@ -1263,7 +1353,10 @@ export function mount(container, opts = {}) {
     }
     if (destroyed) return;
     // Root is pre-expanded: Tenant → Fleet with real counts on first paint.
-    loadChildren(tenant, "initial");
+    await loadChildren(tenant, "initial");
+    // A pending Timeline "open in Navigator" reveal drills in once the fleet
+    // level is loaded (#54).
+    if (!destroyed && revealTarget) reveal(revealTarget);
   }
 
   rebuildRows();

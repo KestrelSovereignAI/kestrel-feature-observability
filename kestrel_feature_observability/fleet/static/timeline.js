@@ -87,9 +87,34 @@ const KIND_COLORS = {
 const KIND_DEFAULT = "#64748b";
 const ERROR_COLOR = "#ef4444";
 const DENSITY_COLOR = "#94a3b8";
+const SESSION_BAND_COLOR = "#64748b"; // translucent outermost session envelope
+const OPEN_EDGE_COLOR = "#22d3ee"; // live/provisional bar right-edge cap
+
+// A `kestrel.marker == "start"` attribute tags a provisional "<name> (started)"
+// span whose real closed span may not have arrived yet (talon in-flight): it
+// renders open-ended until the closed span pairs with it by name.
+const ATTR_MARKER = "kestrel.marker";
+const MARKER_START = "start";
 
 function kindColor(kind) {
   return KIND_COLORS[kind] || KIND_DEFAULT;
+}
+
+// A span still "running" for layout/paint: no closed end yet (null endTime), or
+// a provisional start-marker whose real closed span hasn't arrived. Open spans
+// paint as a band from their start to the current right edge.
+function isOpen(s) {
+  return s.openEnded || s.marker === MARKER_START;
+}
+
+// Effective end for layout/paint: an open span extends to `nowMs` (right edge).
+function effEnd(s, nowMs) {
+  return isOpen(s) ? nowMs : s.end;
+}
+
+// The base name a "<name> (started)" marker pairs with its real closed span on.
+function startedBase(name) {
+  return String(name).replace(/\s*\(started\)\s*$/i, "");
 }
 
 // Local wall-clock HH:MM:SS for the ruler ticks and tooltips.
@@ -130,7 +155,14 @@ export function mount(container, opts = {}) {
   const viewStart = () => viewEnd - windowMs;
 
   // ── Data ──
-  const spans = new Map(); // spanId → normalized span
+  const spans = new Map(); // Phoenix node id → normalized span
+  // Incremental parent-link indexes, maintained on every merge/prune so the
+  // layout can rebuild the span tree cheaply and tolerate orphans (children
+  // paged before parents; talon leaves exported before their held-open roots;
+  // a pruned parent kept children) — an orphan renders at its best-known depth
+  // and re-parents when the parent arrives on a later rebuild (#54.2).
+  const spanIdToId = new Map(); // OTel context.spanId → Phoenix node id
+  const childrenByParent = new Map(); // parent OTel spanId → Set<Phoenix node id>
   const projects = []; // [{id, name}] — DEFAULT_PROJECT first
   const watermarks = new Map(); // projectId → newest startTime ms fetched (live)
   const historyFloor = new Map(); // projectId → oldest startTime ms fetched
@@ -206,8 +238,13 @@ export function mount(container, opts = {}) {
   function normalize(raw, projectId, projectName) {
     const start = ts(raw.startTime);
     if (start == null) return null;
-    let end = ts(raw.endTime);
-    if (end == null || end < start) end = start;
+    // Distinguish a real zero-duration point span (instant tick) from a span
+    // with NO closed end yet (open-ended, held-open talon run/stage): the former
+    // has a valid endTime == start; the latter has a null/invalid endTime, and
+    // in live mode renders as a provisional band out to the right edge (#54.5).
+    const rawEnd = ts(raw.endTime);
+    const hasEnd = rawEnd != null && rawEnd >= start;
+    const end = hasEnd ? rawEnd : start;
     const attrs = parseAttributes(raw.attributes);
     const agentRaw = getAttr(attrs, "kestrel.agent_name");
     const agent =
@@ -216,17 +253,25 @@ export function mount(container, opts = {}) {
     const model = getAttr(attrs, ATTR_MODEL_NAME);
     const input = getAttr(attrs, ATTR_INPUT_VALUE);
     const output = getAttr(attrs, ATTR_OUTPUT_VALUE);
+    const marker = getAttr(attrs, ATTR_MARKER);
     return {
       id: raw.id,
       name: raw.name || "(span)",
       start,
       end,
-      instant: end <= start,
+      instant: hasEnd && end <= start,
+      openEnded: !hasEnd,
+      marker: marker != null && marker !== "" ? String(marker) : null,
       kind: spanKindOf(raw),
       status: raw.statusCode === "ERROR" ? "error" : "ok",
       agent,
       worker: workerOf(attrs),
       sessionId: sess ? sess.id : null,
+      // Phoenix's `parentId` is the OTel parent SPAN id (not the GraphQL node
+      // id); it links to another span's `context.spanId`. Keep both so the
+      // layout can rebuild the span tree (#54.1).
+      spanId: (raw.context && raw.context.spanId) || null,
+      parentId: raw.parentId || null,
       traceId: (raw.context && raw.context.traceId) || null,
       projectId,
       projectName,
@@ -235,6 +280,29 @@ export function mount(container, opts = {}) {
       output: output != null ? String(output) : null,
       attrs,
     };
+  }
+
+  // Add/remove a span from the parent-link indexes.
+  function indexSpan(s) {
+    if (s.spanId) spanIdToId.set(s.spanId, s.id);
+    if (s.parentId) {
+      let set = childrenByParent.get(s.parentId);
+      if (!set) {
+        set = new Set();
+        childrenByParent.set(s.parentId, set);
+      }
+      set.add(s.id);
+    }
+  }
+  function deindexSpan(s) {
+    if (s.spanId && spanIdToId.get(s.spanId) === s.id) spanIdToId.delete(s.spanId);
+    if (s.parentId) {
+      const set = childrenByParent.get(s.parentId);
+      if (set) {
+        set.delete(s.id);
+        if (!set.size) childrenByParent.delete(s.parentId);
+      }
+    }
   }
 
   function mergeSpans(rawSpans, projectId, projectName) {
@@ -247,8 +315,11 @@ export function mount(container, opts = {}) {
       if (!s) continue;
       if (newestStart == null || s.start > newestStart) newestStart = s.start;
       if (oldestStart == null || s.start < oldestStart) oldestStart = s.start;
-      if (!spans.has(s.id)) added += 1;
+      const prev = spans.get(s.id);
+      if (prev) deindexSpan(prev);
+      else added += 1;
       spans.set(s.id, s);
+      indexSpan(s);
     }
     if (newestStart != null) {
       const prev = watermarks.get(projectId);
@@ -263,10 +334,15 @@ export function mount(container, opts = {}) {
   }
 
   // Memory guard: when we blow past the cap, drop the oldest-ending spans.
+  // Dropping a parent while keeping its children is fine — the orphans fall
+  // back to depth-0 roots until (if) the parent is re-fetched (#54.2).
   function pruneSpans() {
     const all = [...spans.values()].sort((a, b) => a.end - b.end);
     const drop = all.length - SPAN_CAP;
-    for (let i = 0; i < drop; i++) spans.delete(all[i].id);
+    for (let i = 0; i < drop; i++) {
+      deindexSpan(all[i]);
+      spans.delete(all[i].id);
+    }
   }
 
   // ── Fetch ──
@@ -384,31 +460,277 @@ export function mount(container, opts = {}) {
     }
   }
 
-  // ── Layout: group spans → project → agent lane → worker sub-lanes ──
+  // ── Layout: project → agent lane → worker sub-lanes → session bands → tree ──
+  //
+  // Each lane's spans group into SESSION bands, and inside each band a span TREE
+  // (rebuilt from the parent index) packs depth-by-depth into tracks — the
+  // russian-doll nesting the header promises: session ⊃ depth-0 roots (turns for
+  // agent lanes, the run root for talon) ⊃ depth-1 (stages/tools) ⊃ depth-2
+  // (tool events/markers). Session identity is derived from each span's
+  // lane-local ROOT through the parent index, NOT from a per-span session id —
+  // child spans don't carry one (that's issue #55, which this rendering must not
+  // depend on) — so a whole trace/turn stays one band even though only its root
+  // is tagged.
 
-  function greedyPack(items) {
-    // items: [{span}] → assign each a non-overlapping track (Gantt packing).
-    items.sort((a, b) => a.span.start - b.span.start || a.span.end - b.span.end);
-    const trackEnds = [];
-    for (const it of items) {
+  // Greedy Gantt packing of one depth level: assign each span a non-overlapping
+  // track, writing the ABSOLUTE track (offset + local index) into `trackOf`.
+  function packInto(arr, trackOf, offset, nowMs) {
+    arr.sort((a, b) => a.start - b.start || effEnd(a, nowMs) - effEnd(b, nowMs));
+    const ends = [];
+    for (const s of arr) {
       let placed = false;
-      for (let t = 0; t < trackEnds.length; t++) {
-        if (trackEnds[t] <= it.span.start) {
-          it.track = t;
-          trackEnds[t] = it.span.end;
+      for (let t = 0; t < ends.length; t++) {
+        if (ends[t] <= s.start) {
+          trackOf.set(s.id, offset + t);
+          ends[t] = effEnd(s, nowMs);
           placed = true;
           break;
         }
       }
       if (!placed) {
-        it.track = trackEnds.length;
-        trackEnds.push(it.span.end);
+        trackOf.set(s.id, offset + ends.length);
+        ends.push(effEnd(s, nowMs));
       }
     }
-    return trackEnds.length || 1;
+    return ends.length;
+  }
+
+  // Build one session band: the parent tree over `members`, depth-packed into
+  // tracks. Tolerates orphans — a member whose parent isn't in the band renders
+  // as a depth-0 root and re-parents when the parent arrives on a later build.
+  function buildBand(members, nowMs) {
+    const memberIds = new Set(members.map((s) => s.id));
+    // Children within the band, via the incremental parentSpanId→children index
+    // (filtered to members: a talon run root's stage children live in a separate
+    // worker sub-lane, so they're excluded here and the root reads as a leaf).
+    const kids = new Map(); // node id → [child spans]
+    for (const s of members) {
+      const set = s.spanId ? childrenByParent.get(s.spanId) : null;
+      if (!set) continue;
+      const arr = [];
+      for (const cid of set) {
+        if (cid === s.id || !memberIds.has(cid)) continue;
+        const c = spans.get(cid);
+        if (c) arr.push(c);
+      }
+      if (arr.length) kids.set(s.id, arr);
+    }
+    const hasInBandParent = (s) => {
+      if (!s.parentId) return false;
+      const pid = spanIdToId.get(s.parentId);
+      return pid != null && pid !== s.id && memberIds.has(pid);
+    };
+    const roots = members
+      .filter((s) => !hasInBandParent(s))
+      .sort((a, b) => a.start - b.start);
+
+    // Depth via DFS from the roots (visited-guarded against pathological cycles).
+    const depthOf = new Map();
+    const visited = new Set();
+    (function assign(list, depth) {
+      for (const s of list) {
+        if (visited.has(s.id)) continue;
+        visited.add(s.id);
+        depthOf.set(s.id, depth);
+        const cs = kids.get(s.id);
+        if (cs && cs.length) assign(cs.slice().sort((a, b) => a.start - b.start), depth + 1);
+      }
+    })(roots, 0);
+    for (const s of members) if (!depthOf.has(s.id)) depthOf.set(s.id, 0);
+
+    // Per-depth greedy packing → each depth occupies a contiguous track range,
+    // stacked below the previous so children always sit under their parents.
+    const byDepth = new Map();
+    for (const s of members) {
+      const d = depthOf.get(s.id);
+      let arr = byDepth.get(d);
+      if (!arr) {
+        arr = [];
+        byDepth.set(d, arr);
+      }
+      arr.push(s);
+    }
+    const trackOf = new Map();
+    let total = 0;
+    for (const d of [...byDepth.keys()].sort((a, b) => a - b)) {
+      total += packInto(byDepth.get(d), trackOf, total, nowMs);
+    }
+
+    // Subtree extents (memoized; self-first write guards cycles) → each non-leaf
+    // span's envelope spans its whole subtree horizontally AND vertically, so an
+    // instant parent (the emitter's zero-width AGENT marker) still wraps its
+    // children.
+    const subExtent = new Map();
+    function computeSub(s) {
+      const cached = subExtent.get(s.id);
+      if (cached) return cached;
+      const self = {
+        start: s.start,
+        end: effEnd(s, nowMs),
+        maxTrack: trackOf.get(s.id),
+        open: isOpen(s),
+      };
+      subExtent.set(s.id, self);
+      for (const c of kids.get(s.id) || []) {
+        const sub = computeSub(c);
+        if (sub.start < self.start) self.start = sub.start;
+        if (sub.end > self.end) self.end = sub.end;
+        if (sub.maxTrack > self.maxTrack) self.maxTrack = sub.maxTrack;
+        if (sub.open) self.open = true;
+      }
+      return self;
+    }
+
+    const placed = members.map((s) => ({
+      span: s,
+      depth: depthOf.get(s.id),
+      track: trackOf.get(s.id),
+    }));
+    const envelopes = [];
+    for (const s of members) {
+      if (!kids.has(s.id)) continue; // leaves get no envelope
+      const sub = computeSub(s);
+      const top = trackOf.get(s.id);
+      envelopes.push({
+        span: s,
+        depth: depthOf.get(s.id),
+        trackTop: top,
+        trackCount: sub.maxTrack - top + 1,
+        start: sub.start,
+        end: sub.end,
+        open: sub.open,
+      });
+    }
+
+    let start = Infinity;
+    let end = -Infinity;
+    let open = false;
+    for (const s of members) {
+      if (s.start < start) start = s.start;
+      const e = effEnd(s, nowMs);
+      if (e > end) end = e;
+      if (isOpen(s)) open = true;
+    }
+    const rep = roots[0] || members[0];
+    return {
+      tracks: total || 1,
+      placed,
+      envelopes,
+      start,
+      end,
+      open,
+      sessionId: rep ? rep.sessionId : null,
+      traceId: rep ? rep.traceId : null,
+      count: members.length,
+    };
+  }
+
+  // Drop provisional "<name> (started)" markers once their real closed span has
+  // arrived under the same parent (name-pairing dedupe); survivors stay and
+  // render open-ended (#54.5).
+  function suppressStartedMarkers(laneItems) {
+    let hasMarker = false;
+    const realNames = new Map(); // parentId → Set(real span names)
+    for (const it of laneItems) {
+      const s = it.span;
+      if (s.marker === MARKER_START) {
+        hasMarker = true;
+        continue;
+      }
+      const key = s.parentId || "";
+      let set = realNames.get(key);
+      if (!set) {
+        set = new Set();
+        realNames.set(key, set);
+      }
+      set.add(s.name);
+    }
+    if (!hasMarker) return laneItems;
+    return laneItems.filter((it) => {
+      const s = it.span;
+      if (s.marker !== MARKER_START) return true;
+      const set = realNames.get(s.parentId || "");
+      return !(set && set.has(startedBase(s.name)));
+    });
+  }
+
+  // Group a lane's spans into session bands keyed by each span's lane-local ROOT
+  // (walk parentId within the lane): child spans inherit their root's session,
+  // so a session/turn stays ONE band even though only roots carry the id. A
+  // null-session root falls back to its trace id (one band per trace); a lone
+  // single-span trace is just a plain bar at band level. Sessions stack in
+  // start-time order — concurrent sessions own disjoint track ranges and can
+  // never interleave (the bug this kills). Lane height = Σ per-session tracks.
+  function laneBands(laneItems, nowMs) {
+    const items = suppressStartedMarkers(laneItems);
+    const bySpanId = new Map();
+    for (const it of items) if (it.span.spanId) bySpanId.set(it.span.spanId, it.span);
+    const laneRoot = (s) => {
+      let cur = s;
+      let guard = 0;
+      while (cur.parentId && bySpanId.has(cur.parentId) && guard++ < 100000) {
+        const p = bySpanId.get(cur.parentId);
+        if (!p || p === cur) break;
+        cur = p;
+      }
+      return cur;
+    };
+    const groups = new Map();
+    for (const it of items) {
+      const root = laneRoot(it.span);
+      const key = root.sessionId != null ? `s:${root.sessionId}` : `t:${root.traceId || root.id}`;
+      let arr = groups.get(key);
+      if (!arr) {
+        arr = [];
+        groups.set(key, arr);
+      }
+      arr.push(it.span);
+    }
+    const minStart = (list) => {
+      let m = Infinity;
+      for (const s of list) if (s.start < m) m = s.start;
+      return m;
+    };
+    const ordered = [...groups.values()].sort((a, b) => minStart(a) - minStart(b));
+
+    const outItems = [];
+    const sessionBands = [];
+    const envelopes = [];
+    let laneTracks = 0;
+    for (const members of ordered) {
+      const band = buildBand(members, nowMs);
+      const offset = laneTracks;
+      for (const p of band.placed) {
+        outItems.push({ span: p.span, depth: p.depth, track: offset + p.track });
+      }
+      for (const e of band.envelopes) {
+        envelopes.push({
+          span: e.span,
+          depth: e.depth,
+          trackTop: offset + e.trackTop,
+          trackCount: e.trackCount,
+          start: e.start,
+          end: e.end,
+          open: e.open,
+        });
+      }
+      sessionBands.push({
+        sessionId: band.sessionId,
+        traceId: band.traceId,
+        start: band.start,
+        end: band.end,
+        open: band.open,
+        trackTop: offset,
+        trackCount: band.tracks,
+        count: band.count,
+      });
+      laneTracks += band.tracks;
+    }
+    return { items: outItems, sessionBands, envelopes, tracks: laneTracks || 1 };
   }
 
   function buildLayout() {
+    const nowMs = Date.now();
     // Bucket by project → agent → worker(null = the agent's own band).
     const byProject = new Map();
     for (const s of spans.values()) {
@@ -451,9 +773,8 @@ export function mount(container, opts = {}) {
       );
       for (const [agent, workerMap] of agents) {
         // The agent's own band (worker-less spans: emitter roots, talon run roots).
-        const mainItems = workerMap.get("") || [];
-        const mainTracks = greedyPack(mainItems);
-        const mainH = mainTracks * TRACK_H + 2 * LANE_VPAD;
+        const mainLane = laneBands(workerMap.get("") || [], nowMs);
+        const mainH = mainLane.tracks * TRACK_H + 2 * LANE_VPAD;
         rows.push({
           type: "lane",
           projectName: name,
@@ -462,8 +783,10 @@ export function mount(container, opts = {}) {
           worker: null,
           label: agent,
           level: 1,
-          items: mainItems,
-          tracks: mainTracks,
+          items: mainLane.items,
+          sessionBands: mainLane.sessionBands,
+          envelopes: mainLane.envelopes,
+          tracks: mainLane.tracks,
           y,
           h: mainH,
         });
@@ -472,9 +795,8 @@ export function mount(container, opts = {}) {
         // Worker sub-lanes (talon/implement, talon/review, gate, …).
         const workers = [...workerMap.keys()].filter((w) => w !== "").sort();
         for (const wk of workers) {
-          const items = workerMap.get(wk);
-          const tracks = greedyPack(items);
-          const h = tracks * TRACK_H + 2 * LANE_VPAD;
+          const lane = laneBands(workerMap.get(wk), nowMs);
+          const h = lane.tracks * TRACK_H + 2 * LANE_VPAD;
           rows.push({
             type: "lane",
             projectName: name,
@@ -483,8 +805,10 @@ export function mount(container, opts = {}) {
             worker: wk,
             label: `${agent}/${wk}`,
             level: 2,
-            items,
-            tracks,
+            items: lane.items,
+            sessionBands: lane.sessionBands,
+            envelopes: lane.envelopes,
+            tracks: lane.tracks,
             y,
             h,
           });
@@ -622,13 +946,57 @@ export function mount(container, opts = {}) {
     ctx.stroke();
     ctx.globalAlpha = 1;
 
-    // Blocks — packed by track, coalesced into density strips when sub-pixel.
     const vs = viewStart();
     const ve = viewEnd;
+    const rightT = viewEnd; // open-ended spans/bands extend to the live right edge
+
+    // Project a time+track rect into canvas space, clipped to the plot area.
+    const rectFor = (startT, endT, open, trackTop, trackCount) => {
+      const eT = open ? Math.max(endT, rightT) : endT;
+      const x = timeToX(startT);
+      const cx = Math.max(GUTTER_W, x);
+      const w = Math.max(1, timeToX(eT) - cx);
+      const ry = y + LANE_VPAD + trackTop * TRACK_H;
+      const rh = Math.max(2, trackCount * TRACK_H - 1);
+      return { cx, w, ry, rh };
+    };
+    const onScreen = (startT, endT, open) => !((open ? rightT : endT) < vs || startT > ve);
+
+    // 1. Session bands FIRST — the lightest, outermost envelope. Pushed to
+    //    drawn[] before everything so real spans (drawn later) win the topmost
+    //    hit-test; its own exposed area gives a session-level hover.
+    for (const b of row.sessionBands || []) {
+      if (!onScreen(b.start, b.end, b.open)) continue;
+      const r = rectFor(b.start, b.end, b.open, b.trackTop, b.trackCount);
+      ctx.fillStyle = SESSION_BAND_COLOR;
+      ctx.globalAlpha = 0.1;
+      ctx.fillRect(r.cx, r.ry, r.w, r.rh);
+      ctx.globalAlpha = 1;
+      drawn.push({ x: r.cx, y: r.ry, w: r.w, h: r.rh, band: b });
+    }
+
+    // 2. Parent (subtree) envelopes, shallow → deep so a deeper envelope wins
+    //    the hit-test within its sub-region. Tinted by the parent's span kind;
+    //    the exposed part of each envelope hovers/clicks as that parent span.
+    const envs = (row.envelopes || []).slice().sort((a, b) => a.depth - b.depth);
+    for (const e of envs) {
+      if (!onScreen(e.start, e.end, e.open)) continue;
+      const r = rectFor(e.start, e.end, e.open, e.trackTop, e.trackCount);
+      ctx.fillStyle = e.span.status === "error" ? ERROR_COLOR : kindColor(e.span.kind);
+      ctx.globalAlpha = 0.14 + Math.min(0.16, e.depth * 0.05);
+      ctx.fillRect(r.cx, r.ry, r.w, r.rh);
+      ctx.globalAlpha = 1;
+      drawn.push({ x: r.cx, y: r.ry, w: r.w, h: r.rh, span: e.span });
+    }
+
+    // 3. Span identity bars, grouped by ABSOLUTE track (each track belongs to a
+    //    single session+depth), coalescing sub-pixel runs into density strips
+    //    PER track — so a wide session band never coalesces with its sub-second
+    //    children (the coalescer runs per depth level for free).
     const byTrack = new Map();
-    for (const it of row.items) {
+    for (const it of row.items || []) {
       const s = it.span;
-      if (s.end < vs || s.start > ve) continue; // outside window
+      if (!onScreen(s.start, s.end, isOpen(s))) continue;
       let arr = byTrack.get(it.track);
       if (!arr) {
         arr = [];
@@ -653,11 +1021,14 @@ export function mount(container, opts = {}) {
         run = null;
       };
       for (const s of list) {
+        const open = isOpen(s);
+        const sEnd = open ? rightT : s.end;
+        const tick = !open && s.instant;
         const x = timeToX(s.start);
-        const rawW = s.instant ? 2 : (s.end - s.start) * pxPerMs();
+        const rawW = tick ? 2 : (sEnd - s.start) * pxPerMs();
         const cx = Math.max(GUTTER_W, x);
         const w = Math.max(1, x + rawW - cx);
-        if (w < MIN_BLOCK_PX && !s.instant) {
+        if (!tick && w < MIN_BLOCK_PX) {
           // Coalesce sub-pixel blocks into a density strip.
           if (run && cx <= run.x1 + 1) {
             run.x1 = Math.max(run.x1, cx + w);
@@ -670,8 +1041,8 @@ export function mount(container, opts = {}) {
           continue;
         }
         flush();
-        if (s.instant) {
-          // Instant event → a tick.
+        if (tick) {
+          // Instant event → a 2px tick (track-assigned inside its parent band).
           ctx.fillStyle = s.status === "error" ? ERROR_COLOR : kindColor(s.kind);
           ctx.fillRect(cx, ry, 2, bh);
           drawn.push({ x: cx - 2, y: ry, w: 6, h: bh, span: s });
@@ -683,18 +1054,23 @@ export function mount(container, opts = {}) {
           ctx.fillStyle = ERROR_COLOR;
           ctx.fillRect(cx, ry, w, 2);
         }
+        if (open) {
+          // Still-running / provisional: a bright cap at the live right edge.
+          ctx.fillStyle = OPEN_EDGE_COLOR;
+          ctx.globalAlpha = 0.6;
+          ctx.fillRect(cx + w - 2, ry, 2, bh);
+          ctx.globalAlpha = 1;
+        }
         // Label the block when it's wide enough to read.
         if (w > 46) {
           ctx.fillStyle = "#0b1120";
           ctx.font = "10px system-ui, sans-serif";
-          const prevClip = ctx.getLineDash;
           ctx.save();
           ctx.beginPath();
           ctx.rect(cx, ry, w, bh);
           ctx.clip();
           ctx.fillText(s.name, cx + 3, ry + bh / 2);
           ctx.restore();
-          void prevClip;
         }
         drawn.push({ x: cx, y: ry, w, h: bh, span: s });
       }
@@ -747,13 +1123,29 @@ export function mount(container, opts = {}) {
     let html;
     if (d.density) {
       html = `<b>${d.density} spans</b><div class="obs-tl__tipdim">coalesced · zoom in to expand</div>`;
-    } else {
+    } else if (d.band) {
+      const b = d.band;
+      const title = b.sessionId
+        ? `session ${b.sessionId}`
+        : b.traceId
+          ? `trace ${b.traceId}`
+          : "session";
+      const dur = b.end > b.start ? fmtDuration((b.open ? viewEnd : b.end) - b.start) : "";
+      html =
+        `<b>${escapeHtml(title)}</b>` +
+        `<div class="obs-tl__tipdim">${b.count} span${b.count === 1 ? "" : "s"}${
+          dur ? ` · ${escapeHtml(dur)}` : ""
+        }${b.open ? " · live" : ""}</div>`;
+    } else if (d.span) {
       const s = d.span;
-      const dur = s.instant ? "instant" : fmtDuration(s.end - s.start);
+      const dur = isOpen(s) ? "running" : s.instant ? "instant" : fmtDuration(s.end - s.start);
       html =
         `<b>${escapeHtml(s.name)}</b>` +
         `<div class="obs-tl__tipdim">${escapeHtml(s.kind)} · ${escapeHtml(dur)} · ${escapeHtml(s.status)}</div>` +
         (s.model ? `<div class="obs-tl__tipdim">model: ${escapeHtml(s.model)}</div>` : "");
+    } else {
+      hideTip();
+      return;
     }
     tipEl.innerHTML = html;
     tipEl.hidden = false;
@@ -777,7 +1169,28 @@ export function mount(container, opts = {}) {
     return `${PHOENIX_URL}projects/${encodeURIComponent(s.projectId)}/traces/${encodeURIComponent(s.traceId)}`;
   }
 
+  // A tool/event child span carries no session attribute — only the trace root
+  // does (the emitter's `web_search` tool child has agent_name but no
+  // session_id, while its root marker/summary carry it). Walk the parentId →
+  // spanId chain (the same index the layout uses) to the nearest ancestor that
+  // carries a session id, so the popover's "open in Navigator" reveal works for
+  // the hierarchical children too. Orphan / not-yet-loaded parent → null (the
+  // button stays hidden, best-effort) (#54.6).
+  function resolveSessionId(s) {
+    let cur = s;
+    let guard = 0;
+    while (cur && guard++ < 100000) {
+      if (cur.sessionId != null) return cur.sessionId;
+      if (!cur.parentId) return null;
+      const pid = spanIdToId.get(cur.parentId);
+      if (pid == null || pid === cur.id) return null;
+      cur = spans.get(pid);
+    }
+    return null;
+  }
+
   function showPopover(s, clientX, clientY) {
+    const sessionId = resolveSessionId(s);
     const rows = [];
     const add = (k, v) => {
       if (v == null || v === "") return;
@@ -789,11 +1202,11 @@ export function mount(container, opts = {}) {
     add("kind", s.kind);
     add("agent", s.agent);
     if (s.worker) add("worker", s.worker);
-    add("duration", s.instant ? "instant" : fmtDuration(s.end - s.start));
+    add("duration", isOpen(s) ? "running" : s.instant ? "instant" : fmtDuration(s.end - s.start));
     add("status", s.status);
     add("started", `${fmtClock(s.start, true)} · ${relTime(s.start)}`);
     if (s.model) add("model", s.model);
-    if (s.sessionId) add("session", s.sessionId);
+    if (sessionId) add("session", sessionId);
     if (s.traceId) add("trace", s.traceId);
 
     const io =
@@ -808,7 +1221,7 @@ export function mount(container, opts = {}) {
           `</div>`
         : "";
 
-    const canNav = Boolean(openNavigator && s.sessionId);
+    const canNav = Boolean(openNavigator && sessionId);
     const canPhx = Boolean(openTrace && s.traceId && s.projectId);
     popEl.innerHTML = `
       <div class="obs-tl__phead">
@@ -842,7 +1255,7 @@ export function mount(container, opts = {}) {
           projectName: s.projectName,
           agentName: s.agent,
           worker: s.worker,
-          sessionId: s.sessionId,
+          sessionId,
           traceId: s.traceId,
         });
       });
@@ -944,8 +1357,11 @@ export function mount(container, opts = {}) {
     }
     // Hover → tooltip.
     const d = hitTest(e.offsetX, e.offsetY);
-    if (d && !d.project) {
+    if (d && (d.span || d.density)) {
       canvas.style.cursor = "pointer";
+      showTip(d, e.clientX, e.clientY);
+    } else if (d && d.band) {
+      canvas.style.cursor = "default"; // session envelope: informational, not clickable
       showTip(d, e.clientX, e.clientY);
     } else {
       canvas.style.cursor = d && d.project ? "pointer" : "default";
@@ -983,6 +1399,7 @@ export function mount(container, opts = {}) {
       requestDraw();
       return;
     }
+    if (d.band) return; // session envelope: decorative, no popover
     if (d.density) {
       // Zoom in centered on the density strip so its spans separate out.
       pauseLive();

@@ -480,6 +480,7 @@ export function mount(container) {
   let handle = null; // handle returned by the active view's mount()
   let destroyed = false;
   let pendingTraceUrl = null; // set by the navigator's "open in Phoenix" (#46)
+  let pendingRevealTarget = null; // set by the timeline's "open in Navigator" (#54)
 
   container.innerHTML = `
     <div class="obs-panel">
@@ -521,6 +522,15 @@ export function mount(container) {
       pendingTraceUrl = null;
     } else if (view.id === "navigator") {
       opts.openTrace = openTrace;
+      // One-shot: a pending timeline "open in Navigator" reveal target rides
+      // along on this mount only (#54).
+      opts.revealTarget = pendingRevealTarget;
+      pendingRevealTarget = null;
+    } else if (view.id === "timeline") {
+      // The Timeline popover's "open in Navigator" / "open in Phoenix" buttons
+      // (canNav / canPhx) only show when these are provided (#54.6).
+      opts.openTrace = openTrace;
+      opts.openNavigator = openNavigator;
     }
     handle = view.mount(contentEl, opts);
   }
@@ -540,6 +550,22 @@ export function mount(container) {
       mountView("phoenix"); // already on Phoenix → remount onto the trace
     } else {
       switchTo("phoenix");
+    }
+  }
+
+  // Timeline → Navigator drill-down (#54): switch to the Navigator subtab AND
+  // pass a reveal target ({projectId, projectName, agentName, worker,
+  // sessionId, traceId}) the navigator best-effort expands its tree to —
+  // project → agent → session → trace — and scrolls into view. Missing nodes
+  // fail soft (no error UI); this is the whole point of the Timeline popover:
+  // drill-down continuity into the tree at that session/turn.
+  function openNavigator(target) {
+    if (destroyed || !target) return;
+    pendingRevealTarget = target;
+    if (activeId === "navigator") {
+      mountView("navigator"); // already on Navigator → remount onto the reveal
+    } else {
+      switchTo("navigator");
     }
   }
 
