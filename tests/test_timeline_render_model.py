@@ -86,14 +86,14 @@ function span(o) {
   };
 }
 const NOW = 10000;
-// Far-future clock so a span starting near t=0 is > STALE_MARKER_MS (5 min) old —
+// Far-future clock so a span starting near t=0 is > STALE_MARKER_MS (15 min) old —
 // the #67 abandoned-cap scenarios exercise stale open spans, whereas the NOW-based
 // scenarios above stay recent (never abandoned).
 const LATE = 10_000_000;
-// Mirror timeline.js's thresholds so the harness can place spans just inside /
-// just outside the abandoned + reconcile windows.
-const STALE = 5 * 60 * 1000; // STALE_MARKER_MS
-const RECONCILE = 5 * 60 * 1000; // STALE_RECONCILE_MS (grace past staleness)
+// Mirror timeline.js's thresholds (raised to 15 min in #69) so the harness can
+// place spans just inside / just outside the abandoned + reconcile windows.
+const STALE = 15 * 60 * 1000; // STALE_MARKER_MS
+const RECONCILE = 15 * 60 * 1000; // STALE_RECONCILE_MS (grace past staleness)
 const pick = (s) => ({ rHide: s.rHide, rOpen: s.rOpen, rEnd: s.rEnd, rLabel: s.rLabel, rSummary: s.rSummary, rAbandoned: s.rAbandoned });
 const out = {};
 
@@ -205,7 +205,7 @@ const out = {};
 
 // #67 — SIGKILL / power-loss cap. A hard kill can't be caught, so the held-open
 // span never gets its close. Any still-open span older than STALE_MARKER_MS whose
-// whole subtree has been silent that long is ABANDONED (capped), not painted
+// whole run COHORT has been silent that long is ABANDONED (capped), not painted
 // running-to-now. All three open shapes are capped by the one unified pass.
 
 // (a) held-open real span (frinz#657 shape) — a talon run root exported in-flight
@@ -253,6 +253,28 @@ const out = {};
   out.nestedAbandoned = { run: pick(run), stage: pick(stage) };
 }
 
+// #69 — LIVE talon flicker. The held-open stage span (spanId 0fe0ee7c0d) is NOT
+// exported while in-flight, so forward-poll loads only its "<stage> (started)"
+// MARKER and its `command_execution` tool spans — BOTH parented under the missing
+// stage, so the tools are SIBLINGS of the marker and the marker's OWN subtree is
+// empty. An OLD marker whose cohort saw a RECENT sibling tool must stay open, not
+// be abandoned by the empty-subtree signal (the #67/#68 regression this fixes).
+{
+  const marker = span({ name: "implement (started)", start: 1000, marker: "start", spanId: "lm1", parentId: "0fe0ee7c0d", sessionId: "LIVE1" });
+  const tool = span({ name: "command_execution", start: LATE - 1000, end: LATE - 500, spanId: "lt1", parentId: "0fe0ee7c0d", sessionId: "LIVE1" });
+  annotateRenderModel([marker, tool], LATE);
+  out.liveTalonCohort = { marker: pick(marker), tool: pick(tool) };
+}
+// #69 contrast — a truly-DEAD talon run: the SAME sibling shape but the whole
+// cohort has been silent past the window (no recent sibling) → the held-open
+// marker still caps (the genuine SIGKILL case the guard exists for).
+{
+  const marker = span({ name: "implement (started)", start: 1000, marker: "start", spanId: "dm1", parentId: "deadstage", sessionId: "DEAD1" });
+  const tool = span({ name: "command_execution", start: 1200, end: 1500, spanId: "dt1", parentId: "deadstage", sessionId: "DEAD1" });
+  annotateRenderModel([marker, tool], LATE);
+  out.deadTalonCohort = { marker: pick(marker), tool: pick(tool) };
+}
+
 // #67 P1 (live re-annotation) — a span loaded while RECENT is open; with NO new
 // span IDs, only the clock advancing past STALE_MARKER_MS must flip it to
 // abandoned. This is the pure core of the live fix: buildLayout re-runs
@@ -272,7 +294,7 @@ const out = {};
 // late summary lands it folds, un-abandons and closes the turn, and the floor
 // clears so the poll stops re-fetching.
 {
-  const START = LATE - 500_000; // > STALE (abandoned) but within STALE+RECONCILE (reconciling)
+  const START = LATE - 1_200_000; // > STALE (abandoned) but within STALE+RECONCILE (reconciling)
   const t1 = span({ name: "claude-code turn 1", start: START, marker: "start", kind: "AGENT", spanId: "kr1", sessionId: "K7", projectId: "R", attrs: { kestrel: { turn_index: 1 } } });
   annotateRenderModel([t1], LATE);
   const before = openStartFloors([t1]);
@@ -409,7 +431,7 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     assert r["talonOpen"]["real"]["rAbandoned"] is False
 
     # #67 — SIGKILL / power-loss cap. A still-open span past STALE_MARKER_MS with
-    # no recent subtree activity is ABANDONED (rOpen=False), bounded to evidence,
+    # no recent cohort activity is ABANDONED (rOpen=False), bounded to evidence,
     # not painted running-to-now. All three open shapes are capped uniformly.
     ab_ho = r["abandonedHeldOpen"]  # held-open real span (frinz#657 shape)
     assert ab_ho["rAbandoned"] is True
@@ -446,6 +468,21 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     assert na["run"]["rOpen"] is False
     assert na["stage"]["rAbandoned"] is True
     assert na["stage"]["rOpen"] is False
+
+    # #69 — LIVE talon flicker fix. A held-open run parents its "<stage> (started)"
+    # marker and its tool spans as SIBLINGS (the marker's own subtree is empty), so
+    # per-span subtree liveness would abandon the marker the moment it crosses the
+    # window despite constant sibling activity. Cohort liveness: a RECENT sibling
+    # tool under the same run keeps the OLD marker open (never abandoned).
+    ltc = r["liveTalonCohort"]
+    assert ltc["marker"]["rAbandoned"] is False
+    assert ltc["marker"]["rOpen"] is True
+    assert ltc["tool"]["rAbandoned"] is False
+    # Contrast: the SAME sibling shape with the whole cohort silent past the window
+    # → the held-open marker still caps (the genuine SIGKILL case is preserved).
+    dtc = r["deadTalonCohort"]
+    assert dtc["marker"]["rAbandoned"] is True
+    assert dtc["marker"]["rOpen"] is False
 
     # #67 P1 (live re-annotation): re-annotating the SAME span (no new IDs) with
     # only the clock advanced past STALE_MARKER_MS flips a recent open span to
