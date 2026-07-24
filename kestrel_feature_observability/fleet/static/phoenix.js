@@ -40,6 +40,13 @@ export const ATTR_RUN_ID = "kestrel.run_id"; // final session fallback (talon ru
 export const ATTR_INPUT_VALUE = "input.value";
 export const ATTR_OUTPUT_VALUE = "output.value";
 export const ATTR_MODEL_NAME = "llm.model_name"; // LLM span model, shown in tooltips
+export const ATTR_TURN_COUNT = "kestrel.turn_count";
+export const ATTR_TOOL_COUNT = "kestrel.tool_count";
+export const ATTR_ERROR_COUNT = "kestrel.error_count";
+export const ATTR_SUCCESS_RATIO = "kestrel.success_ratio";
+export const ATTR_DURATION_MS = "kestrel.duration_ms";
+export const ATTR_TURN_DURATION_MS = "kestrel.turn_duration_ms";
+export const ATTR_SESSION_DURATION_MS = "kestrel.session_duration_ms";
 
 // Spans missing kestrel.agent_name bucket here (should be none post-#2602).
 export const UNKNOWN_AGENT = "unknown";
@@ -250,6 +257,34 @@ export function clip(text) {
   return s.length > IO_CLIP ? `${s.slice(0, IO_CLIP)}\n… (truncated)` : s;
 }
 
+function present(value) {
+  return value != null && value !== "";
+}
+
+function numberValue(value) {
+  if (!present(value)) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function firstPresent(...values) {
+  return values.find(present);
+}
+
+function timestampValue(value) {
+  if (Number.isFinite(value)) return value;
+  return ts(value);
+}
+
+function compactRecord(record, preserveNullKeys = []) {
+  const preserveNull = new Set(preserveNullKeys);
+  return Object.fromEntries(
+    Object.entries(record).filter(
+      ([key, value]) => present(value) || (value === null && preserveNull.has(key)),
+    ),
+  );
+}
+
 // ── Producer-shape read-model (agent / worker / session identity) ──
 //
 // Phoenix has no attribute group-by API, so the Agent / Subagent / Session
@@ -296,6 +331,307 @@ export function sessionKeyOf(attrs) {
 export function spanKindOf(span) {
   const k =
     (span && span.spanKind) ||
+    (span && span.kind) ||
     getAttr(parseAttributes(span && span.attributes), ATTR_SPAN_KIND);
   return String(k || "span").toUpperCase();
+}
+
+// ── Aggregated Navigator read-model ──────────────────────────
+
+// {count, first, last, errored} rollup entries for the Navigator's aggregated
+// levels. These live here with the identity helpers they consume so Navigator
+// and Timeline never grow parallel interpretations of Phoenix spans.
+function bumpEntry(entry, start, end, errored) {
+  const e = entry || { count: 0, first: null, last: null, errored: false };
+  e.count += 1;
+  if (start != null && (e.first == null || start < e.first)) e.first = start;
+  if (end != null && (e.last == null || end > e.last)) e.last = end;
+  if (errored) e.errored = true;
+  return e;
+}
+
+function bump(map, key, start, end, errored) {
+  map.set(key, bumpEntry(map.get(key), start, end, errored));
+}
+
+export function createAgg() {
+  return {
+    seen: new Set(), // Phoenix node ids — dedupes overlapping refresh/more pages
+    agents: new Map(), // base agent name → rollup
+    workers: new Map(), // worker (stage / prefixed-name suffix) → rollup
+    stageless: null, // spans with no worker split (e.g. run roots)
+    sessions: new Map(), // session id → rollup + {attrKey, roots}
+  };
+}
+
+export function mergeSpansIntoAgg(agg, spans) {
+  for (const span of spans) {
+    if (!span || agg.seen.has(span.id)) continue;
+    agg.seen.add(span.id);
+    const attrs = parseAttributes(span.attributes);
+    const start = ts(span.startTime);
+    const end = ts(span.endTime) ?? start;
+    const errored = span.statusCode === "ERROR";
+
+    const agent = getAttr(attrs, ATTR_AGENT_NAME);
+    bump(
+      agg.agents,
+      agent != null && agent !== "" ? baseAgentName(agent) : UNKNOWN_AGENT,
+      start,
+      end,
+      errored,
+    );
+
+    const worker = workerOf(attrs);
+    if (worker) bump(agg.workers, worker, start, end, errored);
+    else agg.stageless = bumpEntry(agg.stageless, start, end, errored);
+
+    const sess = sessionKeyOf(attrs);
+    if (sess) {
+      bump(agg.sessions, sess.id, start, end, errored);
+      const entry = agg.sessions.get(sess.id);
+      if (!entry.attrKey) entry.attrKey = sess.attrKey;
+      if (span.parentId == null) entry.roots = (entry.roots || 0) + 1;
+    }
+  }
+}
+
+// ── Shared span-detail contract ──────────────────────────────
+//
+// Both Timeline's compact popover and Navigator's persistent inspector render
+// this exact normalized model. It accepts either a raw Phoenix GraphQL span or
+// Timeline's normalized/render-annotated span. Context supplies ancestor-only
+// identity (notably session id for leaf spans); it never manufactures I/O or
+// performs another fetch.
+
+export function spanSummaryOf(span) {
+  const source = span || {};
+  const attrs = parseAttributes(source.attributes ?? source.attrs);
+  const existing = source.rSummary || {};
+  return {
+    turnCount: numberValue(firstPresent(existing.turnCount, getAttr(attrs, ATTR_TURN_COUNT))),
+    toolCount: numberValue(firstPresent(existing.toolCount, getAttr(attrs, ATTR_TOOL_COUNT))),
+    errorCount: numberValue(
+      firstPresent(existing.errorCount, getAttr(attrs, ATTR_ERROR_COUNT)),
+    ),
+    successRatio: numberValue(
+      firstPresent(existing.successRatio, getAttr(attrs, ATTR_SUCCESS_RATIO)),
+    ),
+    durationMs: numberValue(
+      firstPresent(
+        existing.durationMs,
+        getAttr(attrs, ATTR_DURATION_MS),
+        getAttr(attrs, ATTR_TURN_DURATION_MS),
+        getAttr(attrs, ATTR_SESSION_DURATION_MS),
+      ),
+    ),
+  };
+}
+
+export function normalizeSpanDetail(span, context = {}) {
+  const source = span || {};
+  const attrs = parseAttributes(source.attributes ?? source.attrs);
+  const startMs = timestampValue(firstPresent(source.start, source.startTime));
+  const rawEndMs = timestampValue(
+    firstPresent(context.endMs, source.rEnd, source.end, source.endTime),
+  );
+  const running =
+    typeof source.rOpen === "boolean"
+      ? source.rOpen
+      : source.openEnded === true ||
+        (!Number.isFinite(context.endMs) &&
+          !present(source.endTime) &&
+          !Number.isFinite(source.end));
+  const endMs = running ? null : rawEndMs;
+  const ownSummary = spanSummaryOf(source);
+  const summary = context.summary || source.rSummary || ownSummary;
+  const attrDuration = firstPresent(
+    getAttr(attrs, ATTR_DURATION_MS),
+    getAttr(attrs, ATTR_TURN_DURATION_MS),
+    getAttr(attrs, ATTR_SESSION_DURATION_MS),
+  );
+  const durationMs = numberValue(
+    firstPresent(
+      context.durationMs,
+      summary.durationMs,
+      source.latencyMs,
+      startMs != null && endMs != null ? endMs - startMs : null,
+      attrDuration,
+    ),
+  );
+
+  const attrAgent = getAttr(attrs, ATTR_AGENT_NAME);
+  const sess = sessionKeyOf(attrs);
+  const statusRaw = firstPresent(source.status, source.statusCode);
+  const status = present(statusRaw) ? String(statusRaw).toLowerCase() : null;
+  const state = source.rAbandoned
+    ? "abandoned — no completion recorded"
+    : running
+      ? "running"
+      : "completed";
+  const input = firstPresent(source.input, getAttr(attrs, ATTR_INPUT_VALUE));
+  const output = firstPresent(source.output, getAttr(attrs, ATTR_OUTPUT_VALUE));
+  const model = firstPresent(source.model, getAttr(attrs, ATTR_MODEL_NAME));
+  const projectName = firstPresent(
+    context.projectName,
+    source.projectName,
+    getAttr(attrs, ATTR_PROJECT_NAME),
+  );
+  const projectId = firstPresent(context.projectId, source.projectId);
+  const agent = firstPresent(
+    context.agent,
+    context.agentName,
+    source.agent,
+    present(attrAgent) ? baseAgentName(attrAgent) : null,
+  );
+  const worker = firstPresent(context.worker, source.worker, workerOf(attrs));
+  const sessionId = firstPresent(
+    context.sessionId,
+    source.sessionId,
+    sess && sess.id,
+  );
+  const traceId = firstPresent(
+    context.traceId,
+    source.traceId,
+    source.context && source.context.traceId,
+  );
+  const spanId = firstPresent(
+    context.spanId,
+    source.spanId,
+    source.context && source.context.spanId,
+  );
+  const parentSpanId = firstPresent(
+    context.parentSpanId,
+    source.parentSpanId,
+    source.parentId,
+  );
+
+  return {
+    name: String(firstPresent(source.name, "(span)")),
+    displayName: String(firstPresent(source.rLabel, source.name, "(span)")),
+    kind: spanKindOf(source),
+    status,
+    state,
+    startMs,
+    endMs,
+    durationMs,
+    agent: present(agent) ? String(agent) : null,
+    worker: present(worker) ? String(worker) : null,
+    model: present(model) ? String(model) : null,
+    projectName: present(projectName) ? String(projectName) : null,
+    projectId: present(projectId) ? String(projectId) : null,
+    sessionId: present(sessionId) ? String(sessionId) : null,
+    traceId: present(traceId) ? String(traceId) : null,
+    spanId: present(spanId) ? String(spanId) : null,
+    parentSpanId: present(parentSpanId) ? String(parentSpanId) : null,
+    nodeId: present(firstPresent(context.nodeId, source.nodeId, source.id))
+      ? String(firstPresent(context.nodeId, source.nodeId, source.id))
+      : null,
+    stats: {
+      turnCount: numberValue(firstPresent(summary.turnCount, ownSummary.turnCount)),
+      toolCount: numberValue(firstPresent(summary.toolCount, ownSummary.toolCount)),
+      errorCount: numberValue(firstPresent(summary.errorCount, ownSummary.errorCount)),
+      successRatio: numberValue(firstPresent(summary.successRatio, ownSummary.successRatio)),
+    },
+    input: present(input) ? String(input) : null,
+    output: present(output) ? String(output) : null,
+    attributes: attrs,
+  };
+}
+
+export function spanDetailFields(detail) {
+  const d = detail || {};
+  const fields = [];
+  const add = (label, value) => {
+    if (present(value)) fields.push({ label, value: String(value) });
+  };
+  add("name", d.name);
+  add("kind", d.kind);
+  add("status", d.status);
+  add("state", d.state);
+  if (Number.isFinite(d.startMs)) add("started", new Date(d.startMs).toISOString());
+  if (Number.isFinite(d.endMs)) add("ended", new Date(d.endMs).toISOString());
+  if (Number.isFinite(d.durationMs)) add("duration", fmtDuration(d.durationMs));
+  add("agent", d.agent);
+  add("worker", d.worker);
+  add("model", d.model);
+  add("project", d.projectName);
+  add("session", d.sessionId);
+  add("trace ID", d.traceId);
+  add("span ID", d.spanId);
+  add("parent span ID", d.parentSpanId);
+  const stats = d.stats || {};
+  if (Number.isFinite(stats.turnCount)) add("turns", stats.turnCount);
+  if (Number.isFinite(stats.toolCount)) add("tools", stats.toolCount);
+  if (Number.isFinite(stats.errorCount)) add("errors", stats.errorCount);
+  if (Number.isFinite(stats.successRatio)) {
+    add("success", `${Math.round(stats.successRatio * 100)}%`);
+  }
+  return fields;
+}
+
+function attributesJson(attributes) {
+  try {
+    return JSON.stringify(attributes || {}, null, 2);
+  } catch (_e) {
+    return "{}";
+  }
+}
+
+// DOM-testable shared presentation. Callers may hide the raw section for a
+// compact surface, but field ordering, omission, I/O clipping, and labels stay
+// identical in both views.
+export function renderSpanDetail(detail, { rawAttributes = true } = {}) {
+  const d = detail || {};
+  const rows = spanDetailFields(d)
+    .map(
+      ({ label, value }) =>
+        `<div class="obs-detail__row"><span class="obs-detail__key">${escapeHtml(label)}</span>` +
+        `<span class="obs-detail__value">${escapeHtml(value)}</span></div>`,
+    )
+    .join("");
+  const ioBlock = (label, value) =>
+    !present(value)
+      ? ""
+      : `<div class="obs-detail__io"><div class="obs-detail__io-label">${escapeHtml(label)}</div>` +
+        `<pre class="obs-detail__io-value">${escapeHtml(clip(value))}</pre></div>`;
+  const io = ioBlock(ATTR_INPUT_VALUE, d.input) + ioBlock(ATTR_OUTPUT_VALUE, d.output);
+  const raw = rawAttributes
+    ? `<details class="obs-detail__raw"><summary>Raw attributes</summary>` +
+      `<pre class="obs-detail__raw-value">${escapeHtml(attributesJson(d.attributes))}</pre></details>`
+    : "";
+  return `<div class="obs-detail">${rows}${io}${raw}</div>`;
+}
+
+export function buildNavigatorRevealTarget(detail) {
+  const d = detail || {};
+  return compactRecord(
+    {
+      projectId: d.projectId,
+      projectName: d.projectName,
+      agentName: d.agent,
+      // `null` is meaningful here: it identifies the agent's stageless bucket
+      // rather than an unspecified worker whose session may be found beneath
+      // any worker carrying the same run id.
+      worker: d.worker,
+      sessionId: d.sessionId,
+      traceId: d.traceId,
+      spanId: d.spanId,
+      nodeId: d.nodeId,
+      startTime: d.startMs,
+    },
+    ["worker"],
+  );
+}
+
+export function buildTimelineRevealTarget(detail) {
+  const d = detail || {};
+  return compactRecord({
+    projectId: d.projectId,
+    projectName: d.projectName,
+    traceId: d.traceId,
+    spanId: d.spanId,
+    nodeId: d.nodeId,
+    startTime: d.startMs,
+  });
 }

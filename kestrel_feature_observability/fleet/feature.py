@@ -1,10 +1,10 @@
 """Fleet observability ``HostFeature``.
 
-Ships the single "Observability" console panel — a thin embed of the
-host-supervised Phoenix UI (the OTel-native pivot, epic #32). The custom event
-store, query routes, and swimlane/runs panels this feature once carried are
-retired: emission is fully OTel (the per-agent hook emits spans) and the UI is
-the Phoenix embed, so nothing writes to or reads from a local store anymore.
+Ships the single "Observability" console panel: Timeline for temporal overview,
+Navigator for hierarchy plus persistent span inspection, and the curated
+host-supervised Phoenix embed for exhaustive trace forensics (the OTel-native
+pivot, epic #32). The custom event store and query routes are retired: all
+three views read Phoenix, so nothing writes to or reads from a local store.
 
 Discovered at host scope via the ``kestrel_sovereign.host_features`` entry point.
 """
@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 class FleetObservabilityHostFeature(HostFeature):
     """Host-scoped fleet observability feature.
 
-    Ships the single "Observability" console panel embedding the host-supervised
-    Phoenix UI. Discovered at host scope, not per-agent.
+    Ships the single "Observability" console panel backed by host-supervised
+    Phoenix. Discovered at host scope, not per-agent.
     """
 
     #: Stable slug used for mount path / capability gating.
@@ -32,7 +32,7 @@ class FleetObservabilityHostFeature(HostFeature):
     # -- UI -----------------------------------------------------------------
 
     def get_ui_contributions(self) -> Optional[UIContributions]:
-        """Ship the single "Observability" console panel (embedded Phoenix UI)."""
+        """Ship the Timeline, Navigator inspector, and embedded Phoenix panel."""
         import os
 
         static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -45,8 +45,8 @@ class FleetObservabilityHostFeature(HostFeature):
             # module as ``{mount}/{path}``, so the path is relative to the static
             # root (the file ships at ``static/observability.js``) — no ``slug``
             # prefix here (the host already adds it) or the URL 404s. The single
-            # panel module embeds the self-hosted Phoenix UI (``/phoenix/``) via
-            # an iframe (OTel-native pivot #32).
+            # panel module reads Phoenix for Timeline/Navigator and embeds its UI
+            # at ``/phoenix/`` for exhaustive trace forensics.
             modules=["observability.js"],
             # Host panels are always-on; keep the capability gate off (the
             # sovereign gate bug is fixed separately in

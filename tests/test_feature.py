@@ -52,8 +52,8 @@ def test_ui_module_paths_are_mount_relative_and_shipped():
 def test_navigator_subview_ships_and_is_wired():
     """The Fleet Navigator sub-view (#46) ships on disk and is wired in.
 
-    The container (``observability.js``) renders the two-item sub-nav
-    (Navigator | Phoenix) and imports the navigator module relatively, so
+    The container (``observability.js``) renders the three-view sub-nav
+    (Timeline | Navigator | Phoenix) and imports the navigator module relatively, so
     ``navigator.js`` must ship in the same static dir WITHOUT being registered
     as a second top-level module (the host imports only the container).
     """
@@ -85,9 +85,13 @@ def test_navigator_reads_the_emitter_attribute_contract():
     feature = FleetObservabilityHostFeature()
     contributions = feature.get_ui_contributions()
     assert contributions is not None
-    src = open(
+    navigator_src = open(
         os.path.join(contributions.static_dir, "navigator.js"), encoding="utf-8"
     ).read()
+    phoenix_src = open(
+        os.path.join(contributions.static_dir, "phoenix.js"), encoding="utf-8"
+    ).read()
+    src = navigator_src + phoenix_src
     for needle in (
         "/phoenix/graphql",
         "openinference.project.name",

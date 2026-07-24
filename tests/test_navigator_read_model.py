@@ -45,28 +45,33 @@ def _navigator_source() -> str:
 
 
 def _navigator_module(tmp_path: pathlib.Path) -> pathlib.Path:
-    """Write navigator.js as a node-importable module.
+    """Write navigator.js + shared phoenix.js as a node-importable module.
 
-    navigator.js imports the console's API client from an absolute URL only a
+    phoenix.js imports the console's API client from an absolute URL only a
     browser can resolve; stub it — the code under test never touches it.
     """
-    src = _navigator_source().replace(
+    pkg = tmp_path / "nav"
+    pkg.mkdir()
+    (pkg / "package.json").write_text('{"type":"module"}', encoding="utf-8")
+    phoenix = (STATIC / "phoenix.js").read_text(encoding="utf-8").replace(
         'import API from "/js/api.js";',
         "const API = { requestHost: async () => ({}) };",
     )
-    assert "const API" in src, "API import stub failed — import line changed?"
-    module = tmp_path / "navigator.mjs"
-    module.write_text(src, encoding="utf-8")
+    assert "const API" in phoenix, "phoenix.js API import stub failed"
+    (pkg / "phoenix.js").write_text(phoenix, encoding="utf-8")
+    module = pkg / "navigator.js"
+    module.write_text(_navigator_source(), encoding="utf-8")
     return module
 
 
 def _graphql_documents() -> list[str]:
     """Every GraphQL document the fleet static bundle sends to Phoenix.
 
-    navigator.js holds its documents in backtick template literals;
+    phoenix.js holds the shared documents in backtick template literals;
     observability.js's name→ID deep-link query is a double-quoted string.
     """
-    docs = re.findall(r"`\s*(query\s[^`]*)`", _navigator_source())
+    phoenix = (STATIC / "phoenix.js").read_text(encoding="utf-8")
+    docs = re.findall(r"`\s*(query\s[^`]*)`", phoenix)
     obs = (STATIC / "observability.js").read_text(encoding="utf-8")
     docs += re.findall(r'"(query\s[^"]*)"', obs)
     return docs
