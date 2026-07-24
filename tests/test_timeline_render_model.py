@@ -86,7 +86,15 @@ function span(o) {
   };
 }
 const NOW = 10000;
-const pick = (s) => ({ rHide: s.rHide, rOpen: s.rOpen, rEnd: s.rEnd, rLabel: s.rLabel, rSummary: s.rSummary });
+// Far-future clock so a span starting near t=0 is > STALE_MARKER_MS (5 min) old —
+// the #67 abandoned-cap scenarios exercise stale open spans, whereas the NOW-based
+// scenarios above stay recent (never abandoned).
+const LATE = 10_000_000;
+// Mirror timeline.js's thresholds so the harness can place spans just inside /
+// just outside the abandoned + reconcile windows.
+const STALE = 5 * 60 * 1000; // STALE_MARKER_MS
+const RECONCILE = 5 * 60 * 1000; // STALE_RECONCILE_MS (grace past staleness)
+const pick = (s) => ({ rHide: s.rHide, rOpen: s.rOpen, rEnd: s.rEnd, rLabel: s.rLabel, rSummary: s.rSummary, rAbandoned: s.rAbandoned });
 const out = {};
 
 // talon: marker parented UNDER a CLOSED real span → marker dropped, real is the bar.
@@ -195,6 +203,104 @@ const out = {};
   out.turnFloor = { before: before.get("P"), openBefore, closedAfter: t1.rOpen === false, afterEmpty: after.get("P") == null };
 }
 
+// #67 — SIGKILL / power-loss cap. A hard kill can't be caught, so the held-open
+// span never gets its close. Any still-open span older than STALE_MARKER_MS whose
+// whole subtree has been silent that long is ABANDONED (capped), not painted
+// running-to-now. All three open shapes are capped by the one unified pass.
+
+// (a) held-open real span (frinz#657 shape) — a talon run root exported in-flight
+//     but never closed → abandoned, capped to its own start (childless).
+{
+  const run = span({ name: "talon run", start: 1000, openEnded: true, spanId: "ka1", sessionId: "K1" });
+  annotateRenderModel([run], LATE);
+  out.abandonedHeldOpen = pick(run);
+}
+// (b) unpaired "(started)" marker whose twin never arrived → abandoned.
+{
+  const marker = span({ name: "coordinate (started)", start: 1000, marker: "start", spanId: "kb1", parentId: "MISSING", sessionId: "K2" });
+  annotateRenderModel([marker], LATE);
+  out.abandonedMarker = pick(marker);
+}
+// (c) summary-less live-tail turn root (Claude/emitter SIGKILL'd mid-turn) →
+//     abandoned rather than open-ended to the live edge forever.
+{
+  const turn = span({ name: "claude-code turn 1", start: 1000, marker: "start", kind: "AGENT", spanId: "kc1", sessionId: "K3", attrs: { kestrel: { turn_index: 1 } } });
+  annotateRenderModel([turn], LATE);
+  out.abandonedTurn = pick(turn);
+}
+// (d) prefer observed evidence: an abandoned run WITH exported children ends at
+//     the latest child end (not a fixed stub, not the live edge).
+{
+  const run = span({ name: "talon run", start: 1000, openEnded: true, spanId: "kd1", sessionId: "K4" });
+  const tool = span({ name: "Bash", start: 1200, end: 5000, spanId: "kd2", parentId: "kd1", sessionId: "K4" });
+  annotateRenderModel([run, tool], LATE);
+  out.abandonedWithChild = { run: pick(run), tool: pick(tool) };
+}
+// (e) descendant-liveness exemption: a recent child keeps an OLD open root LIVE
+//     (genuinely in-flight) — never marked abandoned. Self-correcting each poll.
+{
+  const run = span({ name: "talon run", start: 1000, openEnded: true, spanId: "ke1", sessionId: "K5" });
+  const tool = span({ name: "Bash", start: LATE - 1000, openEnded: true, spanId: "ke2", parentId: "ke1", sessionId: "K5" });
+  annotateRenderModel([run, tool], LATE);
+  out.liveChildKeepsOpen = { run: pick(run), tool: pick(tool) };
+}
+// (f) nested held-open subtree (run root ⊃ stage), both silent past the window →
+//     BOTH capped (the raw-open child must not exempt its parent forever).
+{
+  const run = span({ name: "talon run", start: 1000, openEnded: true, spanId: "kf1", sessionId: "K6" });
+  const stage = span({ name: "implement", start: 1100, openEnded: true, spanId: "kf2", parentId: "kf1", sessionId: "K6" });
+  annotateRenderModel([run, stage], LATE);
+  out.nestedAbandoned = { run: pick(run), stage: pick(stage) };
+}
+
+// #67 P1 (live re-annotation) — a span loaded while RECENT is open; with NO new
+// span IDs, only the clock advancing past STALE_MARKER_MS must flip it to
+// abandoned. This is the pure core of the live fix: buildLayout re-runs
+// annotateRenderModel every poll tick (not only when new IDs arrive), so a poll
+// that adds nothing still catches staleness.
+{
+  const run = span({ name: "talon run", start: NOW - 1000, openEnded: true, spanId: "kt1", sessionId: "K9" });
+  annotateRenderModel([run], NOW); // recent → genuinely live
+  const whileRecent = { rOpen: run.rOpen, rAbandoned: run.rAbandoned };
+  annotateRenderModel([run], NOW + STALE + 1); // same span, clock advanced → abandoned
+  out.reAnnotateStale = { whileRecent, afterAdvance: { rOpen: run.rOpen, rAbandoned: run.rAbandoned } };
+}
+
+// #67 P1 (reconcile floor) — visual abandonment must NOT sever the backdated-twin
+// re-fetch floor. An abandoned turn root still within the reconcile grace keeps
+// anchoring the poll floor (floor <= its backdated summary's start); when that
+// late summary lands it folds, un-abandons and closes the turn, and the floor
+// clears so the poll stops re-fetching.
+{
+  const START = LATE - 500_000; // > STALE (abandoned) but within STALE+RECONCILE (reconciling)
+  const t1 = span({ name: "claude-code turn 1", start: START, marker: "start", kind: "AGENT", spanId: "kr1", sessionId: "K7", projectId: "R", attrs: { kestrel: { turn_index: 1 } } });
+  annotateRenderModel([t1], LATE);
+  const before = openStartFloors([t1]);
+  const abandonedBefore = t1.rAbandoned;
+  const floorWhileAbandoned = before.get("R");
+  const summary = span({ name: "turn 1 summary", start: START, end: START + 20_000, kind: "CHAIN", spanId: "kr2", parentId: "kr1", sessionId: "K7", projectId: "R", attrs: { kestrel: { tool_count: 0, success_ratio: 1, turn_duration_ms: 20000 } } });
+  annotateRenderModel([t1, summary], LATE);
+  const after = openStartFloors([t1, summary]);
+  out.abandonedReconcile = {
+    abandonedBefore,
+    floorWhileAbandoned,
+    coversTwin: floorWhileAbandoned != null && floorWhileAbandoned <= START,
+    reAbandonedAfter: t1.rAbandoned,
+    closedAfter: t1.rOpen === false,
+    afterEmpty: after.get("R") == null,
+  };
+}
+
+// #67 P1 (bounded floor) — an ANCIENT abandoned run (its twin will never arrive)
+// is BEYOND the reconcile grace, so it drops out of the floor: the poll must not
+// peg its cursor to days-ago and re-scan the whole span every tick forever.
+{
+  const run = span({ name: "talon run", start: 1000, openEnded: true, spanId: "kh1", sessionId: "K8", projectId: "R2" });
+  annotateRenderModel([run], LATE);
+  const floors = openStartFloors([run]);
+  out.abandonedBeyondReconcile = { abandoned: run.rAbandoned, floorEmpty: floors.get("R2") == null };
+}
+
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -296,3 +402,76 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     assert tf["before"] == 200
     assert tf["closedAfter"] is True
     assert tf["afterEmpty"] is True
+
+    # Recent open spans (well within the window) are NEVER abandoned — the orphan
+    # marker and the in-flight talon stage keep their provisional open band.
+    assert r["orphan"]["rAbandoned"] is False
+    assert r["talonOpen"]["real"]["rAbandoned"] is False
+
+    # #67 — SIGKILL / power-loss cap. A still-open span past STALE_MARKER_MS with
+    # no recent subtree activity is ABANDONED (rOpen=False), bounded to evidence,
+    # not painted running-to-now. All three open shapes are capped uniformly.
+    ab_ho = r["abandonedHeldOpen"]  # held-open real span (frinz#657 shape)
+    assert ab_ho["rAbandoned"] is True
+    assert ab_ho["rOpen"] is False
+    assert ab_ho["rEnd"] == 1000  # childless → capped to its own start (instant stub)
+    ab_mk = r["abandonedMarker"]  # unpaired "(started)" marker, twin never arrived
+    assert ab_mk["rAbandoned"] is True
+    assert ab_mk["rOpen"] is False
+    assert ab_mk["rEnd"] == 1000
+    ab_tn = r["abandonedTurn"]  # summary-less live-tail turn root
+    assert ab_tn["rAbandoned"] is True
+    assert ab_tn["rOpen"] is False
+    assert ab_tn["rEnd"] == 1000
+
+    # Prefer observed evidence: an abandoned run WITH exported children ends at the
+    # latest child end, not a fixed stub and not the live edge. The child span
+    # itself (closed) is untouched.
+    awc = r["abandonedWithChild"]
+    assert awc["run"]["rAbandoned"] is True
+    assert awc["run"]["rOpen"] is False
+    assert awc["run"]["rEnd"] == 5000
+    assert awc["tool"]["rAbandoned"] is False
+
+    # Descendant-liveness exemption: a recent child keeps an OLD open root LIVE —
+    # never abandoned (genuinely in-flight, self-correcting each poll).
+    lck = r["liveChildKeepsOpen"]
+    assert lck["run"]["rAbandoned"] is False
+    assert lck["run"]["rOpen"] is True
+
+    # Nested held-open subtree, both silent past the window → BOTH capped; a raw
+    # still-open child must not exempt its parent forever (the frinz#657 nesting).
+    na = r["nestedAbandoned"]
+    assert na["run"]["rAbandoned"] is True
+    assert na["run"]["rOpen"] is False
+    assert na["stage"]["rAbandoned"] is True
+    assert na["stage"]["rOpen"] is False
+
+    # #67 P1 (live re-annotation): re-annotating the SAME span (no new IDs) with
+    # only the clock advanced past STALE_MARKER_MS flips a recent open span to
+    # abandoned. The live fix rebuilds the render model every poll tick, so
+    # staleness is caught even when a poll adds nothing.
+    ras = r["reAnnotateStale"]
+    assert ras["whileRecent"]["rOpen"] is True
+    assert ras["whileRecent"]["rAbandoned"] is False
+    assert ras["afterAdvance"]["rOpen"] is False
+    assert ras["afterAdvance"]["rAbandoned"] is True
+
+    # #67 P1 (reconcile floor): abandonment must not sever the backdated-twin
+    # re-fetch floor. While within the bounded reconcile grace an abandoned span
+    # still anchors the poll floor (<= its backdated summary start); once the late
+    # summary lands the span un-abandons + closes and the floor clears.
+    ar = r["abandonedReconcile"]
+    assert ar["abandonedBefore"] is True
+    assert ar["floorWhileAbandoned"] is not None
+    assert ar["coversTwin"] is True
+    assert ar["reAbandonedAfter"] is False
+    assert ar["closedAfter"] is True
+    assert ar["afterEmpty"] is True
+
+    # ...but the reconcile floor is BOUNDED: an ancient abandoned run (its twin
+    # will never arrive) drops out of the floor, so the poll doesn't peg its
+    # cursor to days-ago and re-scan the whole span forever.
+    abr = r["abandonedBeyondReconcile"]
+    assert abr["abandoned"] is True
+    assert abr["floorEmpty"] is True
