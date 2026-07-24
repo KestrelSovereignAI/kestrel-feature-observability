@@ -56,15 +56,40 @@ class FakeClassList {
 }
 
 class FakeCanvasContext {
+  constructor() {
+    this.frames = [];
+    this.currentFrame = null;
+  }
+  record(type, args) {
+    if (!this.currentFrame) return;
+    this.currentFrame.operations.push({
+      type,
+      args,
+      fillStyle: this.fillStyle ?? null,
+      strokeStyle: this.strokeStyle ?? null,
+      lineWidth: this.lineWidth ?? null,
+      textAlign: this.textAlign ?? null,
+    });
+  }
   setTransform() {}
-  clearRect() {}
-  fillRect() {}
-  strokeRect() {}
+  clearRect(...args) {
+    this.currentFrame = { operations: [] };
+    this.frames.push(this.currentFrame);
+    this.record("clearRect", args);
+  }
+  fillRect(...args) {
+    this.record("fillRect", args);
+  }
+  strokeRect(...args) {
+    this.record("strokeRect", args);
+  }
   beginPath() {}
   moveTo() {}
   lineTo() {}
   stroke() {}
-  fillText() {}
+  fillText(...args) {
+    this.record("fillText", args);
+  }
   save() {}
   restore() {}
   rect() {}
@@ -635,3 +660,296 @@ process.stdout.write(JSON.stringify({
     assert "orphan tool" in result["popover"]
     assert result["hasNavigatorButton"] is False
     assert result["hasPhoenixButton"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_mounted_timeline_redraws_async_exact_reveal_without_input(tmp_path):
+    """Async reveal data paints centered/highlighted; fallbacks stay honest."""
+    pkg = _module_dir(tmp_path)
+    _write_fake_dom(pkg)
+    (pkg / "async-timeline-reveal.mjs").write_text(
+        r"""
+import { FakeElement, installFakeDom, waitFor } from "./fake-dom.mjs";
+
+installFakeDom();
+
+const actualStart = Date.now() - 120_000;
+const iso = (value) => new Date(value).toISOString();
+const makeSpan = ({
+  id,
+  spanId,
+  agent,
+  name = "loaded tool",
+  start = actualStart,
+  duration = 10_000,
+  parentId = null,
+  attributes = null,
+}) => ({
+  id,
+  name,
+  spanKind: "TOOL",
+  startTime: iso(start),
+  endTime: iso(start + duration),
+  latencyMs: duration,
+  statusCode: "OK",
+  parentId,
+  attributes: JSON.stringify(
+    attributes || {
+      openinference: { span: { kind: "TOOL" } },
+      kestrel: { agent_name: agent },
+    },
+  ),
+  context: { spanId, traceId: `trace-${spanId}` },
+});
+
+const exactSpans = Array.from({ length: 30 }, (_unused, index) =>
+  makeSpan({
+    id: `node-${index}`,
+    spanId: index === 15 ? "exact-span" : `span-${index}`,
+    agent: `agent-${String(index).padStart(2, "0")}`,
+    name: index === 15 ? "exact loaded target" : `background ${index}`,
+    start: actualStart + index,
+  }),
+);
+
+let scenario = "exact";
+let activeSpans = exactSpans;
+let releaseProjects;
+let projectsReleased = false;
+const projectGate = new Promise((resolve) => {
+  releaseProjects = () => {
+    projectsReleased = true;
+    resolve();
+  };
+});
+
+globalThis.fetch = async (_url, options) => {
+  const { query } = JSON.parse(options.body);
+  if (query.includes("NavigatorProjects")) {
+    if (scenario === "exact" && !projectsReleased) await projectGate;
+    const data = {
+      projects: {
+        edges: [{
+          node: {
+            id: "project-1",
+            name: "owner/repo",
+            traceCount: activeSpans.length,
+            endTime: activeSpans[0] && activeSpans[0].endTime,
+          },
+        }],
+      },
+    };
+    return { status: 200, ok: true, json: async () => ({ data }) };
+  }
+  if (query.includes("NavigatorSpanPage")) {
+    const data = {
+      node: {
+        spans: {
+          edges: activeSpans.map((node) => ({ node })),
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    };
+    return { status: 200, ok: true, json: async () => ({ data }) };
+  }
+  throw new Error("unexpected GraphQL operation");
+};
+
+const { mount } = await import("./timeline.js");
+const exactContainer = new FakeElement("div");
+const exactMounted = mount(exactContainer, {
+  revealTarget: {
+    projectId: "project-1",
+    projectName: "owner/repo",
+    spanId: "exact-span",
+    // Deliberately stale navigation metadata: finishReveal() must recenter on
+    // the loaded span's authoritative start, ten seconds later.
+    startTime: actualStart - 10_000,
+  },
+});
+const exactCanvas = exactContainer.querySelector("[data-canvas]");
+const exactNotice = exactContainer.querySelector("[data-reveal-notice]");
+const exactLive = exactContainer.querySelector("[data-live]");
+await waitFor(
+  () => exactCanvas.context.frames.length > 0,
+  "Timeline did not paint its pre-load frame",
+);
+const preLoadFrameCount = exactCanvas.context.frames.length;
+const preLoadOperations = exactCanvas.context.frames.flatMap((frame) => frame.operations);
+
+releaseProjects();
+await waitFor(
+  () => exactNotice.textContent.includes("exact-span highlighted"),
+  "Timeline did not finish the exact reveal",
+);
+await waitFor(
+  () => exactCanvas.context.frames.some((frame, index) =>
+    index >= preLoadFrameCount &&
+    frame.operations.some(
+      (operation) =>
+        operation.type === "strokeRect" &&
+        operation.strokeStyle === "#facc15",
+    ),
+  ),
+  "Timeline did not redraw the loaded exact-span highlight",
+);
+
+const highlightedFrameIndex = exactCanvas.context.frames.findIndex(
+  (frame, index) =>
+    index >= preLoadFrameCount &&
+    frame.operations.some(
+      (operation) =>
+        operation.type === "strokeRect" &&
+        operation.strokeStyle === "#facc15",
+    ),
+);
+const highlightedFrame = exactCanvas.context.frames[highlightedFrameIndex];
+const highlightStroke = highlightedFrame.operations.find(
+  (operation) =>
+    operation.type === "strokeRect" &&
+    operation.strokeStyle === "#facc15",
+);
+const targetFill = highlightedFrame.operations.find(
+  (operation) =>
+    operation.type === "fillRect" &&
+    operation.fillStyle === "#f59e0b" &&
+    Math.abs(operation.args[0] - (highlightStroke.args[0] + 2)) < 0.01 &&
+    Math.abs(operation.args[1] - (highlightStroke.args[1] + 2)) < 0.01,
+);
+const exactResult = {
+  preLoadFrameCount,
+  preLoadHadTarget: preLoadOperations.some(
+    (operation) =>
+      operation.type === "fillRect" && operation.fillStyle === "#f59e0b",
+  ),
+  preLoadHadHighlight: preLoadOperations.some(
+    (operation) =>
+      operation.type === "strokeRect" && operation.strokeStyle === "#facc15",
+  ),
+  preLoadText: preLoadOperations
+    .filter((operation) => operation.type === "fillText")
+    .map((operation) => operation.args[0]),
+  highlightedFrameIndex,
+  highlightStroke,
+  targetFill,
+  livePressed: exactLive.attributes.get("aria-pressed"),
+  liveClass: exactLive.classList.values.has("obs-tl__btn--on"),
+  notice: exactNotice.textContent,
+};
+exactMounted.destroy();
+
+async function mountFallback(kind, target, spans, noticeText) {
+  scenario = kind;
+  activeSpans = spans;
+  const container = new FakeElement("div");
+  const mounted = mount(container, { revealTarget: target });
+  const canvas = container.querySelector("[data-canvas]");
+  const notice = container.querySelector("[data-reveal-notice]");
+  await waitFor(
+    () => notice.textContent.includes(noticeText),
+    `${kind} reveal did not show its fallback notice`,
+  );
+  await waitFor(
+    () => canvas.context.frames.some((frame) =>
+      frame.operations.some(
+        (operation) =>
+          operation.type === "fillRect" &&
+          operation.fillStyle === "#f59e0b",
+      ),
+    ),
+    `${kind} reveal did not paint its post-load frame`,
+  );
+  const result = {
+    notice: notice.textContent,
+    highlighted: canvas.context.frames.some((frame) =>
+      frame.operations.some(
+        (operation) =>
+          operation.type === "strokeRect" &&
+          operation.strokeStyle === "#facc15",
+      ),
+    ),
+    paintedOther: canvas.context.frames.some((frame) =>
+      frame.operations.some(
+        (operation) =>
+          operation.type === "fillRect" &&
+          operation.fillStyle === "#f59e0b",
+      ),
+    ),
+  };
+  mounted.destroy();
+  return result;
+}
+
+const otherSpan = makeSpan({
+  id: "other-node",
+  spanId: "other-span",
+  agent: "agent-other",
+});
+const missingResult = await mountFallback(
+  "missing",
+  {
+    projectId: "project-1",
+    projectName: "owner/repo",
+    spanId: "missing-span",
+    startTime: actualStart,
+  },
+  [otherSpan],
+  "could not be loaded",
+);
+const foldedSummary = makeSpan({
+  id: "summary-node",
+  spanId: "summary-span",
+  agent: "agent-summary",
+  name: "session summary",
+  duration: 12_000,
+});
+const foldedResult = await mountFallback(
+  "folded",
+  {
+    projectId: "project-1",
+    projectName: "owner/repo",
+    spanId: "summary-span",
+    startTime: actualStart,
+  },
+  [otherSpan, foldedSummary],
+  "folded into its owning Timeline band",
+);
+
+process.stdout.write(JSON.stringify({
+  exact: exactResult,
+  missing: missingResult,
+  folded: foldedResult,
+}));
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [NODE, str(pkg / "async-timeline-reveal.mjs")],
+        cwd=pkg,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    result = json.loads(proc.stdout)
+
+    exact = result["exact"]
+    assert exact["preLoadFrameCount"] >= 1
+    assert exact["preLoadHadTarget"] is False
+    assert exact["preLoadHadHighlight"] is False
+    assert "No spans in this window" in exact["preLoadText"]
+    assert exact["highlightedFrameIndex"] >= exact["preLoadFrameCount"]
+    assert exact["targetFill"] is not None
+    assert exact["highlightStroke"]["strokeStyle"] == "#facc15"
+    # 1000px canvas - 168px gutter => the loaded start is centered at x=584.
+    assert exact["targetFill"]["args"][0] == pytest.approx(584)
+    # Thirty lanes force a vertical scroll; the selected middle lane is centered.
+    assert 275 < exact["targetFill"]["args"][1] < 325
+    assert exact["livePressed"] == "false"
+    assert exact["liveClass"] is False
+    assert "exact-span highlighted" in exact["notice"]
+
+    for fallback in (result["missing"], result["folded"]):
+        assert fallback["paintedOther"] is True
+        assert fallback["highlighted"] is False
+        assert "no other span was highlighted" in fallback["notice"]
