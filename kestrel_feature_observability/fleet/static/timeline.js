@@ -39,6 +39,7 @@ import {
   ATTR_INPUT_VALUE,
   ATTR_OUTPUT_VALUE,
   ATTR_MODEL_NAME,
+  ATTR_RUN_ID,
   mintPhoenixSession,
   gql,
   PROJECTS_QUERY,
@@ -110,11 +111,18 @@ const ATTR_TOOL_CALL_ID = "tool.call_id";
 // "<x> (started)" marker, a summary-less live-tail turn root, or a held-open
 // talon run/stage root — and the earlier resolution would paint any of them
 // running-to-now. A still-open span whose start is older than this AND whose
-// whole subtree has been silent for at least this long is treated as ABANDONED:
-// bounded to observed child activity (or an instant stub), never the live edge.
-// Descendant activity WITHIN the window keeps it live (genuinely in-flight);
-// re-resolved every poll, so a fresh child flips it back to running (#67).
-const STALE_MARKER_MS = 5 * 60 * 1000;
+// whole RUN COHORT has been silent for at least this long is treated as
+// ABANDONED: bounded to observed child activity (or an instant stub), never the
+// live edge. Liveness is judged by the cohort, NOT the span's own subtree — a
+// held-open talon run parents its "<stage> (started)" markers and its tool spans
+// as SIBLINGS, so a marker's subtree is structurally empty even while its run is
+// busy; cohort activity within the window keeps the whole run live (genuinely
+// in-flight). Re-resolved every poll, so a fresh cohort span flips it back to
+// running (#67/#69). 15 min (not 5): the cap only needs to eventually retire
+// truly-dead (typically hours-old) orphans, and a tighter bound false-positives a
+// legitimately-quiet-but-alive run (a long test gate / long generation with no
+// tool spans).
+const STALE_MARKER_MS = 15 * 60 * 1000;
 
 // Visual abandonment (rAbandoned) is separate from ingestion: even after a span
 // is capped, a late BACKDATED completion (a twin/summary whose start == the
@@ -124,8 +132,9 @@ const STALE_MARKER_MS = 5 * 60 * 1000;
 // (`rReconcile`) so that late close can still be pulled and un-abandon it. The
 // bound is essential: an ancient SIGKILL'd run (whose twin will NEVER arrive)
 // must eventually drop out of the floor, else the poll would peg its cursor to
-// days-ago forever and re-scan that whole span every tick (#67 P1).
-const STALE_RECONCILE_MS = 5 * 60 * 1000;
+// days-ago forever and re-scan that whole span every tick (#67 P1). Tracks
+// STALE_MARKER_MS (raised to 15 min in #69).
+const STALE_RECONCILE_MS = 15 * 60 * 1000;
 
 function kindColor(kind) {
   return KIND_COLORS[kind] || KIND_DEFAULT;
@@ -213,6 +222,20 @@ function isSummary(s) {
 // id when stamped (emitter / Claude), else the trace (a lone talon-style run).
 function sessionKeyFor(s) {
   return s.sessionId != null ? `s:${s.sessionId}` : `t:${s.traceId || s.id}`;
+}
+
+// The RUN COHORT key for liveness (#69): the whole talon run / agent session /
+// lone trace a span belongs to. `kestrel.run_id` (stamped on EVERY talon span)
+// wins so a held-open run's markers and its SIBLING tool spans share one cohort;
+// else the session id (emitter / Claude stamp `kestrel.session_id` on every span
+// of a session); else the trace. The abandoned-cap judges liveness by this cohort
+// rather than a span's own subtree, since talon parents markers and tool spans as
+// siblings (a marker's subtree is empty even mid-run).
+function cohortKeyFor(s) {
+  const runId = getAttr(s.attrs, ATTR_RUN_ID);
+  if (runId != null && runId !== "") return `r:${runId}`;
+  if (s.sessionId != null) return `s:${s.sessionId}`;
+  return `t:${s.traceId || s.id}`;
 }
 
 function numAttr(s, key) {
@@ -492,20 +515,48 @@ export function annotateRenderModel(spanIter, nowMs) {
   //    openEnded default all leave a still-running span `rOpen=true`; a hard kill
   //    can't be caught, so a run that died days ago would keep painting open-ended
   //    out to the live edge. Apply ONE unified pass over the resolved model: any
-  //    span still open past STALE_MARKER_MS whose ENTIRE subtree has been silent
-  //    that long is abandoned — it never got a completion. Bound it to observed
-  //    evidence (the latest exported child end) or, childless, to an instant stub
-  //    — never `nowMs`. Descendant activity within the window (a child that
-  //    started or ended recently) is the honest liveness signal: it keeps the run
-  //    open-ended (genuinely in-flight). Pure time on the subtree, so it's
-  //    order-independent and self-correcting — a fresh child flips it back to live
-  //    on the next poll. This narrows ONLY the fate of a span that stays open past
-  //    the threshold; all pairing / turn-extent logic above is unchanged (#67).
+  //    span still open past STALE_MARKER_MS whose ENTIRE RUN COHORT has been silent
+  //    that long is abandoned — it never got a completion.
+  //
+  //    Liveness is judged by the span's cohort, NOT its own subtree. A LIVE talon
+  //    run holds its run/stage spans OPEN (not yet exported), so forward-poll loads
+  //    only their "<stage> (started)" markers and the `command_execution` tool
+  //    spans — BOTH parented under the (missing) held-open stage, so the tools are
+  //    SIBLINGS of the marker, not its children. A marker's own subtree is
+  //    therefore structurally always empty, so per-span subtree liveness would flag
+  //    every stage/run marker as abandoned the moment it crosses the window despite
+  //    constant sibling tool activity under the same run — the #69 flicker. Instead
+  //    the run is in-flight iff its cohort (`kestrel.run_id`, else session, else
+  //    trace) saw activity within the window; a truly-dead run's ENTIRE cohort is
+  //    silent, so its held-open markers still cap (the genuine SIGKILL case). Bound
+  //    the cap to observed evidence (the latest exported child end) or, childless,
+  //    to an instant stub — never `nowMs`. Re-resolved every poll, so it's
+  //    order-independent and self-correcting — a fresh cohort span flips it back to
+  //    live on the next poll. This narrows ONLY the fate of a span that stays open
+  //    past the threshold; all pairing / turn-extent logic above is unchanged
+  //    (#67/#69).
+
+  // Latest activity per cohort: max over members of max(start, effective end).
+  // Computed ONCE here — after steps 1–4 set `rEnd` (folded summaries / turn
+  // extents count as activity), before step 5 caps it below.
+  const cohortActivity = new Map();
+  for (const s of list) {
+    const key = cohortKeyFor(s);
+    const act = Math.max(s.start, s.rEnd != null ? s.rEnd : s.end);
+    const cur = cohortActivity.get(key);
+    if (cur == null || act > cur) cohortActivity.set(key, act);
+  }
   for (const s of list) {
     if (s.rOpen !== true) continue;
     if (nowMs - s.start <= STALE_MARKER_MS) continue; // recent → genuinely live
+    // The run is in-flight if ANYTHING in its cohort started or ended within the
+    // window — a sibling tool under a held-open run counts, unlike the marker's
+    // (empty) own subtree. Keep it open-ended when the cohort is still alive.
+    const act = cohortActivity.get(cohortKeyFor(s));
+    if (act != null && nowMs - act <= STALE_MARKER_MS) continue;
+    // Cohort silent past the window → abandoned. Retain the subtree walk ONLY to
+    // bound the cap `rEnd` to the latest observed child end (evidence).
     let latestEnd = s.start; // latest observed child end (evidence for rEnd)
-    let liveDescendant = false;
     const stack = (childrenOf.get(s.spanId) || []).slice();
     const seen = new Set();
     while (stack.length) {
@@ -514,15 +565,8 @@ export function annotateRenderModel(spanIter, nowMs) {
       seen.add(d);
       const dEnd = d.rEnd != null ? d.rEnd : d.end;
       if (dEnd > latestEnd) latestEnd = dEnd;
-      // A descendant that started OR ended within the window = live activity →
-      // the run is still in-flight, keep it open-ended.
-      if (nowMs - d.start <= STALE_MARKER_MS || nowMs - dEnd <= STALE_MARKER_MS) {
-        liveDescendant = true;
-        break;
-      }
       for (const c of childrenOf.get(d.spanId) || []) stack.push(c);
     }
-    if (liveDescendant) continue;
     s.rAbandoned = true;
     s.rOpen = false;
     s.rEnd = latestEnd; // latest child end, else s.start (childless → instant stub)
