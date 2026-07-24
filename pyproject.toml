@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-observability"
-version = "0.17.3"
+version = "0.17.4"
 description = "Observability feature for Kestrel Sovereign — a per-agent emitter that emits OTel spans for hook-driven lifecycle events, with a shared Prometheus registry"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
