@@ -17,14 +17,17 @@ process boundaries):
 - **Host extra** (`kestrel-feature-observability[fleet]`) — enables the
   **`FleetObservabilityHostFeature`** (the `kestrel_sovereign.host_features`
   entry point), which ships the single "Observability" console panel with a
-  two-item sub-nav: **Navigator** (default) — the hierarchical fleet drill-down
-  (Tenant → Fleet → Agent → Subagent → Session → Turn → Events) rendered
-  kestrel-native as a lazily-expanding virtualized tree, a pure read-model over
-  Phoenix's GraphQL through the same-origin `/phoenix/graphql` proxy (no store,
-  no new host routes) — and **Phoenix**, the curated thin embed of the
-  host-supervised Phoenix UI, which the navigator's per-trace "open in Phoenix"
-  links deep-link into. The HostFeature lives in the
-  `kestrel_feature_observability.fleet` subpackage. Since the custom
+  three-view sub-nav: **Timeline** (default) answers when activity happened with
+  a temporal overview and compact span detail; **Navigator** answers where it
+  fits with the hierarchical Tenant → Fleet → Agent → Subagent → Session → Turn
+  → Events tree and a persistent inspector for the selected Turn/Event span;
+  and **Phoenix** provides exhaustive trace forensics in the curated thin embed.
+  Timeline and Navigator links preserve the exact OTel span ID in both
+  directions, visibly highlight it, and report an honest containing-Turn or
+  no-highlight fallback when that exact span is unavailable. All three are pure
+  read-models over Phoenix's GraphQL through the same-origin
+  `/phoenix/graphql` proxy (no store or new host routes). The HostFeature lives
+  in the `kestrel_feature_observability.fleet` subpackage. Since the custom
   store/entities were retired, `fleet/feature.py` imports only the
   `HostFeature`/`UIContributions` contract from `kestrel_sdk`, so the host role
   is gated by the **SDK version**, not by an extra-only importable module: the

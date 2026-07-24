@@ -1,16 +1,18 @@
 // Fleet observability — "Observability" console panel.
 //
-// Part of the OTel pivot (#32): a single top-level host panel with a two-item
-// sub-nav (#46, reintroducing the pre-#37 subtab container pattern minimally):
+// Part of the OTel pivot (#32): a single top-level host panel with three
+// purpose-specific views:
 //
-//   Navigator (default) — the hierarchical fleet drill-down
+//   Timeline (default) — temporal overview and compact span detail.
+//   Navigator — the hierarchical fleet drill-down plus persistent span inspector
 //     (Tenant → Fleet → Agent → Subagent → Session → Turn → Events) rendered
-//     kestrel-native over Phoenix's GraphQL (see ./navigator.js).
+//     kestrel-native over Phoenix's GraphQL (see ./navigator.js). Cross-view
+//     navigation preserves the exact OTel span id.
 //   Phoenix — the curated same-origin Phoenix embed (unchanged from #41),
-//     which the navigator's per-trace "open in Phoenix" links deep-link into.
+//     used for exhaustive trace forensics.
 //
 // Selection persists (URL hash `#observability/<id>` wins so links are
-// shareable; localStorage is the fallback; else Navigator).
+// shareable; localStorage is the fallback; else Timeline).
 //
 // ── Phoenix embed subtab ──
 // On mount we probe availability by minting an embed session:
@@ -491,7 +493,7 @@ function mountPhoenix(container, opts = {}) {
 // Extensible registry: adding a view = one entry (id + label + mount). Each
 // view module exports `mount(container, opts)` returning a handle with
 // `destroy()`; the container mounts the active view and unmounts it on
-// switch/teardown, so only one view is live at a time. Navigator is first →
+// switch/teardown, so only one view is live at a time. Timeline is first →
 // the default on a fresh console load.
 
 const VIEWS = [
@@ -512,7 +514,7 @@ function escapeHtml(s) {
 
 // Persisted selection survives reloads. URL hash (#observability/<id>) wins so a
 // link is shareable; localStorage is the fallback; else the first view
-// (Navigator).
+// (Timeline).
 function readPersistedViewId() {
   try {
     const hash = (typeof location !== "undefined" && location.hash) || "";
@@ -555,7 +557,8 @@ export function mount(container) {
   let handle = null; // handle returned by the active view's mount()
   let destroyed = false;
   let pendingTraceUrl = null; // set by the navigator's "open in Phoenix" (#46)
-  let pendingRevealTarget = null; // set by the timeline's "open in Navigator" (#54)
+  let pendingRevealTarget = null; // Timeline → Navigator exact span
+  let pendingTimelineTarget = null; // Navigator → Timeline exact span
 
   container.innerHTML = `
     <div class="obs-panel">
@@ -597,6 +600,7 @@ export function mount(container) {
       pendingTraceUrl = null;
     } else if (view.id === "navigator") {
       opts.openTrace = openTrace;
+      opts.openTimeline = openTimeline;
       // One-shot: a pending timeline "open in Navigator" reveal target rides
       // along on this mount only (#54).
       opts.revealTarget = pendingRevealTarget;
@@ -606,6 +610,8 @@ export function mount(container) {
       // (canNav / canPhx) only show when these are provided (#54.6).
       opts.openTrace = openTrace;
       opts.openNavigator = openNavigator;
+      opts.revealTarget = pendingTimelineTarget;
+      pendingTimelineTarget = null;
     }
     handle = view.mount(contentEl, opts);
   }
@@ -630,10 +636,8 @@ export function mount(container) {
 
   // Timeline → Navigator drill-down (#54): switch to the Navigator subtab AND
   // pass a reveal target ({projectId, projectName, agentName, worker,
-  // sessionId, traceId}) the navigator best-effort expands its tree to —
-  // project → agent → session → trace — and scrolls into view. Missing nodes
-  // fail soft (no error UI); this is the whole point of the Timeline popover:
-  // drill-down continuity into the tree at that session/turn.
+  // sessionId, traceId, spanId, nodeId}) the navigator expands through the
+  // exact Event. A miss stops honestly at the deepest resolved ancestor.
   function openNavigator(target) {
     if (destroyed || !target) return;
     pendingRevealTarget = target;
@@ -641,6 +645,19 @@ export function mount(container) {
       mountView("navigator"); // already on Navigator → remount onto the reveal
     } else {
       switchTo("navigator");
+    }
+  }
+
+  // Navigator → Timeline reverse continuity: center the selected span's
+  // timestamp/project window and highlight that exact OTel span id. Timeline
+  // owns the honest not-found/folded fallback and never highlights a neighbor.
+  function openTimeline(target) {
+    if (destroyed || !target) return;
+    pendingTimelineTarget = target;
+    if (activeId === "timeline") {
+      mountView("timeline");
+    } else {
+      switchTo("timeline");
     }
   }
 
@@ -678,6 +695,25 @@ function ensureStyles() {
     .obs-subnav__tab--active { background:var(--color-accent,#818cf8); color:#0b1120;
                                border-color:var(--color-accent,#818cf8); }
     .obs-content { flex:1; min-height:0; overflow:hidden; }
+    .obs-detail { display:flex; flex-direction:column; gap:2px; }
+    .obs-detail__row { display:flex; gap:9px; padding:1px 0; font-size:12px; }
+    .obs-detail__key { flex:none; width:88px; padding-top:2px;
+                       color:var(--color-text-muted,#94a3b8); text-transform:uppercase;
+                       font-size:10px; font-weight:700; letter-spacing:.04em; }
+    .obs-detail__value { flex:1; min-width:0; word-break:break-word;
+                         font-family:ui-monospace,monospace; font-size:11px; }
+    .obs-detail__io { margin-top:7px; display:flex; flex-direction:column; gap:3px; }
+    .obs-detail__io-label { color:var(--color-text-muted,#94a3b8); text-transform:uppercase;
+                            font-size:10px; font-weight:700; letter-spacing:.04em; }
+    .obs-detail__io-value, .obs-detail__raw-value { margin:0; max-height:180px; overflow:auto;
+                                                    padding:7px 8px; white-space:pre-wrap;
+                                                    word-break:break-word; font:11px ui-monospace,monospace;
+                                                    background:var(--color-bg,#0b1120);
+                                                    border:1px solid var(--color-border,#334155);
+                                                    border-radius:6px; color:var(--color-text,#e2e8f0); }
+    .obs-detail__raw { margin-top:9px; color:var(--color-text-muted,#94a3b8); font-size:11px; }
+    .obs-detail__raw summary { cursor:pointer; font-weight:600; }
+    .obs-detail__raw-value { margin-top:5px; max-height:260px; color:var(--color-text,#e2e8f0); }
     .obs-embed { display:flex; flex-direction:column; height:100%; }
     .obs-frame { flex:1; min-height:0; width:100%; border:0; }
     .obs-notice { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
@@ -695,7 +731,7 @@ function ensureStyles() {
 //
 // A single always-on top-level panel. `registerPanel` expects a `panelId` and a
 // lazy `render(bodyEl)` callback; `mount(container)` fills the panel body and
-// renders the sub-nav (Navigator | Phoenix) on first activation.
+// renders the sub-nav (Timeline | Navigator | Phoenix) on first activation.
 
 registerPanel({
   panelId: "observability",
