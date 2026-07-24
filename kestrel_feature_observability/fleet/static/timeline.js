@@ -89,6 +89,9 @@ const ERROR_COLOR = "#ef4444";
 const DENSITY_COLOR = "#94a3b8";
 const SESSION_BAND_COLOR = "#64748b"; // translucent outermost session envelope
 const OPEN_EDGE_COLOR = "#22d3ee"; // live/provisional bar right-edge cap
+const ABANDONED_FILL = "#475569"; // SIGKILL'd/never-completed run — muted slate
+const ABANDONED_HATCH = "#94a3b8"; // diagonal hatch over the muted fill
+const ABANDONED_STUB_PX = 24; // childless abandoned marker → fixed stub width (paint-time)
 
 // A `kestrel.marker == "start"` attribute tags a provisional "<name> (started)"
 // span whose real closed span may not have arrived yet (talon in-flight): it
@@ -101,6 +104,28 @@ const MARKER_START = "start";
 // concurrent same-name tools (parallel `Bash`) pair one-to-one instead of the
 // first close hiding every same-name marker (#62 P2).
 const ATTR_TOOL_CALL_ID = "tool.call_id";
+
+// SIGKILL / power-loss / hard-reboot guard: the producers close their spans on
+// CATCHABLE exits, but a hard kill leaves work OPEN forever — an unpaired
+// "<x> (started)" marker, a summary-less live-tail turn root, or a held-open
+// talon run/stage root — and the earlier resolution would paint any of them
+// running-to-now. A still-open span whose start is older than this AND whose
+// whole subtree has been silent for at least this long is treated as ABANDONED:
+// bounded to observed child activity (or an instant stub), never the live edge.
+// Descendant activity WITHIN the window keeps it live (genuinely in-flight);
+// re-resolved every poll, so a fresh child flips it back to running (#67).
+const STALE_MARKER_MS = 5 * 60 * 1000;
+
+// Visual abandonment (rAbandoned) is separate from ingestion: even after a span
+// is capped, a late BACKDATED completion (a twin/summary whose start == the
+// span's own start, ≤ the live-poll watermark) may still be exported — a run
+// that was merely quiet for a while, not truly dead. For a BOUNDED grace past
+// the staleness threshold the abandoned span keeps anchoring the re-fetch floor
+// (`rReconcile`) so that late close can still be pulled and un-abandon it. The
+// bound is essential: an ancient SIGKILL'd run (whose twin will NEVER arrive)
+// must eventually drop out of the floor, else the poll would peg its cursor to
+// days-ago forever and re-scan that whole span every tick (#67 P1).
+const STALE_RECONCILE_MS = 5 * 60 * 1000;
 
 function kindColor(kind) {
   return KIND_COLORS[kind] || KIND_DEFAULT;
@@ -148,11 +173,17 @@ function startedBase(name) {
 //     band (never their own bar): the band end + click stats come from them.
 //
 // Annotates each span in place with the fields the layout/draw read:
-//   rHide    — never render (paired marker / folded summary)
-//   rOpen    — render open-ended (out to the live right edge)
-//   rEnd     — effective closed end (== start for a true instant)
-//   rSummary — folded summary stats {kind, turnCount, toolCount, successRatio, durationMs, end}
-//   rLabel   — informative band label ("turn 16 · 12 tools · 3m 40s"), else the bare name
+//   rHide      — never render (paired marker / folded summary)
+//   rOpen      — render open-ended (out to the live right edge)
+//   rEnd       — effective closed end (== start for a true instant)
+//   rSummary   — folded summary stats {kind, turnCount, toolCount, successRatio, durationMs, end}
+//   rLabel     — informative band label ("turn 16 · 12 tools · 3m 40s"), else the bare name
+//   rAbandoned — a SIGKILL'd/never-completed still-open span: capped (rOpen=false,
+//                rEnd=latest child end else start), drawn muted/hatched not live (#67)
+//   rReconcile — ingestion-only: an abandoned span still within the bounded
+//                reconcile grace that keeps anchoring the live re-fetch floor so
+//                a late backdated twin/summary can still be pulled (#67 P1). NOT
+//                read by the draw layer — purely a poll-floor signal.
 const TURN_SUMMARY_RE = /^turn\s+\d+\s+summary$/i;
 const SESSION_SUMMARY_RE = /^session\s+summary$/i;
 const STARTED_RE = /\(started\)\s*$/i;
@@ -241,6 +272,7 @@ function turnLabel(s, stats) {
 // Human duration for a span's own bar (folded summary duration wins for turn
 // bands; a zero-width closed span is "instant"; an open span is "running").
 function durText(s) {
+  if (s.rAbandoned) return "abandoned";
   if (isOpen(s)) return "running";
   if (s.rSummary && s.rSummary.durationMs != null) {
     const d = fmtDuration(s.rSummary.durationMs);
@@ -277,6 +309,8 @@ export function annotateRenderModel(spanIter, nowMs) {
     s.rEnd = s.end;
     s.rSummary = null;
     s.rLabel = null;
+    s.rAbandoned = false;
+    s.rReconcile = false;
   }
 
   // 1. Fold summaries into their owning root. A turn root absorbs the summary
@@ -454,6 +488,52 @@ export function annotateRenderModel(spanIter, nowMs) {
     }
   }
 
+  // 5. Abandoned-run cap (SIGKILL / power loss / hard reboot). Steps 2c/3 and the
+  //    openEnded default all leave a still-running span `rOpen=true`; a hard kill
+  //    can't be caught, so a run that died days ago would keep painting open-ended
+  //    out to the live edge. Apply ONE unified pass over the resolved model: any
+  //    span still open past STALE_MARKER_MS whose ENTIRE subtree has been silent
+  //    that long is abandoned — it never got a completion. Bound it to observed
+  //    evidence (the latest exported child end) or, childless, to an instant stub
+  //    — never `nowMs`. Descendant activity within the window (a child that
+  //    started or ended recently) is the honest liveness signal: it keeps the run
+  //    open-ended (genuinely in-flight). Pure time on the subtree, so it's
+  //    order-independent and self-correcting — a fresh child flips it back to live
+  //    on the next poll. This narrows ONLY the fate of a span that stays open past
+  //    the threshold; all pairing / turn-extent logic above is unchanged (#67).
+  for (const s of list) {
+    if (s.rOpen !== true) continue;
+    if (nowMs - s.start <= STALE_MARKER_MS) continue; // recent → genuinely live
+    let latestEnd = s.start; // latest observed child end (evidence for rEnd)
+    let liveDescendant = false;
+    const stack = (childrenOf.get(s.spanId) || []).slice();
+    const seen = new Set();
+    while (stack.length) {
+      const d = stack.pop();
+      if (seen.has(d)) continue;
+      seen.add(d);
+      const dEnd = d.rEnd != null ? d.rEnd : d.end;
+      if (dEnd > latestEnd) latestEnd = dEnd;
+      // A descendant that started OR ended within the window = live activity →
+      // the run is still in-flight, keep it open-ended.
+      if (nowMs - d.start <= STALE_MARKER_MS || nowMs - dEnd <= STALE_MARKER_MS) {
+        liveDescendant = true;
+        break;
+      }
+      for (const c of childrenOf.get(d.spanId) || []) stack.push(c);
+    }
+    if (liveDescendant) continue;
+    s.rAbandoned = true;
+    s.rOpen = false;
+    s.rEnd = latestEnd; // latest child end, else s.start (childless → instant stub)
+    // Visual cap ≠ giving up on ingestion. For a BOUNDED grace past the
+    // staleness threshold, keep anchoring the live re-fetch floor so a late,
+    // backdated twin/summary (start == s.start ≤ the poll watermark) can still
+    // be pulled and un-abandon this span. Beyond the grace we stop — an ancient
+    // dead run must not peg the poll cursor to its start forever (#67 P1).
+    if (nowMs - s.start <= STALE_MARKER_MS + STALE_RECONCILE_MS) s.rReconcile = true;
+  }
+
   return list;
 }
 
@@ -467,11 +547,15 @@ export function annotateRenderModel(spanIter, nowMs) {
 // startTime down to this floor (an open anchor's start ≤ its awaited close's
 // start) guarantees the close is pulled; once it lands the anchor resolves
 // (rOpen=false) and drops out of the floor, so polling stops re-fetching it
-// (#62 P1). Pure + exported for the render-model tests.
+// (#62 P1). An abandoned span within its bounded reconcile grace (`rReconcile`)
+// ALSO anchors the floor: visual abandonment must not sever the backdated-twin
+// re-fetch path, so a late completion for a merely-quiet run can still be pulled
+// and un-abandon it — the grace bound then drops truly-dead runs (#67 P1). Pure
+// + exported for the render-model tests.
 export function openStartFloors(spanIter) {
-  const floors = new Map(); // projectId → earliest still-open span start
+  const floors = new Map(); // projectId → earliest open/reconciling span start
   for (const s of spanIter) {
-    if (s.rOpen !== true) continue;
+    if (s.rOpen !== true && s.rReconcile !== true) continue;
     const key = s.projectId != null ? s.projectId : null;
     const cur = floors.get(key);
     if (cur == null || s.start < cur) floors.set(key, s.start);
@@ -786,7 +870,15 @@ export function mount(container, opts = {}) {
     } finally {
       polling = false;
     }
-    if (added) {
+    // Rebuild every tick, not only when new span IDs arrive: abandonment is
+    // purely time-based (a still-open span crosses STALE_MARKER_MS with its
+    // whole subtree silent), so an `added === 0` poll can still flip a span
+    // that was recent when loaded to abandoned. buildLayout() re-runs
+    // annotateRenderModel against a fresh nowMs, so the cap self-corrects
+    // within one poll of the deadline instead of painting running-to-now
+    // until a reload (#67 P1). Re-annotation is also self-healing: a fresh
+    // child or a backdated twin flips an abandoned span back to live/closed.
+    if (!destroyed) {
       buildLayout();
       requestDraw();
     }
@@ -1350,7 +1442,11 @@ export function mount(container, opts = {}) {
     for (const e of envs) {
       if (!onScreen(e.start, e.end, e.open)) continue;
       const r = rectFor(e.start, e.end, e.open, e.trackTop, e.trackCount);
-      ctx.fillStyle = e.span.status === "error" ? ERROR_COLOR : kindColor(e.span.kind);
+      ctx.fillStyle = e.span.rAbandoned
+        ? ABANDONED_FILL
+        : e.span.status === "error"
+          ? ERROR_COLOR
+          : kindColor(e.span.kind);
       ctx.globalAlpha = 0.14 + Math.min(0.16, e.depth * 0.05);
       ctx.fillRect(r.cx, r.ry, r.w, r.rh);
       ctx.globalAlpha = 1;
@@ -1364,7 +1460,9 @@ export function mount(container, opts = {}) {
     const byTrack = new Map();
     for (const it of row.items || []) {
       const s = it.span;
-      if (!onScreen(s.start, s.end, isOpen(s))) continue;
+      // Test visibility against the DRAWN extent (rEnd folds in a turn's summary
+      // and an abandoned run's latest-child bound), not the raw span end.
+      if (!onScreen(s.start, s.rEnd != null ? s.rEnd : s.end, isOpen(s))) continue;
       let arr = byTrack.get(it.track);
       if (!arr) {
         arr = [];
@@ -1389,6 +1487,31 @@ export function mount(container, opts = {}) {
         run = null;
       };
       for (const s of list) {
+        if (s.rAbandoned) {
+          // SIGKILL'd / never-completed run: a muted/hatched stub bounded to the
+          // latest observed child end (rEnd), or a fixed ~24px stub when childless
+          // — NEVER open-ended out to the live edge (#67). Not coalesced.
+          flush();
+          const aEnd = s.rEnd != null ? s.rEnd : s.end;
+          const hasExtent = aEnd > s.start;
+          const x = timeToX(s.start);
+          const cx = Math.max(GUTTER_W, x);
+          const rawW = hasExtent ? (aEnd - s.start) * pxPerMs() : ABANDONED_STUB_PX;
+          const w = Math.max(2, x + rawW - cx);
+          fillAbandoned(cx, ry, w, bh);
+          if (w > 46) {
+            ctx.fillStyle = theme.muted;
+            ctx.font = "10px system-ui, sans-serif";
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(cx, ry, w, bh);
+            ctx.clip();
+            ctx.fillText(`⚠ ${s.rLabel || s.name}`, cx + 3, ry + bh / 2);
+            ctx.restore();
+          }
+          drawn.push({ x: cx, y: ry, w, h: bh, span: s });
+          continue;
+        }
         const open = isOpen(s);
         const closedEnd = s.rEnd != null ? s.rEnd : s.end;
         const sEnd = open ? rightT : closedEnd;
@@ -1464,6 +1587,30 @@ export function mount(container, opts = {}) {
     ctx.textAlign = "left";
   }
 
+  // Muted diagonal-hatch fill for an ABANDONED run/marker band (#67) — reads as
+  // "died", visually distinct from a live/kind-colored bar.
+  function fillAbandoned(x, y, w, h) {
+    ctx.fillStyle = ABANDONED_FILL;
+    ctx.globalAlpha = 0.6;
+    ctx.fillRect(x, y, w, h);
+    ctx.globalAlpha = 1;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    ctx.strokeStyle = ABANDONED_HATCH;
+    ctx.globalAlpha = 0.45;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let hx = x - h; hx < x + w; hx += 5) {
+      ctx.moveTo(hx, y + h);
+      ctx.lineTo(hx + h, y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
   function truncLabel(text, maxPx) {
     const s = String(text);
     if (ctx.measureText(s).width <= maxPx) return s;
@@ -1523,6 +1670,9 @@ export function mount(container, opts = {}) {
       html =
         `<b>${escapeHtml(s.rLabel || s.name)}</b>` +
         `<div class="obs-tl__tipdim">${escapeHtml(s.kind)} · ${escapeHtml(durText(s))} · ${escapeHtml(s.status)}</div>` +
+        (s.rAbandoned
+          ? `<div class="obs-tl__tipwarn">⚠ abandoned — no completion recorded</div>`
+          : "") +
         (s.model ? `<div class="obs-tl__tipdim">model: ${escapeHtml(s.model)}</div>` : "");
     } else {
       hideTip();
@@ -1585,6 +1735,7 @@ export function mount(container, opts = {}) {
     if (s.worker) add("worker", s.worker);
     add("duration", durText(s));
     add("status", s.status);
+    if (s.rAbandoned) add("state", "⚠ abandoned — no completion recorded");
     add("started", `${fmtClock(s.start, true)} · ${relTime(s.start)}`);
     // Folded summary stats — a turn/session band answers "what was this turn":
     // tool count, success ratio, turn count (read off the summary attrs, #62).
@@ -1995,6 +2146,7 @@ function ensureStyles() {
                    border-radius:6px; padding:6px 9px; font-size:12px; line-height:1.35;
                    box-shadow:0 6px 20px rgba(0,0,0,.35); }
     .obs-tl__tipdim { color:var(--color-text-muted,#94a3b8); font-size:11px; }
+    .obs-tl__tipwarn { color:#f59e0b; font-size:11px; font-weight:600; }
     .obs-tl__pop { position:absolute; z-index:6; width:360px; max-width:calc(100% - 8px);
                    max-height:calc(100% - 8px); display:flex; flex-direction:column;
                    background:var(--color-surface,#1e293b); border:1px solid var(--color-border,#334155);
