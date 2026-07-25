@@ -89,9 +89,10 @@ When no OTLP endpoint is configured the tracer is a **no-op** — no provider, n
 exporter, no network — so the emit path costs nothing and the agent runs
 unaffected (Prometheus counters still fire locally). The span shape is the nested
 doll **session ⊃ turn ⊃ tool ⊃ tool-start markers**, one trace per turn (the
-session band is an attribute grouping — `kestrel.session_id` is stamped on every
-span — not a trace). A session-marker root is exported lazily on the first
-lifecycle event; each `UserPromptSubmit` starts a turn (a new trace root
+session band is an attribute grouping — OpenInference `session.id` and the
+backward-compatible `kestrel.session_id` are stamped with the same value on
+every span — not a trace). A session-marker root is exported lazily on the
+first lifecycle event; each `UserPromptSubmit` starts a turn (a new trace root
 `<agent> turn <n>`, tagged `kestrel.turn_id`/`kestrel.turn_index`); each
 `PreToolUse` emits an instant `<tool> (started)` marker and each `PostToolUse` a
 child `tool_span` (tool name, real duration, success) parented to the current
@@ -119,9 +120,10 @@ into the identical span shape as the in-process emitter above — session ⊃ tu
 tool ⊃ tool-start markers, one trace per turn — posted over OTLP/HTTP:
 
 - `SessionStart` → an immediately-ended `AGENT` session-marker root
-  (`kestrel.session_id` = the Claude session id, `kestrel.agent_name` =
-  `claude-code`, `kestrel.orchestrator` = `$KESTREL_OBSERVABILITY_ORCHESTRATOR`
-  else `Direct`).
+  (`session.id` and `kestrel.session_id` = the Claude session id,
+  `kestrel.agent_name` = `claude-code`, `kestrel.orchestrator` =
+  `$KESTREL_OBSERVABILITY_ORCHESTRATOR` else `Direct`). Both session attributes
+  are retained on every span the hook emits.
 - `UserPromptSubmit` → a labeled `claude-code turn <n>` root (a new trace). By
   default the root carries no prompt text; setting `KESTREL_OTEL_CAPTURE_PROMPTS=1`
   opts in to stamping the payload's `prompt` on the turn root as `input.value`,
@@ -187,6 +189,7 @@ fire a **separate** event, so without it errored tool calls would go unrecorded:
     "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
     "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
     "Stop":               [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
+    "SubagentStop":       [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }],
     "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/obs-emit.sh" }] }]
   }
 }

@@ -71,6 +71,18 @@ test = [
     "graphql-core>=3.2",
 ]
 
+[dependency-groups]
+# ``uv run`` installs the default ``dev`` group, so the repository's documented
+# and issue-verification command (``uv run pytest``) must provide its test runner
+# without requiring callers to remember ``--extra test``. Keep the public
+# ``test`` extra above for editable/pip development installs.
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+    "kestrel-sovereign-sdk[metrics]>=0.30.0,<0.32",
+    "graphql-core>=3.2",
+]
+
 [project.urls]
 Homepage = "https://kestrelsovereign.com"
 Source = "https://github.com/KestrelSovereignAI/kestrel-feature-observability"

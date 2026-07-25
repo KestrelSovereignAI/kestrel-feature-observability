@@ -218,6 +218,14 @@ test = [
     { name = "pytest-asyncio" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "graphql-core" },
+    { name = "kestrel-sovereign-sdk", extra = ["metrics"] },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "graphql-core", marker = "extra == 'test'", specifier = ">=3.2" },
@@ -233,6 +241,14 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=1.1.0" },
 ]
 provides-extras = ["metrics", "fleet", "test"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "graphql-core", specifier = ">=3.2" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics"], specifier = ">=0.30.0,<0.32" },
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", specifier = ">=1.1.0" },
+]
 
 [[package]]
 name = "kestrel-sovereign-sdk"
