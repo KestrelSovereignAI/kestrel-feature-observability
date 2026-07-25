@@ -29,8 +29,8 @@
 //   - root spans are Turns (session markers + per-interaction/run roots; talon
 //     run roots are named `owner/repo#issue`),
 //   - a turn's trace tree is the Events level (`openinference.span.kind`
-//     TOOL / LLM / CHAIN / AGENT …), with `input.value` / `output.value`
-//     revealed inline for LLM events.
+//     TOOL / LLM / CHAIN / AGENT …). Selecting a Turn or Event keeps the tree
+//     visible and fills the persistent span inspector beside it.
 //
 // Levels load LAZILY: expanding a node fires exactly ONE paginated GraphQL
 // query for that level. Phoenix has no attribute group-by API, so the Agent /
@@ -46,343 +46,94 @@
 // inline with indentation guides, never modal/page navigation. Live-follow
 // (off by default) polls every 10s, refreshing counts and prepending new
 // sessions/turns. Keyboard: ↑/↓ move, → expand/descend, ← collapse/ascend,
-// Enter/Space toggles. Phoenix down → the same friendly notice as the embed.
+// Enter/Space activates/selects. Phoenix down → the same friendly notice as the embed.
 // Styles are console-native (dark/light aware) — kestrel chrome, not Phoenix's.
 
-import API from "/js/api.js";
+import {
+  PHOENIX_URL,
+  DEFAULT_PROJECT,
+  ATTR_AGENT_NAME,
+  ATTR_SESSION_ID,
+  mintPhoenixSession,
+  gql,
+  PROJECTS_QUERY,
+  SPAN_PAGE_QUERY,
+  TRACE_SPANS_QUERY,
+  escapeHtml,
+  parseAttributes,
+  getAttr,
+  attrRef,
+  dslString,
+  exactAgentFilter,
+  agentFilter,
+  workerFilter,
+  ts,
+  relTime,
+  fmtDuration,
+  plural,
+  baseAgentName,
+  createAgg,
+  mergeSpansIntoAgg,
+  spanKindOf,
+  spanSummaryOf,
+  normalizeSpanDetail,
+  renderSpanDetail,
+  buildTimelineRevealTarget,
+} from "./phoenix.js";
 
-const PHOENIX_SESSION_PATH = "/api/host/phoenix/session";
-const PHOENIX_URL = "/phoenix/";
-const PHOENIX_GRAPHQL_URL = "/phoenix/graphql";
-
-// The agents' project (tracing.py DEFAULT_OTEL_PROJECT) — pinned first at the
-// Fleet level; repo projects (`owner/repo`, the talon claims) follow by name.
-const DEFAULT_PROJECT = "kestrel-fleet";
-
-// ── Emitter span-attribute contract (tracing.py / hook.py) ────
-const ATTR_PROJECT_NAME = "openinference.project.name"; // Resource attr → Phoenix project
-const ATTR_SPAN_KIND = "openinference.span.kind";
-const ATTR_AGENT_NAME = "kestrel.agent_name";
-const ATTR_STAGE = "kestrel.stage";
-const ATTR_SESSION_ID = "kestrel.session_id";
-const ATTR_OI_SESSION_ID = "session.id"; // OpenInference convention (fallback)
-const ATTR_RUN_ID = "kestrel.run_id"; // final session fallback (talon runs)
-const ATTR_INPUT_VALUE = "input.value";
-const ATTR_OUTPUT_VALUE = "output.value";
-
-// Spans missing kestrel.agent_name bucket here (should be none post-#2602).
-const UNKNOWN_AGENT = "unknown";
+// Keep the pure read-model exports available from navigator.js for callers
+// that predate phoenix.js becoming the shared source of truth.
+export {
+  attrRef,
+  exactAgentFilter,
+  agentFilter,
+  workerFilter,
+  baseAgentName,
+  createAgg,
+  mergeSpansIntoAgg,
+} from "./phoenix.js";
 
 const PAGE_SIZE = 100; // root spans per lazy page (client-side aggregation window)
 const TRACE_SPAN_LIMIT = 1000; // events per turn (one trace)
 const POLL_MS = 10_000; // live-follow cadence
-const IO_CLIP = 4000; // chars of input/output shown inline
 
-// Virtualization: fixed-height rows, taller inline I/O detail rows.
+// Virtualization: fixed-height tree rows.
 const ROW_H = 28;
-const DETAIL_H = 192;
 const OVERSCAN_PX = 200;
 
-// ── GraphQL client (embed-cookie auth; mint before first query, re-mint on 401)
-
-let phoenixSessionMinted = false;
-
-async function mintPhoenixSession() {
-  await API.requestHost(PHOENIX_SESSION_PATH, { method: "POST" });
-  phoenixSessionMinted = true;
-}
-
-async function gql(query, variables) {
-  if (!phoenixSessionMinted) await mintPhoenixSession();
-  const post = () =>
-    fetch(PHOENIX_GRAPHQL_URL, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, variables: variables || {} }),
-    });
-  let resp = await post();
-  if (resp.status === 401) {
-    // Embed cookie expired → re-mint once and retry.
-    phoenixSessionMinted = false;
-    await mintPhoenixSession();
-    resp = await post();
-  }
-  if (!resp.ok) throw new Error(`phoenix graphql HTTP ${resp.status}`);
-  const payload = await resp.json();
-  if (payload && Array.isArray(payload.errors) && payload.errors.length) {
-    throw new Error(payload.errors[0].message || "phoenix graphql error");
-  }
-  return (payload && payload.data) || {};
-}
-
-// Fleet level: the Phoenix projects (spans routed by the
-// `openinference.project.name` Resource attribute) with trace counts +
-// last-activity.
-const PROJECTS_QUERY = `
-  query NavigatorProjects {
-    projects(first: 1000) {
-      edges { node { id name traceCount endTime } }
+// Pure exact-selection contract used by the mounted reveal flow and Node
+// behavior tests. OTel span id is authoritative; Phoenix node id is used only
+// when no span id was supplied. A miss returns the containing Turn — never a
+// nearby/different Event — and marks the result inexact.
+export function resolveExactSpanReveal(turn, target = {}) {
+  if (!turn) return { node: null, path: [], exact: false };
+  const targetSpanId = target.spanId != null ? String(target.spanId) : null;
+  const targetNodeId =
+    targetSpanId == null && target.nodeId != null ? String(target.nodeId) : null;
+  const matches = (node) => {
+    const span = node && node.data && node.data.span;
+    if (!span) return false;
+    if (targetSpanId != null) {
+      return String((span.context && span.context.spanId) || "") === targetSpanId;
     }
-  }`;
-
-// One page of recency-ordered spans, optionally filtered with Phoenix's
-// span-filter DSL — the single query shape behind the Agent / Subagent /
-// Session / Turn levels (distinct-ness aggregated client-side). `$rootOnly`
-// is per-level: Agents/Turns read roots; the Subagent/Session drills read all
-// spans because the producers stamp the worker split on children only.
-// Phoenix (17.7.0) exposes `node(id:)` as plain `ID!` — it has no `GlobalID`
-// scalar; the documents here are schema-validated in the tests.
-const SPAN_PAGE_QUERY = `
-  query NavigatorSpanPage($projectId: ID!, $first: Int!, $after: String, $filter: String, $rootOnly: Boolean!, $sort: SpanSort) {
-    node(id: $projectId) {
-      ... on Project {
-        spans(first: $first, after: $after, filterCondition: $filter, rootSpansOnly: $rootOnly, sort: $sort) {
-          pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              id name spanKind startTime endTime latencyMs statusCode parentId attributes
-              context { spanId traceId }
-            }
-          }
-        }
-      }
-    }
-  }`;
-
-// Events level: the full span tree of one turn (= one trace).
-const TRACE_SPANS_QUERY = `
-  query NavigatorTraceSpans($projectId: ID!, $traceId: ID!, $first: Int!) {
-    node(id: $projectId) {
-      ... on Project {
-        trace(traceId: $traceId) {
-          spans(first: $first) {
-            edges {
-              node {
-                id name spanKind startTime endTime latencyMs statusCode parentId attributes
-                context { spanId traceId }
-              }
-            }
-          }
-        }
-      }
-    }
-  }`;
-
-// ── Attribute / formatting helpers ────────────────────────────
-
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function parseAttributes(raw) {
-  if (raw && typeof raw === "object") return raw;
-  try {
-    return JSON.parse(raw) || {};
-  } catch (_e) {
-    return {};
-  }
-}
-
-// Phoenix unflattens OTLP attribute keys into nested JSON
-// (`{"kestrel": {"agent_name": …}}`); accept the flat dotted key too so either
-// serialization works.
-function getAttr(attrs, key) {
-  if (!attrs || typeof attrs !== "object") return undefined;
-  if (key in attrs) return attrs[key];
-  let cur = attrs;
-  for (const part of key.split(".")) {
-    if (!cur || typeof cur !== "object" || !(part in cur)) return undefined;
-    cur = cur[part];
-  }
-  return cur;
-}
-
-// Phoenix span-filter DSL building blocks (Python-expression syntax). Phoenix
-// stores dotted OTel attribute keys NESTED (see getAttr above) and the filter
-// DSL matches only nested subscripts — verified live on 17.7.0, a flat
-// `attributes["kestrel.agent_name"]` ref silently matches nothing (#50) — so
-// each dot segment becomes its own subscript (`kestrel.agent_name` →
-// `attributes["kestrel"]["agent_name"]`); dotless keys are unchanged.
-export function attrRef(key) {
-  const parts = String(key).split(".");
-  let ref = `attributes[${JSON.stringify(parts[0])}]`;
-  for (const part of parts.slice(1)) ref += `[${JSON.stringify(part)}]`;
-  return ref;
-}
-
-function dslString(value) {
-  return `'${String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
-}
-
-// Exact-name spans only (run roots; no prefixed worker variants). `unknown`
-// covers the emitter's literal fallback name; attribute-less foreign spans
-// (should be none post-#2602) stay listed but un-drillable.
-export function exactAgentFilter(agentName) {
-  return `${attrRef(ATTR_AGENT_NAME)} == ${dslString(agentName)}`;
-}
-
-// Spans of `agentName` INCLUDING its prefixed worker variants: talon's child
-// stage spans carry `kestrel.agent_name == "talon/implement"` etc., which an
-// exact match excludes — a drill filtered that way never sees the worker
-// split. The DSL's `in` is substring containment (Phoenix `TextContains`),
-// not anchored, so the rare over-match (`xtalon/…`) is dropped client-side
-// during aggregation (see `ownedByAgent`).
-export function agentFilter(agentName) {
-  return `(${exactAgentFilter(agentName)} or ${dslString(`${agentName}/`)} in ${attrRef(ATTR_AGENT_NAME)})`;
-}
-
-// One worker under an agent, matched the same two ways the producers stamp
-// the split: an explicit `kestrel.stage`, or the prefixed agent-name variant.
-export function workerFilter(agentName, worker) {
-  return (
-    `${agentFilter(agentName)} and (${attrRef(ATTR_STAGE)} == ${dslString(worker)}` +
-    ` or ${attrRef(ATTR_AGENT_NAME)} == ${dslString(`${agentName}/${worker}`)})`
-  );
-}
-
-function ts(iso) {
-  const t = Date.parse(iso || "");
-  return Number.isFinite(t) ? t : null;
-}
-
-function relTime(ms) {
-  if (!Number.isFinite(ms)) return "";
-  const delta = Date.now() - ms;
-  if (delta < 0) return "now";
-  const s = Math.round(delta / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  if (h < 48) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
-}
-
-function fmtDuration(msLike) {
-  const ms = Number(msLike);
-  if (msLike == null || !Number.isFinite(ms)) return "";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${Math.round(s - m * 60)}s`;
-}
-
-function plural(n, word) {
-  return `${n} ${word}${n === 1 ? "" : "s"}`;
-}
-
-function clip(text) {
-  const s = String(text);
-  return s.length > IO_CLIP ? `${s.slice(0, IO_CLIP)}\n… (truncated)` : s;
-}
-
-// {count, first, last, errored} rollup entries for the aggregated levels.
-function bumpEntry(entry, start, end, errored) {
-  const e = entry || { count: 0, first: null, last: null, errored: false };
-  e.count += 1;
-  if (start != null && (e.first == null || start < e.first)) e.first = start;
-  if (end != null && (e.last == null || end > e.last)) e.last = end;
-  if (errored) e.errored = true;
-  return e;
-}
-
-function bump(map, key, start, end, errored) {
-  map.set(key, bumpEntry(map.get(key), start, end, errored));
-}
-
-// ── Read-model aggregation (pure; exported for the node-run tests) ──
-//
-// Phoenix has no attribute group-by API, so the Agent / Subagent / Session
-// levels aggregate client-side from pages of spans. The shape follows what
-// the producers REALLY stamp (hook.py here; talon via tracing.py):
-//
-//   - emitter sessions: the root marker + summary carry `kestrel.agent_name`
-//     + `kestrel.session_id`; tool children carry the agent name only.
-//   - talon runs: the run ROOT carries `kestrel.agent_name == "talon"` +
-//     `kestrel.run_id`; the worker split (`kestrel.stage`, prefixed
-//     `talon/implement` agent names) lives on child stage spans only; and NO
-//     talon span stamps a session attribute — the run id is the session.
-
-// `talon/implement` → `talon`: prefixed worker variants group under their
-// base agent so workers never surface as separate Agent-level entries.
-export function baseAgentName(name) {
-  const s = String(name);
-  const i = s.indexOf("/");
-  return i > 0 ? s.slice(0, i) : s;
-}
-
-// The worker (Subagent-level key) a span belongs to: an explicit
-// `kestrel.stage`, else the suffix of a prefixed `kestrel.agent_name`
-// (`talon/review` → `review`); null → no worker split (plain run spans).
-export function workerOf(attrs) {
-  const stage = getAttr(attrs, ATTR_STAGE);
-  if (stage != null && stage !== "") return String(stage);
-  const agent = getAttr(attrs, ATTR_AGENT_NAME);
-  if (agent == null) return null;
-  const s = String(agent);
-  const i = s.indexOf("/");
-  return i > 0 && i < s.length - 1 ? s.slice(i + 1) : null;
-}
-
-// Session identity, in producer priority order. Talon stamps neither session
-// attribute, so its per-run `kestrel.run_id` (on every talon span) is the
-// final fallback — each talon run groups as one session. The winning
-// attribute key is kept so the Turn level filters on that same attribute.
-export function sessionKeyOf(attrs) {
-  for (const attrKey of [ATTR_SESSION_ID, ATTR_OI_SESSION_ID, ATTR_RUN_ID]) {
-    const value = getAttr(attrs, attrKey);
-    if (value != null && value !== "") return { id: String(value), attrKey };
-  }
-  return null;
-}
-
-export function createAgg() {
-  return {
-    seen: new Set(), // span ids — dedupes overlapping refresh/more pages
-    agents: new Map(), // base agent name → rollup
-    workers: new Map(), // worker (stage / prefixed-name suffix) → rollup
-    stageless: null, // rollup of spans with no worker split (e.g. run roots)
-    sessions: new Map(), // session id → rollup + {attrKey, roots}
+    return targetNodeId != null && String(span.id || "") === targetNodeId;
   };
-}
 
-export function mergeSpansIntoAgg(agg, spans) {
-  for (const span of spans) {
-    if (!span || agg.seen.has(span.id)) continue;
-    agg.seen.add(span.id);
-    const attrs = parseAttributes(span.attributes);
-    const start = ts(span.startTime);
-    const end = ts(span.endTime) ?? start;
-    const errored = span.statusCode === "ERROR";
-
-    const agent = getAttr(attrs, ATTR_AGENT_NAME);
-    bump(
-      agg.agents,
-      agent != null && agent !== "" ? baseAgentName(agent) : UNKNOWN_AGENT,
-      start,
-      end,
-      errored,
-    );
-
-    const worker = workerOf(attrs);
-    if (worker) bump(agg.workers, worker, start, end, errored);
-    else agg.stageless = bumpEntry(agg.stageless, start, end, errored);
-
-    const sess = sessionKeyOf(attrs);
-    if (sess) {
-      bump(agg.sessions, sess.id, start, end, errored);
-      const entry = agg.sessions.get(sess.id);
-      if (!entry.attrKey) entry.attrKey = sess.attrKey;
-      // Root spans are the session's turns; children only pad the span count.
-      if (span.parentId == null) entry.roots = (entry.roots || 0) + 1;
-    }
+  if (matches(turn)) return { node: turn, path: [turn], exact: true };
+  if (targetSpanId == null && targetNodeId == null) {
+    return { node: turn, path: [turn], exact: false };
   }
+
+  const visit = (node, path) => {
+    for (const child of node.children || []) {
+      const childPath = [...path, child];
+      if (matches(child)) return { node: child, path: childPath, exact: true };
+      const nested = visit(child, childPath);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  return visit(turn, [turn]) || { node: turn, path: [turn], exact: false };
 }
 
 // ── View / mount ──────────────────────────────────────────────
@@ -391,9 +142,11 @@ export function mount(container, opts = {}) {
   ensureStyles();
 
   const openTrace = typeof opts.openTrace === "function" ? opts.openTrace : null;
+  const openTimeline =
+    typeof opts.openTimeline === "function" ? opts.openTimeline : null;
   // A one-shot reveal target from the Timeline's "open in Navigator" (#54):
-  // {projectId, projectName, agentName, worker, sessionId, traceId}. Consumed
-  // once on boot to expand+scroll the tree to that session/turn, best-effort.
+  // {projectId, projectName, agentName, worker, sessionId, traceId, spanId,
+  // nodeId}. Consumed once on boot to select that exact span, best-effort.
   const revealTarget = opts.revealTarget || null;
 
   let destroyed = false;
@@ -428,8 +181,6 @@ export function mount(container, opts = {}) {
       agg: null, // client-side rollup for the aggregated levels
       turns: null, // session level: span-id → root span
       passThrough: undefined, // agent level: no worker split → sessions inline
-      detailOpen: false, // event level: inline input/output reveal
-      io: null,
     };
   }
 
@@ -450,9 +201,14 @@ export function mount(container, opts = {}) {
         <button type="button" class="obs-nav__btn" data-refresh title="Refresh now">Refresh</button>
       </div>
       <div class="obs-nav__body" data-body>
-        <div class="obs-nav__scroll" data-scroll tabindex="0" role="tree" aria-label="Fleet navigator">
-          <div class="obs-nav__spacer" data-spacer></div>
+        <div class="obs-nav__treepane">
+          <div class="obs-nav__scroll" data-scroll tabindex="0" role="tree" aria-label="Fleet navigator">
+            <div class="obs-nav__spacer" data-spacer></div>
+          </div>
         </div>
+        <aside class="obs-nav__inspector" data-inspector aria-live="polite">
+          <div class="obs-nav__inspector-empty">Select a Turn or Event to inspect its span.</div>
+        </aside>
       </div>
     </div>`;
 
@@ -461,6 +217,7 @@ export function mount(container, opts = {}) {
   const spacerEl = container.querySelector("[data-spacer]");
   const liveBtn = container.querySelector("[data-live]");
   const refreshBtn = container.querySelector("[data-refresh]");
+  const inspectorEl = container.querySelector("[data-inspector]");
 
   // ── Level loaders — one paginated GraphQL query per expand ──
 
@@ -802,6 +559,13 @@ export function mount(container, opts = {}) {
       if (st != null && (turnStart == null || st < turnStart)) turnStart = st;
       if (en != null && (turnEnd == null || en > turnEnd)) turnEnd = en;
     }
+    const turnSummary = spans.find(
+      (span) =>
+        span.parentId === rootSpanId &&
+        /\bturn\b.*\bsummary\b/i.test(String(span.name || "")),
+    );
+    node.data.summary = turnSummary ? spanSummaryOf(turnSummary) : null;
+    node.data.summaryEndMs = turnSummary ? ts(turnSummary.endTime) : null;
 
     function eventNode(parent, span) {
       const key = `event:${span.id}`;
@@ -817,10 +581,6 @@ export function mount(container, opts = {}) {
         turnStart,
         turnEnd,
       };
-      const attrs = parseAttributes(span.attributes);
-      const input = getAttr(attrs, ATTR_INPUT_VALUE);
-      const output = getAttr(attrs, ATTR_OUTPUT_VALUE);
-      child.io = input != null || output != null ? { input, output } : null;
       child.meta = fmtDuration(span.latencyMs);
       child.status = span.statusCode === "ERROR" ? "error" : null;
       const kids = kidsOf.get((span.context && span.context.spanId) || "") || [];
@@ -838,11 +598,13 @@ export function mount(container, opts = {}) {
   //
   // The whole tree flattens into one row list with per-row offsets; only the
   // window around the viewport renders. Sub-rows (loading / error / load-more /
-  // detail) belong to their node, indented one level deeper.
+  // empty) belong to their node, indented one level deeper.
 
   let rows = [];
   let totalH = 0;
   let focusedNode = null;
+  let selectedNode = null;
+  let revealFallback = null;
   let rebuildScheduled = false;
 
   function rebuildRows() {
@@ -856,7 +618,6 @@ export function mount(container, opts = {}) {
     };
     (function walk(node) {
       push({ t: "node", node }, ROW_H);
-      if (node.detailOpen && node.io) push({ t: "detail", node }, DETAIL_H);
       if (!node.expanded) return;
       if (node.error) push({ t: "error", node }, ROW_H);
       else if (node.loading && !node.children.length) push({ t: "loading", node }, ROW_H);
@@ -895,11 +656,7 @@ export function mount(container, opts = {}) {
       case "turn":
         return "turn";
       case "event": {
-        const span = node.data.span;
-        const k =
-          (span && span.spanKind) ||
-          getAttr(parseAttributes(span && span.attributes), ATTR_SPAN_KIND);
-        return String(k || "span").toUpperCase();
+        return spanKindOf(node.data.span);
       }
       default:
         return node.kind;
@@ -929,6 +686,7 @@ export function mount(container, opts = {}) {
   function nodeRowHtml(row, i) {
     const node = row.node;
     const focused = node === focusedNode;
+    const selected = node === selectedNode;
     const caret = node.expandable
       ? `<span class="obs-nav__caret" data-caret>${node.expanded ? "▾" : "▸"}</span>`
       : `<span class="obs-nav__caret"></span>`;
@@ -939,41 +697,18 @@ export function mount(container, opts = {}) {
         : node.kind === "turn"
           ? `<span class="obs-nav__pill obs-nav__pill--ok">ok</span>`
           : "";
-    const ioHint =
-      node.kind === "event" && node.io
-        ? `<span class="obs-nav__iohint">${node.detailOpen ? "hide i/o" : "i/o"}</span>`
-        : "";
     const bar = node.kind === "event" ? barHtml(node) : "";
     const open =
       node.kind === "turn" && node.data.traceId && openTrace
         ? `<a href="#" class="obs-nav__open" data-open>open in Phoenix</a>`
         : "";
-    return `<div class="obs-nav__row obs-nav__row--node${focused ? " obs-nav__row--focused" : ""}" data-i="${i}" role="treeitem" aria-expanded="${node.expandable ? String(node.expanded) : "false"}" style="top:${row.top}px;height:${row.h}px">
+    return `<div class="obs-nav__row obs-nav__row--node${focused ? " obs-nav__row--focused" : ""}${selected ? " obs-nav__row--selected" : ""}" data-i="${i}" role="treeitem" aria-selected="${selected}" aria-expanded="${node.expandable ? String(node.expanded) : "false"}" style="top:${row.top}px;height:${row.h}px">
       <span class="obs-nav__indent" style="width:${node.depth * 16}px"></span>
       ${caret}${pill}
       <span class="obs-nav__label" title="${escapeHtml(node.label)}">${escapeHtml(node.label)}</span>
-      ${statusPill}${ioHint}${bar}
+      ${statusPill}${bar}
       <span class="obs-nav__meta">${escapeHtml(node.meta || "")}</span>
       ${open}
-    </div>`;
-  }
-
-  function detailRowHtml(row, i) {
-    const node = row.node;
-    const io = node.io || {};
-    const block = (label, value) =>
-      value == null
-        ? ""
-        : `<div class="obs-nav__io">
-            <div class="obs-nav__io-label">${escapeHtml(label)}</div>
-            <pre class="obs-nav__io-pre">${escapeHtml(clip(value))}</pre>
-          </div>`;
-    return `<div class="obs-nav__row obs-nav__row--detail" data-i="${i}" style="top:${row.top}px;height:${row.h}px">
-      <span class="obs-nav__indent" style="width:${(node.depth + 1) * 16}px"></span>
-      <div class="obs-nav__iowrap">
-        ${block(ATTR_INPUT_VALUE, io.input)}
-        ${block(ATTR_OUTPUT_VALUE, io.output)}
-      </div>
     </div>`;
   }
 
@@ -981,8 +716,6 @@ export function mount(container, opts = {}) {
     switch (row.t) {
       case "node":
         return nodeRowHtml(row, i);
-      case "detail":
-        return detailRowHtml(row, i);
       case "loading":
         return subRowHtml(row, i, `<span class="obs-nav__muted">Loading…</span>`, "status");
       case "empty":
@@ -1037,10 +770,74 @@ export function mount(container, opts = {}) {
     scheduleRebuild();
   }
 
+  function detailForNode(node) {
+    if (!node || (node.kind !== "turn" && node.kind !== "event")) return null;
+    const context = {};
+    let cur = node;
+    while (cur) {
+      const data = cur.data || {};
+      if (context.projectId == null && data.projectId != null) context.projectId = data.projectId;
+      if (context.projectName == null && data.projectName != null) {
+        context.projectName = data.projectName;
+      }
+      if (context.agentName == null && data.agentName != null) context.agentName = data.agentName;
+      if (context.sessionId == null && data.sessionId != null) context.sessionId = data.sessionId;
+      if (context.traceId == null && data.traceId != null) context.traceId = data.traceId;
+      cur = cur.parent;
+    }
+    if (node.kind === "turn" && node.data.summary) {
+      context.summary = node.data.summary;
+      context.endMs = node.data.summaryEndMs;
+    }
+    return normalizeSpanDetail(node.data.span, context);
+  }
+
+  function renderInspector() {
+    if (!inspectorEl) return;
+    const detail = detailForNode(selectedNode);
+    if (!detail) {
+      inspectorEl.innerHTML =
+        `<div class="obs-nav__inspector-empty">Select a Turn or Event to inspect its span.</div>`;
+      return;
+    }
+    const fallback = revealFallback
+      ? `<div class="obs-nav__fallback">${escapeHtml(revealFallback)}</div>`
+      : "";
+    const canPhx = Boolean(openTrace && detail.traceId && detail.projectId);
+    const canTimeline = Boolean(openTimeline && detail.spanId);
+    inspectorEl.innerHTML = `
+      <div class="obs-nav__inspector-head">
+        <span class="obs-nav__inspector-title" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
+      </div>
+      ${fallback}
+      <div class="obs-nav__inspector-body">${renderSpanDetail(detail)}</div>
+      <div class="obs-nav__inspector-actions">
+        ${canPhx ? `<button type="button" class="obs-nav__action" data-inspector-phoenix>Open in Phoenix</button>` : ""}
+        ${canTimeline ? `<button type="button" class="obs-nav__action" data-inspector-timeline>Show in Timeline</button>` : ""}
+      </div>`;
+  }
+
+  function selectSpanNode(node, fallbackMessage = null) {
+    if (!node || (node.kind !== "turn" && node.kind !== "event")) return;
+    focusedNode = node;
+    selectedNode = node;
+    revealFallback = fallbackMessage;
+    renderInspector();
+    scheduleRebuild();
+    if (node.kind === "turn" && !node.loaded && !node.loading) {
+      ensureLoaded(node).then(() => {
+        if (!destroyed && selectedNode === node) {
+          renderInspector();
+          scheduleRebuild();
+        }
+      });
+    }
+  }
+
   function activate(node) {
     focusedNode = node;
-    if (node.kind === "event" && node.io) {
-      node.detailOpen = !node.detailOpen;
+    if (node.kind === "turn" || node.kind === "event") {
+      selectSpanNode(node);
     } else if (node.expandable) {
       toggleExpand(node);
       return;
@@ -1053,6 +850,18 @@ export function mount(container, opts = {}) {
     // Phoenix's trace route inside the embed: /phoenix/projects/{id}/traces/{traceId}.
     const url = `${PHOENIX_URL}projects/${encodeURIComponent(node.data.projectId)}/traces/${encodeURIComponent(node.data.traceId)}`;
     openTrace(url);
+  }
+
+  if (inspectorEl) {
+    inspectorEl.addEventListener("click", (e) => {
+      const detail = detailForNode(selectedNode);
+      if (!detail) return;
+      if (e.target.closest("[data-inspector-phoenix]")) {
+        openTraceFor(selectedNode);
+      } else if (e.target.closest("[data-inspector-timeline]") && openTimeline) {
+        openTimeline(buildTimelineRevealTarget(detail));
+      }
+    });
   }
 
   spacerEl.addEventListener("click", (e) => {
@@ -1075,8 +884,8 @@ export function mount(container, opts = {}) {
     }
     if (row.t !== "node") return;
     focusedNode = row.node;
-    // An event row with BOTH children and I/O: the caret expands, the row
-    // toggles the inline prompt/response reveal.
+    // The caret owns hierarchy expansion. Activating the rest of a span-backed
+    // row selects it for the persistent inspector.
     if (row.node.expandable && e.target.closest("[data-caret]")) {
       toggleExpand(row.node);
     } else {
@@ -1135,17 +944,10 @@ export function mount(container, opts = {}) {
         if (!n) focusStep(1);
         else if (n.expandable && !n.expanded) toggleExpand(n);
         else if (n.expanded && n.children.length) focusNode(n.children[0]);
-        else if (n.kind === "event" && n.io && !n.detailOpen) {
-          n.detailOpen = true;
-          scheduleRebuild();
-        }
         break;
       case "ArrowLeft":
         if (!n) break;
-        if (n.detailOpen) {
-          n.detailOpen = false;
-          scheduleRebuild();
-        } else if (n.expanded) {
+        if (n.expanded) {
           n.expanded = false;
           scheduleRebuild();
         } else if (n.parent) {
@@ -1223,9 +1025,10 @@ export function mount(container, opts = {}) {
 
   // ── Timeline → Navigator reveal (#54) ──
   //
-  // Best-effort drill-down to a Timeline span's location: expand the tree along
-  // project → agent → session → trace and scroll it into view, going only as far
-  // as the loaded data allows. Missing nodes fail soft (no error UI).
+  // Drill down to a Timeline span's location, paging each lazy ancestor until
+  // its identity is resolved. The exact Event is selected by OTel span id (or
+  // Phoenix node id when no span id exists). A trace miss stops honestly at its
+  // Turn and tells the operator that the exact span was unavailable.
 
   function pickChild(node, kind, pred) {
     if (!node) return null;
@@ -1246,9 +1049,22 @@ export function mount(container, opts = {}) {
     }
   }
 
+  async function findChildPaged(node, kind, pred) {
+    await ensureLoaded(node);
+    let found = pickChild(node, kind, pred);
+    let pages = 0;
+    while (!found && node.hasMore && !destroyed && pages++ < 1000) {
+      await loadChildren(node, "more");
+      found = pickChild(node, kind, pred);
+    }
+    return found;
+  }
+
   async function reveal(target) {
     if (!target || destroyed) return;
     let deepest = tenant;
+    let selected = null;
+    let fallbackMessage = null;
     try {
       await ensureLoaded(tenant);
       const project = pickChild(
@@ -1260,20 +1076,36 @@ export function mount(container, opts = {}) {
       );
       if (!project) return;
       deepest = project;
-      await ensureLoaded(project);
 
-      const agent = pickChild(project, "agent", (n) => n.data.agentName === target.agentName);
+      const agent = await findChildPaged(
+        project,
+        "agent",
+        (n) => n.data.agentName === target.agentName,
+      );
       if (!agent) return;
       deepest = agent;
       await ensureLoaded(agent);
+      if (target.sessionId == null) return;
 
       // Sessions sit directly under the agent (pass-through: no worker split) or
       // under a worker subagent. Prefer the span's own worker, then scan the
       // rest — a session lives under exactly one of them.
       let session = null;
       if (agent.passThrough) {
-        session = pickChild(agent, "session", (n) => n.data.sessionId === target.sessionId);
+        session = await findChildPaged(
+          agent,
+          "session",
+          (n) => n.data.sessionId === target.sessionId,
+        );
       } else {
+        // A requested worker may be outside the first aggregation page.
+        if (target.worker !== undefined) {
+          await findChildPaged(
+            agent,
+            "subagent",
+            (n) => n.data.worker === (target.worker || null),
+          );
+        }
         const subs = agent.children.filter((c) => c.kind === "subagent");
         subs.sort(
           (a, b) =>
@@ -1281,8 +1113,11 @@ export function mount(container, opts = {}) {
         );
         for (const sub of subs) {
           if (destroyed) return;
-          await ensureLoaded(sub);
-          const found = pickChild(sub, "session", (n) => n.data.sessionId === target.sessionId);
+          const found = await findChildPaged(
+            sub,
+            "session",
+            (n) => n.data.sessionId === target.sessionId,
+          );
           if (found) {
             session = found;
             break;
@@ -1291,18 +1126,40 @@ export function mount(container, opts = {}) {
       }
       if (!session) return;
       deepest = session;
-      await ensureLoaded(session);
 
       if (target.traceId) {
-        const turn = pickChild(session, "turn", (n) => n.data.traceId === target.traceId);
-        if (turn) deepest = turn;
+        const turn = await findChildPaged(
+          session,
+          "turn",
+          (n) => n.data.traceId === target.traceId,
+        );
+        if (turn) {
+          deepest = turn;
+          await ensureLoaded(turn);
+          const resolved = resolveExactSpanReveal(turn, target);
+          deepest = resolved.node || turn;
+          selected = deepest;
+          for (const ancestor of resolved.path.slice(0, -1)) {
+            if (ancestor.expandable) ancestor.expanded = true;
+          }
+          if (!resolved.exact && (target.spanId || target.nodeId)) {
+            fallbackMessage =
+              `Exact span ${target.spanId || target.nodeId} is unavailable; ` +
+              `showing its containing Turn.`;
+          }
+        }
       }
     } catch (_e) {
-      /* best-effort: reveal as far as the loaded data allows */
+      /* reveal still focuses the deepest ancestor resolved before the failure */
     } finally {
       if (!destroyed) {
         rebuildRows();
-        focusNode(deepest);
+        if (selected) {
+          selectSpanNode(selected, fallbackMessage);
+          focusNode(selected);
+        } else {
+          focusNode(deepest);
+        }
       }
     }
   }
@@ -1387,7 +1244,8 @@ function ensureStyles() {
     .obs-nav__btn:hover { background:var(--color-surface,#1e293b); color:var(--color-text,#e2e8f0); }
     .obs-nav__btn--on { background:var(--color-accent,#818cf8); border-color:var(--color-accent,#818cf8);
                         color:#0b1120; }
-    .obs-nav__body { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .obs-nav__body { flex:1; min-height:0; display:flex; }
+    .obs-nav__treepane { flex:1; min-width:0; min-height:0; display:flex; }
     .obs-nav__scroll { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; outline:none; }
     .obs-nav__scroll:focus-visible { box-shadow:inset 0 0 0 1px var(--color-accent,#818cf8); }
     .obs-nav__spacer { position:relative; }
@@ -1397,6 +1255,8 @@ function ensureStyles() {
     .obs-nav__row--node:hover { background:var(--color-surface,#1e293b); }
     .obs-nav__row--focused { background:var(--color-surface,#1e293b);
                              box-shadow:inset 2px 0 0 var(--color-accent,#818cf8); }
+    .obs-nav__row--selected { background:color-mix(in srgb, var(--color-accent,#818cf8) 14%, transparent);
+                              box-shadow:inset 3px 0 0 var(--color-accent,#818cf8); }
     .obs-nav__indent { flex:none; align-self:stretch;
                        background:repeating-linear-gradient(to right,
                          transparent 0 15px, var(--color-border,#334155) 15px 16px); }
@@ -1416,7 +1276,6 @@ function ensureStyles() {
                          background:color-mix(in srgb, var(--color-success,#34d399) 15%, transparent); }
     .obs-nav__pill--error { color:var(--color-danger,#f87171);
                             background:color-mix(in srgb, var(--color-danger,#f87171) 15%, transparent); }
-    .obs-nav__iohint { flex:none; font-size:11px; color:var(--color-accent,#818cf8); }
     .obs-nav__bartrack { flex:none; position:relative; width:120px; height:6px;
                          border-radius:3px; background:var(--color-surface,#1e293b); }
     .obs-nav__barfill { position:absolute; top:0; bottom:0; border-radius:3px;
@@ -1428,16 +1287,31 @@ function ensureStyles() {
     .obs-nav__muted { color:var(--color-text-muted,#94a3b8); }
     .obs-nav__more { color:var(--color-accent,#818cf8); cursor:pointer; font-weight:600; }
     .obs-nav__error { color:var(--color-danger,#f87171); overflow:hidden; text-overflow:ellipsis; }
-    .obs-nav__row--detail { align-items:stretch; padding-top:4px; padding-bottom:4px; }
-    .obs-nav__iowrap { flex:1; min-width:0; display:flex; gap:8px; }
-    .obs-nav__io { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
-    .obs-nav__io-label { font-size:10px; font-weight:700; letter-spacing:.04em;
-                         text-transform:uppercase; color:var(--color-text-muted,#94a3b8); }
-    .obs-nav__io-pre { flex:1; min-height:0; margin:0; overflow:auto; white-space:pre-wrap;
-                       word-break:break-word; font-family:ui-monospace,monospace; font-size:11px;
-                       background:var(--color-surface,#1e293b);
-                       border:1px solid var(--color-border,#334155); border-radius:6px; padding:6px 8px;
-                       color:var(--color-text,#e2e8f0); }
+    .obs-nav__inspector { flex:0 0 min(380px,42%); min-width:280px; min-height:0;
+                          display:flex; flex-direction:column;
+                          border-left:1px solid var(--color-border,#334155);
+                          background:color-mix(in srgb, var(--color-surface,#1e293b) 38%, transparent); }
+    .obs-nav__inspector-empty { margin:auto; max-width:230px; padding:24px; text-align:center;
+                                color:var(--color-text-muted,#94a3b8); line-height:1.5; }
+    .obs-nav__inspector-head { flex:none; padding:10px 12px;
+                               border-bottom:1px solid var(--color-border,#334155); }
+    .obs-nav__inspector-title { display:block; overflow:hidden; text-overflow:ellipsis;
+                                white-space:nowrap; font-weight:700; }
+    .obs-nav__fallback { flex:none; padding:8px 12px; color:#f59e0b; font-size:11px;
+                         border-bottom:1px solid var(--color-border,#334155); }
+    .obs-nav__inspector-body { flex:1; min-height:0; overflow:auto; padding:10px 12px; }
+    .obs-nav__inspector-actions { flex:none; display:flex; flex-wrap:wrap; gap:8px; padding:9px 12px;
+                                  border-top:1px solid var(--color-border,#334155); }
+    .obs-nav__action { background:transparent; border:1px solid var(--color-border,#334155);
+                       border-radius:999px; color:var(--color-accent,#818cf8); cursor:pointer;
+                       font-size:11px; font-weight:600; padding:3px 10px; }
+    .obs-nav__action:hover { background:var(--color-surface,#1e293b); }
+    @media (max-width:760px) {
+      .obs-nav__body { flex-direction:column; }
+      .obs-nav__treepane { min-height:45%; }
+      .obs-nav__inspector { flex:1 1 45%; min-width:0; border-left:0;
+                            border-top:1px solid var(--color-border,#334155); }
+    }
     .obs-nav .obs-notice { flex:1; display:flex; flex-direction:column; align-items:center;
                            justify-content:center; gap:8px; padding:24px; text-align:center;
                            color:var(--color-text-muted,#94a3b8); }

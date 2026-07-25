@@ -48,13 +48,15 @@ import {
   parseAttributes,
   getAttr,
   ts,
-  relTime,
   fmtDuration,
-  clip,
   baseAgentName,
   workerOf,
   sessionKeyOf,
   spanKindOf,
+  spanSummaryOf,
+  normalizeSpanDetail,
+  renderSpanDetail,
+  buildNavigatorRevealTarget,
 } from "./phoenix.js";
 
 // ── Tuning ────────────────────────────────────────────────────
@@ -90,6 +92,7 @@ const ERROR_COLOR = "#ef4444";
 const DENSITY_COLOR = "#94a3b8";
 const SESSION_BAND_COLOR = "#64748b"; // translucent outermost session envelope
 const OPEN_EDGE_COLOR = "#22d3ee"; // live/provisional bar right-edge cap
+const HIGHLIGHT_COLOR = "#facc15"; // exact cross-view reveal
 const ABANDONED_FILL = "#475569"; // SIGKILL'd/never-completed run — muted slate
 const ABANDONED_HATCH = "#94a3b8"; // diagonal hatch over the muted fill
 const ABANDONED_STUB_PX = 24; // childless abandoned marker → fixed stub width (paint-time)
@@ -255,13 +258,10 @@ function toolCallId(s) {
 
 // Read the folded summary stats off a "turn <n> summary" / "session summary" span.
 function summaryStats(sum) {
-  const turnDur = numAttr(sum, "kestrel.turn_duration_ms");
+  const shared = spanSummaryOf(sum);
   return {
     kind: isSessionSummary(sum) ? "session" : "turn",
-    turnCount: numAttr(sum, "kestrel.turn_count"),
-    toolCount: numAttr(sum, "kestrel.tool_count"),
-    successRatio: numAttr(sum, "kestrel.success_ratio"),
-    durationMs: turnDur != null ? turnDur : numAttr(sum, "kestrel.session_duration_ms"),
+    ...shared,
     end: sum.end,
   };
 }
@@ -633,14 +633,22 @@ export function mount(container, opts = {}) {
 
   const openTrace = typeof opts.openTrace === "function" ? opts.openTrace : null;
   const openNavigator = typeof opts.openNavigator === "function" ? opts.openNavigator : null;
+  const revealTarget = opts.revealTarget || null;
 
   let destroyed = false;
 
   // ── Time-window state ──
   let windowMs = DEFAULT_WINDOW_MS;
   let viewEnd = Date.now(); // right edge (ms); tracks wall-clock while live
-  let live = true; // follow wall-clock; a manual time-pan turns this off
+  let live = !revealTarget; // cross-view reveal opens paused around its timestamp
   let laneScrollY = 0; // vertical lane scroll offset
+  let highlightedSpanId =
+    revealTarget && revealTarget.spanId != null ? String(revealTarget.spanId) : null;
+  const revealStart = Number(revealTarget && revealTarget.startTime);
+  if (revealTarget && Number.isFinite(revealStart)) {
+    windowMs = MIN_WINDOW_MS;
+    viewEnd = revealStart + windowMs / 2;
+  }
 
   const viewStart = () => viewEnd - windowMs;
 
@@ -680,6 +688,7 @@ export function mount(container, opts = {}) {
         <canvas class="obs-tl__canvas" data-canvas></canvas>
         <div class="obs-tl__tip" data-tip hidden></div>
         <div class="obs-tl__pop" data-pop hidden></div>
+        <div class="obs-tl__reveal" data-reveal-notice hidden></div>
       </div>
     </div>`;
 
@@ -687,6 +696,7 @@ export function mount(container, opts = {}) {
   const canvas = container.querySelector("[data-canvas]");
   const tipEl = container.querySelector("[data-tip]");
   const popEl = container.querySelector("[data-pop]");
+  const revealNoticeEl = container.querySelector("[data-reveal-notice]");
   const liveBtn = container.querySelector("[data-live]");
   const windowEl = container.querySelector("[data-window]");
   const ctx = canvas.getContext("2d");
@@ -871,6 +881,95 @@ export function mount(container, opts = {}) {
     const raw = ((conn && conn.edges) || []).map((e) => e && e.node).filter(Boolean);
     const pageInfo = (conn && conn.pageInfo) || {};
     return { raw, hasNext: Boolean(pageInfo.hasNextPage), cursor: pageInfo.endCursor || null };
+  }
+
+  function revealProject() {
+    if (!revealTarget) return null;
+    return (
+      projects.find(
+        (p) =>
+          (revealTarget.projectId != null && p.id === revealTarget.projectId) ||
+          (revealTarget.projectName != null && p.name === revealTarget.projectName),
+      ) || null
+    );
+  }
+
+  // A Navigator round-trip may target history far outside the normal live
+  // window. Load a bounded, timestamp-centered slice from the exact project
+  // instead of walking every span from that time through "now".
+  async function loadRevealWindow() {
+    const project = revealProject();
+    if (!project) return;
+    let after = null;
+    for (let page = 0; page < MAX_POLL_PAGES; page++) {
+      const { raw, hasNext, cursor } = await fetchSpanPage(project.id, {
+        startMs: viewStart(),
+        endMs: viewEnd,
+        after,
+      });
+      mergeSpans(raw, project.id, project.name);
+      const exactLoaded = raw.some((span) => {
+        if (revealTarget.spanId != null) {
+          return (
+            String((span.context && span.context.spanId) || "") ===
+            String(revealTarget.spanId)
+          );
+        }
+        return revealTarget.nodeId != null && String(span.id) === String(revealTarget.nodeId);
+      });
+      if (exactLoaded || !hasNext || !cursor) break;
+      after = cursor;
+    }
+  }
+
+  function showRevealNotice(message, isFallback) {
+    if (!revealNoticeEl) return;
+    revealNoticeEl.textContent = message;
+    revealNoticeEl.classList.toggle("obs-tl__reveal--fallback", Boolean(isFallback));
+    revealNoticeEl.hidden = false;
+  }
+
+  function finishReveal() {
+    if (!revealTarget) return;
+    let hit = null;
+    if (revealTarget.spanId != null) {
+      const nodeId = spanIdToId.get(String(revealTarget.spanId));
+      if (nodeId != null) hit = spans.get(nodeId) || null;
+    } else if (revealTarget.nodeId != null) {
+      hit = spans.get(String(revealTarget.nodeId)) || null;
+    }
+    if (!hit) {
+      highlightedSpanId = null;
+      showRevealNotice(
+        `Exact span ${revealTarget.spanId || revealTarget.nodeId || ""} could not be loaded; no other span was highlighted.`,
+        true,
+      );
+      return;
+    }
+    if (hit.rHide) {
+      highlightedSpanId = null;
+      showRevealNotice(
+        `Exact span ${hit.spanId || hit.id} is folded into its owning Timeline band; no other span was highlighted.`,
+        true,
+      );
+      return;
+    }
+
+    highlightedSpanId = hit.spanId;
+    viewEnd = hit.start + windowMs / 2;
+    collapsed.delete(hit.projectName);
+    const lane = layout.rows.find(
+      (row) =>
+        row.type === "lane" &&
+        row.projectName === hit.projectName &&
+        row.agent === hit.agent &&
+        (row.worker || null) === (hit.worker || null),
+    );
+    if (lane) {
+      laneScrollY = Math.max(0, lane.y - Math.max(0, cssH - lane.h) / 2);
+      clampScroll();
+    }
+    showRevealNotice(`Exact span ${hit.spanId || hit.id} highlighted.`, false);
   }
 
   // Live/initial poll: pull everything since the project's watermark (or the
@@ -1433,6 +1532,26 @@ export function mount(container, opts = {}) {
     drawn.push({ x: 0, y, w: GUTTER_W, h: row.h, project: row });
   }
 
+  function isHighlighted(span) {
+    return Boolean(
+      highlightedSpanId &&
+        span &&
+        span.spanId &&
+        String(span.spanId) === String(highlightedSpanId),
+    );
+  }
+
+  function drawHighlightRect(x, y, w, h, span) {
+    if (!isHighlighted(span)) return;
+    ctx.save();
+    ctx.strokeStyle = HIGHLIGHT_COLOR;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = HIGHLIGHT_COLOR;
+    ctx.shadowBlur = 5;
+    ctx.strokeRect(x - 2, y - 2, Math.max(8, w + 4), h + 4);
+    ctx.restore();
+  }
+
   function drawLane(row, y) {
     // Lane label (left gutter).
     ctx.fillStyle = row.level === 2 ? theme.muted : theme.text;
@@ -1494,6 +1613,7 @@ export function mount(container, opts = {}) {
       ctx.globalAlpha = 0.14 + Math.min(0.16, e.depth * 0.05);
       ctx.fillRect(r.cx, r.ry, r.w, r.rh);
       ctx.globalAlpha = 1;
+      drawHighlightRect(r.cx, r.ry, r.w, r.rh, e.span);
       drawn.push({ x: r.cx, y: r.ry, w: r.w, h: r.rh, span: e.span });
     }
 
@@ -1543,6 +1663,7 @@ export function mount(container, opts = {}) {
           const rawW = hasExtent ? (aEnd - s.start) * pxPerMs() : ABANDONED_STUB_PX;
           const w = Math.max(2, x + rawW - cx);
           fillAbandoned(cx, ry, w, bh);
+          drawHighlightRect(cx, ry, w, bh, s);
           if (w > 46) {
             ctx.fillStyle = theme.muted;
             ctx.font = "10px system-ui, sans-serif";
@@ -1566,7 +1687,7 @@ export function mount(container, opts = {}) {
         const rawW = tick ? 2 : (sEnd - s.start) * pxPerMs();
         const cx = Math.max(GUTTER_W, x);
         const w = Math.max(1, x + rawW - cx);
-        if (!tick && w < MIN_BLOCK_PX) {
+        if (!tick && w < MIN_BLOCK_PX && !isHighlighted(s)) {
           // Coalesce sub-pixel blocks into a density strip.
           if (run && cx <= run.x1 + 1) {
             run.x1 = Math.max(run.x1, cx + w);
@@ -1583,6 +1704,7 @@ export function mount(container, opts = {}) {
           // Instant event → a 2px tick (track-assigned inside its parent band).
           ctx.fillStyle = s.status === "error" ? ERROR_COLOR : kindColor(s.kind);
           ctx.fillRect(cx, ry, 2, bh);
+          drawHighlightRect(cx - 2, ry, 6, bh, s);
           drawn.push({ x: cx - 2, y: ry, w: 6, h: bh, span: s });
           continue;
         }
@@ -1599,6 +1721,7 @@ export function mount(container, opts = {}) {
           ctx.fillRect(cx + w - 2, ry, 2, bh);
           ctx.globalAlpha = 1;
         }
+        drawHighlightRect(cx, ry, w, bh, s);
         // Label the block when it's wide enough to read — an informative band
         // label ("turn 16 · 12 tools · 3m 40s") when folded from a summary, else
         // the bare span name. Clipped to the bar; truncation is the clip.
@@ -1766,56 +1889,25 @@ export function mount(container, opts = {}) {
 
   function showPopover(s, clientX, clientY) {
     const sessionId = resolveSessionId(s);
-    const rows = [];
-    const add = (k, v) => {
-      if (v == null || v === "") return;
-      rows.push(
-        `<div class="obs-tl__prow"><span class="obs-tl__pk">${escapeHtml(k)}</span>` +
-          `<span class="obs-tl__pv">${escapeHtml(String(v))}</span></div>`,
-      );
-    };
-    add("kind", s.kind);
-    add("agent", s.agent);
-    if (s.worker) add("worker", s.worker);
-    add("duration", durText(s));
-    add("status", s.status);
-    if (s.rAbandoned) add("state", "⚠ abandoned — no completion recorded");
-    add("started", `${fmtClock(s.start, true)} · ${relTime(s.start)}`);
-    // Folded summary stats — a turn/session band answers "what was this turn":
-    // tool count, success ratio, turn count (read off the summary attrs, #62).
-    if (s.rSummary) {
-      const sum = s.rSummary;
-      if (sum.turnCount != null) add("turns", sum.turnCount);
-      if (sum.toolCount != null) add("tools", sum.toolCount);
-      if (sum.successRatio != null) add("success", `${Math.round(sum.successRatio * 100)}%`);
-    }
-    if (s.model) add("model", s.model);
-    if (sessionId) add("session", sessionId);
-    if (s.traceId) add("trace", s.traceId);
-
-    const io =
-      s.input != null || s.output != null
-        ? `<div class="obs-tl__io">` +
-          (s.input != null
-            ? `<div class="obs-tl__iolabel">${escapeHtml(ATTR_INPUT_VALUE)}</div><pre class="obs-tl__iopre">${escapeHtml(clip(s.input))}</pre>`
-            : "") +
-          (s.output != null
-            ? `<div class="obs-tl__iolabel">${escapeHtml(ATTR_OUTPUT_VALUE)}</div><pre class="obs-tl__iopre">${escapeHtml(clip(s.output))}</pre>`
-            : "") +
-          `</div>`
-        : "";
-
-    const canNav = Boolean(openNavigator && sessionId);
+    const detail = normalizeSpanDetail(s, { sessionId });
+    const canNav = Boolean(
+      openNavigator &&
+        detail.projectId &&
+        detail.agent &&
+        detail.sessionId &&
+        detail.traceId &&
+        detail.spanId,
+    );
     const canPhx = Boolean(openTrace && s.traceId && s.projectId);
     popEl.innerHTML = `
       <div class="obs-tl__phead">
-        <span class="obs-tl__ptitle" title="${escapeHtml(s.name)}">${escapeHtml(s.rLabel || s.name)}</span>
+        <span class="obs-tl__ptitle" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
         <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
       </div>
-      <div class="obs-tl__pbody">${rows.join("")}${io}</div>
+      <div class="obs-tl__pbody">${renderSpanDetail(detail, { rawAttributes: false })}</div>
       <div class="obs-tl__pfoot">
-        ${canNav ? `<button type="button" class="obs-tl__plink" data-pnav>open in Navigator</button>` : ""}
-        ${canPhx ? `<button type="button" class="obs-tl__plink" data-pphx>open in Phoenix</button>` : ""}
+        ${canNav ? `<button type="button" class="obs-tl__plink" data-pnav>Open in Navigator</button>` : ""}
+        ${canPhx ? `<button type="button" class="obs-tl__plink" data-pphx>Open in Phoenix</button>` : ""}
       </div>`;
     popEl.hidden = false;
     const rect = bodyEl.getBoundingClientRect();
@@ -1834,14 +1926,7 @@ export function mount(container, opts = {}) {
     if (navBtn) {
       navBtn.addEventListener("click", () => {
         hidePopover();
-        openNavigator({
-          projectId: s.projectId,
-          projectName: s.projectName,
-          agentName: s.agent,
-          worker: s.worker,
-          sessionId,
-          traceId: s.traceId,
-        });
+        openNavigator(buildNavigatorRevealTarget(detail));
       });
     }
     const phxBtn = popEl.querySelector("[data-pphx]");
@@ -2138,11 +2223,16 @@ export function mount(container, opts = {}) {
       return;
     }
     if (destroyed) return;
-    await pollTick(true); // initial fill of the visible window
+    if (revealTarget) {
+      await loadRevealWindow();
+    } else {
+      await pollTick(true); // initial fill of the visible window
+    }
     if (destroyed) return;
     buildLayout();
+    if (revealTarget) finishReveal();
     pollTimer = setInterval(() => pollTick(false), POLL_MS);
-    setLive(true); // live by default → starts the follow loop
+    setLive(!revealTarget); // exact reveals stay paused; normal entry follows live
   }
 
   function teardown() {
@@ -2185,6 +2275,13 @@ function ensureStyles() {
     .obs-tl__body { position:relative; flex:1; min-height:0; overflow:hidden;
                     outline:none; touch-action:none; }
     .obs-tl__canvas { position:absolute; inset:0; display:block; }
+    .obs-tl__reveal { position:absolute; z-index:4; top:6px; left:50%; transform:translateX(-50%);
+                      max-width:calc(100% - 24px); padding:4px 10px; border-radius:999px;
+                      background:color-mix(in srgb, #facc15 18%, var(--color-surface,#1e293b));
+                      border:1px solid #facc15; color:var(--color-text,#e2e8f0);
+                      font-size:11px; font-weight:600; pointer-events:none; }
+    .obs-tl__reveal--fallback { border-color:#f59e0b;
+                                background:color-mix(in srgb, #f59e0b 15%, var(--color-surface,#1e293b)); }
     .obs-tl__tip { position:absolute; z-index:5; pointer-events:none; max-width:320px;
                    background:var(--color-surface,#1e293b); border:1px solid var(--color-border,#334155);
                    border-radius:6px; padding:6px 9px; font-size:12px; line-height:1.35;
