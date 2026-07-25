@@ -14,8 +14,9 @@ Span shape (mirrors the #55 conventions — session ⊃ turn ⊃ tool ⊃ tool-s
 markers, one trace per turn):
 
 - ``SessionStart`` → an immediately-ended ``AGENT`` session-marker root, a fresh
-  trace whose ``SpanContext`` every later span parents to. ``kestrel.session_id``
-  = the Claude ``session_id``; ``kestrel.agent_name`` = ``claude-code``;
+  trace whose ``SpanContext`` every later span parents to. Both
+  ``kestrel.session_id`` and OpenInference ``session.id`` equal the Claude
+  ``session_id``; ``kestrel.agent_name`` = ``claude-code``;
   ``kestrel.orchestrator`` = ``$KESTREL_OBSERVABILITY_ORCHESTRATOR`` else
   ``Direct``. A ``source`` of ``compact`` / ``resume`` / ``fork`` on an existing
   session is a **no-op** (the live session is preserved, not re-minted) since
@@ -89,8 +90,11 @@ _SERVICE_NAME = "claude-code"
 _INSTRUMENTATION_NAME = "kestrel_feature_observability.claude_hook"
 _PROJECT_NAME_KEY = "openinference.project.name"
 
-# Standard Kestrel span attribute keys (mirror ``hook.py``).
+# Standard session / turn span attribute keys (mirror ``hook.py``). Keep the
+# OpenInference key as a literal here so importing this standalone module never
+# imports OpenInference/OpenTelemetry on its disabled fast path.
 KESTREL_SESSION_ID = "kestrel.session_id"
+OPENINFERENCE_SESSION_ID = "session.id"
 KESTREL_TURN_ID = "kestrel.turn_id"
 KESTREL_TURN_INDEX = "kestrel.turn_index"
 KESTREL_MARKER = "kestrel.marker"
@@ -463,12 +467,22 @@ def _remote_parent(ids: Dict[str, str]) -> Any:
 
 def _scope_attrs(state: Dict[str, Any]) -> Dict[str, Any]:
     """Session + current-turn ids stamped on every span of a turn."""
-    attrs: Dict[str, Any] = {KESTREL_SESSION_ID: state["session_id"]}
+    attrs = _session_attrs(state.get("session_id"))
     turn = state.get("current_turn")
     if turn:
         attrs[KESTREL_TURN_ID] = turn["turn_id"]
         attrs[KESTREL_TURN_INDEX] = turn["index"]
     return attrs
+
+
+def _session_attrs(session_id: Any) -> Dict[str, Any]:
+    """The paired legacy + OpenInference session attributes, or none without an id."""
+    if not session_id:
+        return {}
+    return {
+        KESTREL_SESSION_ID: session_id,
+        OPENINFERENCE_SESSION_ID: session_id,
+    }
 
 
 def _turn_parent(state: Dict[str, Any]) -> Any:
@@ -491,7 +505,7 @@ def _new_session(
         end_time=now_ns,
         agent_name=_AGENT_NAME,
         orchestrator=orchestrator,
-        attributes={KESTREL_SESSION_ID: session_id},
+        attributes=_session_attrs(session_id),
     )
     return {
         "session_id": session_id,
@@ -536,12 +550,14 @@ def _start_turn(
     state["turn_count"] = int(state.get("turn_count", 0)) + 1
     index = state["turn_count"]
     turn_id = f"{session_id}#{index}"
-    attrs: Dict[str, Any] = {
-        KESTREL_SESSION_ID: session_id,
-        KESTREL_TURN_ID: turn_id,
-        KESTREL_TURN_INDEX: index,
-        KESTREL_MARKER: _MARKER_START,
-    }
+    attrs = _session_attrs(session_id)
+    attrs.update(
+        {
+            KESTREL_TURN_ID: turn_id,
+            KESTREL_TURN_INDEX: index,
+            KESTREL_MARKER: _MARKER_START,
+        }
+    )
     # Opt-in (KESTREL_OTEL_CAPTURE_PROMPTS=1): stamp the user prompt as
     # OpenInference ``input.value``, truncated to the IO cap. Off by default so
     # user-message content is never recorded unless an operator enables it.
@@ -795,7 +811,7 @@ def _close_session(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
             # Legacy per-scope duration key (back-compat); drop in a future major.
             "kestrel.session_duration_ms": duration_ms,
         },
-        attributes={KESTREL_SESSION_ID: state["session_id"]},
+        attributes=_session_attrs(state.get("session_id")),
     )
 
 

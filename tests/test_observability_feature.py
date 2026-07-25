@@ -31,6 +31,7 @@ from kestrel_sdk.hooks.base import (
 from kestrel_feature_observability.hook import (
     ObservabilityHook,
     KESTREL_SESSION_ID,
+    OPENINFERENCE_SESSION_ID,
     KESTREL_TURN_ID,
     KESTREL_TURN_INDEX,
     KESTREL_MARKER,
@@ -798,14 +799,47 @@ class TestTurnSpans:
         assert "kestrel.feature_name" not in marker.attributes
 
     @pytest.mark.asyncio
-    async def test_session_id_on_every_span(self):
+    async def test_session_ids_on_every_span_shape(self):
         hook, exporter = _memory_hook()
         await self._drive_turn(hook)
-        spans = exporter.get_finished_spans()
-        # session marker root, turn root, tool-start marker, tool span, turn summary.
-        assert len(spans) >= 5
-        for span in spans:
-            assert span.attributes[KESTREL_SESSION_ID] == "sess-1"
+        await hook.execute(_make_input("AgentTerminate"))
+        spans = _by_name(exporter.get_finished_spans())
+        assert OPENINFERENCE_SESSION_ID == "session.id"
+        # Cover every lifecycle-emitter shape, not only the session marker.
+        expected = {
+            "test-agent",
+            "test-agent turn 1",
+            "Bash (started)",
+            "Bash",
+            "turn 1 summary",
+            "session summary",
+        }
+        assert expected <= spans.keys()
+        for name in expected:
+            attrs = spans[name].attributes
+            assert attrs[KESTREL_SESSION_ID] == "sess-1"
+            assert attrs["session.id"] == attrs[KESTREL_SESSION_ID]
+
+    @pytest.mark.asyncio
+    async def test_missing_session_id_omits_both_session_attributes(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart", session_id=None))
+        await hook.execute(_make_input("UserPromptSubmit", session_id=None))
+        await hook.execute(
+            _make_input(
+                "PostToolUse",
+                session_id=None,
+                tool_name="Bash",
+                execution_time_ms=1,
+                tool_response={"success": True},
+            )
+        )
+        await hook.execute(_make_input("Stop", session_id=None))
+        await hook.execute(_make_input("AgentTerminate", session_id=None))
+        assert exporter.get_finished_spans()
+        for span in exporter.get_finished_spans():
+            assert KESTREL_SESSION_ID not in span.attributes
+            assert "session.id" not in span.attributes
 
     @pytest.mark.asyncio
     async def test_turn_ids_on_every_span_of_a_turn(self):
@@ -866,6 +900,7 @@ class TestTurnSpans:
         assert summary.attributes["kestrel.turn_count"] == 2
         assert summary.attributes["kestrel.tool_count"] == 2
         assert summary.attributes[KESTREL_SESSION_ID] == "sess-1"
+        assert summary.attributes["session.id"] == "sess-1"
         # Session summary is session-scoped, not turn-scoped.
         assert KESTREL_TURN_ID not in summary.attributes
 

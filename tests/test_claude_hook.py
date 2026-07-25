@@ -191,6 +191,10 @@ class TestFullFlow:
             _payload("PostToolUse", tool_name="Bash", tool_response={"stdout": "ok"}),
             now_ns=ns + 5_000_000,
         )
+        chook._handle(
+            _payload("SubagentStop", agent_type="Explore"),
+            now_ns=ns + 7_000_000,
+        )
         chook._handle(_payload("Stop"), now_ns=ns + 9_000_000)
         chook._handle(_payload("SessionEnd", reason="other"), now_ns=ns + 10_000_000)
 
@@ -202,6 +206,7 @@ class TestFullFlow:
             "claude-code turn 1",
             "Bash (started)",
             "Bash",
+            "Explore",
             "turn 1 summary",
             "session summary",
         }
@@ -209,6 +214,7 @@ class TestFullFlow:
         assert spans["claude-code turn 1"].attributes["openinference.span.kind"] == "AGENT"
         assert spans["Bash (started)"].attributes["openinference.span.kind"] == "TOOL"
         assert spans["Bash"].attributes["openinference.span.kind"] == "TOOL"
+        assert spans["Explore"].attributes["openinference.span.kind"] == "AGENT"
         assert spans["turn 1 summary"].attributes["openinference.span.kind"] == "CHAIN"
         assert spans["session summary"].attributes["openinference.span.kind"] == "CHAIN"
 
@@ -230,11 +236,18 @@ class TestFullFlow:
         # A turn root is a NEW trace (distinct from the session-marker root).
         assert turn.context.trace_id != spans["claude-code"].context.trace_id
 
-    def test_session_and_turn_ids_stamped(self, emitter):
+    def test_session_ids_stamped_on_every_span_shape(self, emitter):
         self._run_flow()
         spans = _by_name(emitter.get_finished_spans())
+        assert chook.OPENINFERENCE_SESSION_ID == "session.id"
+        for span in spans.values():
+            assert span.attributes[chook.KESTREL_SESSION_ID] == "sess-abc"
+            assert (
+                span.attributes["session.id"]
+                == span.attributes[chook.KESTREL_SESSION_ID]
+            )
+
         tool = spans["Bash"]
-        assert tool.attributes[chook.KESTREL_SESSION_ID] == "sess-abc"
         assert tool.attributes[chook.KESTREL_TURN_ID] == "sess-abc#1"
         assert tool.attributes[chook.KESTREL_TURN_INDEX] == 1
 

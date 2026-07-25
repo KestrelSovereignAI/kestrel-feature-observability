@@ -13,9 +13,10 @@ no held-open spans; every span exports immediately — #42, #55):
 
 - On the first lifecycle event of a session a short **session-marker** root span
   (OpenInference ``AGENT``) is opened AND ended immediately, so it is **exported
-  right away**. Its ``SpanContext`` is kept as a fallback parent; ``kestrel.session_id``
-  is stamped on it — and on EVERY span the hook emits — so consumers group a
-  session by attribute: the session band is an attribute grouping, not a trace.
+  right away**. Its ``SpanContext`` is kept as a fallback parent;
+  ``kestrel.session_id`` and OpenInference ``session.id`` are stamped on it —
+  and on EVERY span the hook emits — so Navigator and Phoenix Sessions can group
+  a session by attribute: the session band is an attribute grouping, not a trace.
 - Trace granularity is **one trace per turn**. On ``UserPromptSubmit`` a turn
   starts: a monotonic turn counter is bumped and an immediately-ended ``AGENT``
   turn-root span (``<agent> turn <n>``, ``kestrel.marker=start``) is emitted as a
@@ -84,11 +85,22 @@ from kestrel_feature_observability.tracing import (
 
 logger = logging.getLogger(__name__)
 
-# Standard Kestrel span attributes for the session / turn grouping (no constants
-# in tracing.py). ``kestrel.session_id`` is stamped on EVERY span (the session band
-# is an attribute grouping, not a trace); ``kestrel.turn_id`` / ``kestrel.turn_index``
-# label the one-trace-per-turn spans; ``kestrel.marker`` flags the instant start
-# spans (turn root + tool-start), which the Timeline pairs with their close event.
+# Phoenix Sessions recognizes the OpenInference ``session.id`` span attribute.
+# Older compatible semantic-conventions releases may not expose ``SESSION_ID``,
+# so retain the canonical literal as a dependency-safe fallback.
+try:
+    from openinference.semconv.trace import SpanAttributes
+
+    OPENINFERENCE_SESSION_ID = getattr(SpanAttributes, "SESSION_ID", "session.id")
+except Exception:  # noqa: BLE001 - semantic-conventions fallback must not break the hook
+    OPENINFERENCE_SESSION_ID = "session.id"
+
+# Standard session / turn grouping attributes (no constants in tracing.py).
+# Both ``kestrel.session_id`` (Navigator/backward compatibility) and OpenInference
+# ``session.id`` (Phoenix Sessions) are stamped on EVERY span when a session id
+# exists; ``kestrel.turn_id`` / ``kestrel.turn_index`` label the one-trace-per-turn
+# spans; ``kestrel.marker`` flags the instant start spans (turn root + tool-start),
+# which the Timeline pairs with their close event.
 KESTREL_SESSION_ID = "kestrel.session_id"
 KESTREL_TURN_ID = "kestrel.turn_id"
 KESTREL_TURN_INDEX = "kestrel.turn_index"
@@ -191,6 +203,16 @@ def _effective_prompt(input: HookInput) -> Optional[str]:
         if rewritten is not None:
             return rewritten
     return input.user_message
+
+
+def _session_attrs(session_id: Optional[str]) -> Dict[str, Any]:
+    """The paired legacy + OpenInference session attributes, or none without an id."""
+    if not session_id:
+        return {}
+    return {
+        KESTREL_SESSION_ID: session_id,
+        OPENINFERENCE_SESSION_ID: session_id,
+    }
 
 
 def _tick_success(tool_response: Any) -> bool:
@@ -339,14 +361,13 @@ class ObservabilityHook(Hook):
     ) -> Dict[str, Any]:
         """Session + current-turn attributes stamped on every span of a turn.
 
-        ``kestrel.session_id`` groups a session across turns (attribute grouping,
-        not a trace); ``kestrel.turn_id`` / ``kestrel.turn_index`` label the
-        current turn's spans so the renderer can group a turn by attribute OR by
-        trace membership (#55). Absent when there is no live turn yet.
+        ``kestrel.session_id`` and OpenInference ``session.id`` group a session
+        across turns (attribute grouping, not a trace); ``kestrel.turn_id`` /
+        ``kestrel.turn_index`` label the current turn's spans so the renderer can
+        group a turn by attribute OR by trace membership (#55). Turn attributes
+        are absent when there is no live turn yet.
         """
-        attrs: Dict[str, Any] = {}
-        if session_id:
-            attrs[KESTREL_SESSION_ID] = session_id
+        attrs = _session_attrs(session_id)
         turn = session.current_turn
         if turn is not None:
             attrs[KESTREL_TURN_ID] = turn.turn_id
@@ -369,9 +390,7 @@ class ObservabilityHook(Hook):
         # process-global orchestrator (env default), if any.
         orchestrator = agent_name if self._driving_parent(input) is None else None
 
-        attributes: Dict[str, Any] = {}
-        if session_id:
-            attributes[KESTREL_SESSION_ID] = session_id
+        attributes = _session_attrs(session_id)
         agent_did = self._agent_did()
         if agent_did:
             attributes["kestrel.agent_did"] = agent_did
@@ -424,13 +443,14 @@ class ObservabilityHook(Hook):
 
         # current_turn isn't set yet, so stamp the turn identity explicitly here
         # (every span of the turn carries session id + turn id + turn index).
-        attributes: Dict[str, Any] = {
-            KESTREL_TURN_ID: turn_id,
-            KESTREL_TURN_INDEX: index,
-            KESTREL_MARKER: _MARKER_START,
-        }
-        if session_id:
-            attributes[KESTREL_SESSION_ID] = session_id
+        attributes = _session_attrs(session_id)
+        attributes.update(
+            {
+                KESTREL_TURN_ID: turn_id,
+                KESTREL_TURN_INDEX: index,
+                KESTREL_MARKER: _MARKER_START,
+            }
+        )
 
         # Opt-in (KESTREL_OTEL_CAPTURE_PROMPTS=1): stamp the user prompt on the
         # turn root as OpenInference ``input.value``, truncated to the IO cap. Off
@@ -615,9 +635,10 @@ class ObservabilityHook(Hook):
     def _close_turn(self, session_id: Optional[str], agent_name: str) -> None:
         """On ``Stop``: emit the turn summary and end the turn — but NOT the session.
 
-        The session stays live (its marker root + ``kestrel.session_id`` are stable
-        across turns); the next ``UserPromptSubmit`` mints turn n+1. A ``Stop``
-        with no live turn (e.g. before any prompt) is a no-op.
+        The session stays live (its marker root + paired ``kestrel.session_id`` /
+        ``session.id`` attributes are stable across turns); the next
+        ``UserPromptSubmit`` mints turn n+1. A ``Stop`` with no live turn (e.g.
+        before any prompt) is a no-op.
         """
         session = self._sessions.get(session_id)
         if session is None or session.current_turn is None:
@@ -652,9 +673,7 @@ class ObservabilityHook(Hook):
             # Legacy per-scope duration key (back-compat); drop in a future major.
             "kestrel.session_duration_ms": duration_ms,
         }
-        attributes: Dict[str, Any] = {}
-        if session_id:
-            attributes[KESTREL_SESSION_ID] = session_id
+        attributes = _session_attrs(session_id)
 
         # A `session summary` span in the session-marker trace, parented to the
         # exported root — carries session totals without any held-open span (#42).
