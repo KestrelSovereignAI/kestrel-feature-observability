@@ -170,6 +170,17 @@ const out = {};
   annotateRenderModel([turn, m1, m2, r1], NOW);
   out.correlId = { m1: pick(m1), m2: pick(m2) };
 }
+// #78: the turn root can age out of the Timeline query while its recent tool
+// children remain. The raw missing parentId must still form a sibling cohort:
+// the completed Bash consumes only its exact call-id marker; the other same-name
+// Bash remains open.
+{
+  const m1 = span({ name: "Bash (started)", start: 60, marker: "start", spanId: "om1", parentId: "old-turn-not-loaded", sessionId: "P2c", attrs: { tool: { call_id: "toolu_done" } } });
+  const m2 = span({ name: "Bash (started)", start: 61, marker: "start", spanId: "om2", parentId: "old-turn-not-loaded", sessionId: "P2c", attrs: { tool: { call_id: "toolu_running" } } });
+  const r1 = span({ name: "Bash", start: 60, end: 90, spanId: "or1", parentId: "old-turn-not-loaded", sessionId: "P2c", attrs: { tool: { call_id: "toolu_done" } } });
+  annotateRenderModel([m1, m2, r1], NOW);
+  out.missingParentCorrelId = { m1: pick(m1), m2: pick(m2), r1: pick(r1) };
+}
 // P1: live-poll floor — an unpaired marker whose (backdated) twin hasn't been
 // persisted yet is the re-fetch floor; the floor reaches <= the twin's start, so
 // the next poll pulls it and the marker pairs. (The open turn root also keeps the
@@ -408,6 +419,17 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     assert ci["m1"]["rHide"] is True
     assert ci["m2"]["rHide"] is False
     assert ci["m2"]["rOpen"] is True
+
+    # #78: sibling cohorts are keyed by the shared raw parentId even when that
+    # parent span aged out of the Timeline query. Exact call-id pairing hides the
+    # completed marker only; a different concurrent Bash remains visibly open.
+    mpi = r["missingParentCorrelId"]
+    assert mpi["m1"]["rHide"] is True
+    assert mpi["m1"]["rOpen"] is False
+    assert mpi["m2"]["rHide"] is False
+    assert mpi["m2"]["rOpen"] is True
+    assert mpi["r1"]["rHide"] is False
+    assert mpi["r1"]["rOpen"] is False
 
     # P1: an unpaired marker's twin is BACKDATED to the marker's start, so the
     # live-poll floor must reach <= it; once the twin arrives the marker pairs.
