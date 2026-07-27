@@ -10,8 +10,8 @@ produces (:mod:`kestrel_feature_observability.hook`, #55), so Claude Code sessio
 show up in the fleet Observability Timeline exactly like kestrel agents and talon
 runs.
 
-Span shape (mirrors the #55 conventions — session ⊃ turn ⊃ tool ⊃ tool-start
-markers, one trace per turn):
+Span shape (mirrors the #55 conventions — session ⊃ turn ⊃ tool, one trace per
+turn):
 
 - ``SessionStart`` → an immediately-ended ``AGENT`` session-marker root, a fresh
   trace whose ``SpanContext`` every later span parents to. Both
@@ -24,17 +24,21 @@ markers, one trace per turn):
 - ``UserPromptSubmit`` → a labeled ``<agent> turn <n>`` ``AGENT`` root (a **new**
   trace), ``kestrel.turn_id`` = ``<session_id>#<n>``, ``kestrel.turn_index`` = n,
   ``kestrel.marker=start``.
-- ``PreToolUse`` → an instant ``<tool> (started)`` ``TOOL`` marker
-  (``kestrel.marker=start``) parented to the current turn; its start is recorded
-  keyed by ``tool_use_id`` so parallel same-name tools pair correctly. The
-  ``tool_use_id`` is also stamped as ``tool.call_id`` on the marker AND its
-  completed span so the Timeline pairs concurrent same-name calls one-to-one.
-- ``PostToolUse`` / ``PostToolUseFailure`` → a completed ``TOOL`` span parented to
-  the current turn (``tool.name`` / ``tool.success`` / truncated ``tool.error``).
-  ``PostToolUse`` derives success from ``tool_response``; ``PostToolUseFailure``
-  reports the outcome out-of-band via top-level ``error`` / ``duration_ms`` and is
-  always a failure. Duration prefers the payload's own ``duration_ms`` (the real
-  tool runtime), else the gap to the paired ``PreToolUse`` (never negative).
+- ``PreToolUse`` → NO span. Only the tool's start time is recorded (keyed by
+  ``tool_use_id`` so parallel same-name tools pair correctly) so the completing
+  event can backdate a real duration. A tool that never runs — denied or blocked
+  before execution by the permission classifier, a ``PreToolUse`` guard, or user
+  rejection — therefore produces no span at all, which is correct: the obs hook
+  can't see the guard's decision, and an unpaired ``(started)`` marker would be
+  orphaned and rendered pinned to the end of its turn (#82).
+- ``PostToolUse`` / ``PostToolUseFailure`` → the SINGLE authoritative ``TOOL``
+  span for the call: one completed span spanning the real start→end, parented to
+  the current turn (``tool.name`` / ``tool.success`` / truncated ``tool.error``,
+  plus ``tool.call_id`` = ``tool_use_id`` when provided). ``PostToolUse`` derives
+  success from ``tool_response``; ``PostToolUseFailure`` reports the outcome
+  out-of-band via top-level ``error`` / ``duration_ms`` and is always a failure.
+  Duration prefers the payload's own ``duration_ms`` (the real tool runtime),
+  else the gap to the recorded ``PreToolUse`` start (never negative).
 - ``Stop`` → a ``turn <n> summary`` ``CHAIN`` spanning turn-start→now (tool count,
   duration, success ratio). The session stays open.
 - ``SessionEnd`` (and a defensive staleness sweep) → a ``session summary``
@@ -45,7 +49,7 @@ Cross-process parenting without a daemon: each hook invocation is a new process,
 so a tiny per-session state file (``$KESTREL_OBS_CLAUDE_STATE_DIR`` /
 ``$XDG_STATE_HOME/kestrel-obs-claude`` / ``$TMPDIR/kestrel-obs-claude`` →
 ``<session_id>.json``) carries the session-root trace/span ids, the current turn
-ids + counter + start ts, and the resolved project. Later invocations reconstruct
+ids + counter + start ts, the unclaimed tool starts, and the resolved project. Later invocations reconstruct
 a remote ``SpanContext`` from those ids so spans across invocations share traces.
 The file is written atomically (write-rename) under a per-session ``flock`` so
 concurrent hook processes (Claude Code fires ``PostToolUse`` concurrently for
@@ -100,9 +104,8 @@ KESTREL_TURN_INDEX = "kestrel.turn_index"
 KESTREL_MARKER = "kestrel.marker"
 KESTREL_TOOL_NAME = "tool.name"
 # Non-sensitive per-call correlation id (Claude Code's ``tool_use_id``) stamped
-# on BOTH the ``<tool> (started)`` marker and its completed span so the Timeline
-# pairs concurrent same-name tools one-to-one instead of the first close hiding
-# every same-name marker (#62 P2).
+# on the completed tool span so concurrent same-name calls stay distinguishable
+# (#62 P2).
 KESTREL_TOOL_CALL_ID = "tool.call_id"
 _MARKER_START = "start"
 # OpenInference INPUT_VALUE key — the user prompt stamped on the turn root when
@@ -110,10 +113,10 @@ _MARKER_START = "start"
 _INPUT_VALUE_KEY = "input.value"
 
 # OpenInference span-kind values (uppercase literals — identical to
-# ``tracing.KIND_*`` on both the SDK-present and fallback paths).
+# ``tracing.KIND_*`` on both the SDK-present and fallback paths). ``TOOL`` is not
+# needed here: the one tool span per call goes through ``emit_tool_span``.
 _KIND_AGENT = "AGENT"
 _KIND_CHAIN = "CHAIN"
-_KIND_TOOL = "TOOL"
 
 # Standard OTLP endpoint env vars — drive the no-op-when-unset behavior.
 _ENDPOINT_ENVS = (
@@ -145,6 +148,17 @@ _TTL_ENV = "KESTREL_OBS_CLAUDE_SESSION_TTL"  # seconds
 _DEBUG_ENV = "KESTREL_OBS_CLAUDE_DEBUG"
 _DEFAULT_TTL_S = 6 * 3600
 _MAX_STALE_SWEEP = 16
+
+# Unclaimed tool-start bookkeeping (#82). A ``PreToolUse`` start is popped by its
+# completing event; a tool denied/blocked before it runs never fires one, so its
+# entry would leak into the state file forever. Evict entries older than this TTL
+# on every event — comfortably longer than any realistic tool runtime (so a
+# still-running tool never loses the start that gives its span a real duration),
+# far shorter than the session TTL (so leaked entries die well within a session).
+# No env knob: the TTL is the mechanism, the entry cap is a pure backstop against
+# pathological growth inside the window.
+_PENDING_TTL_S = 30 * 60
+_MAX_PENDING_STARTS = 256
 
 # Budget knobs — a single fast POST, capped so a dead endpoint can't hang Claude.
 _HTTP_TIMEOUT_S = 1
@@ -582,31 +596,25 @@ def _start_turn(
     }
 
 
-def _emit_tool_start(tracer: Any, state: Dict[str, Any], payload: Dict[str, Any], now_ns: int) -> None:
-    """``PreToolUse`` → an instant ``<tool> (started)`` marker parented to the current turn."""
+def _record_tool_start(state: Dict[str, Any], payload: Dict[str, Any], now_ns: int) -> None:
+    """``PreToolUse`` → record the start; emit NOTHING (#82).
+
+    The completing ``PostToolUse`` / ``PostToolUseFailure`` span is the single
+    authoritative tool span, so a tool denied/blocked before it ever runs simply
+    produces no span — correct, since it did not run. (This hook is a separate
+    ``PreToolUse`` hook and cannot see a guard's decision, so a marker emitted
+    here would be orphaned: no completing twin, and the Timeline pins an unpaired
+    marker to the end of its turn.)
+
+    The start is still recorded so the completing event can backdate a real
+    duration: keyed by ``tool_use_id`` when Claude Code provides one so
+    concurrent same-name tools (parallel Bash calls) pair to their OWN start,
+    else by name. Entries never claimed by a completing event are evicted by
+    :func:`_prune_pending`.
+    """
     tool_name = str(payload.get("tool_name") or "tool")
-    tool_use_id = payload.get("tool_use_id")
-    attrs = _scope_attrs(state)
-    attrs[KESTREL_MARKER] = _MARKER_START
-    attrs[KESTREL_TOOL_NAME] = tool_name
-    # Stamp the per-call id so the Timeline pairs THIS marker with its own
-    # completed span even when concurrent same-name tools share the turn (#62 P2).
-    if tool_use_id:
-        attrs[KESTREL_TOOL_CALL_ID] = str(tool_use_id)
-    tracer.emit_span(
-        f"{tool_name} (started)",
-        _KIND_TOOL,
-        parent=_turn_parent(state),
-        start_time=now_ns,
-        end_time=now_ns,
-        agent_name=_AGENT_NAME,
-        attributes=attrs,
-    )
-    # Record the start so the paired PostToolUse can backdate a real duration.
-    # Key by tool_use_id when Claude Code provides one so concurrent same-name
-    # tools (parallel Bash calls) pair to their OWN start; fall back to the name.
     pending = state.setdefault("pending_tools", {})
-    key = _pending_key(tool_name, tool_use_id)
+    key = _pending_key(tool_name, payload.get("tool_use_id"))
     pending.setdefault(key, []).append(now_ns)
 
 
@@ -628,6 +636,42 @@ def _pop_pending(state: Dict[str, Any], tool_name: str, tool_use_id: Any) -> Opt
     if not stack:
         pending.pop(key, None)
     return int(start)
+
+
+def _prune_pending(state: Dict[str, Any], now_ns: int) -> None:
+    """Bound the unclaimed tool starts — TTL first, then a hard cap (#82).
+
+    A tool denied/blocked before it runs fires ``PreToolUse`` but never a
+    completing event, so :func:`_pop_pending` never claims its entry. Sweeping on
+    every event keeps the state file bounded without ever evicting a start a
+    still-running tool still needs (:data:`_PENDING_TTL_S` is far longer than any
+    realistic tool, so a long build never collapses to a zero-duration span).
+    Runs AFTER the event is dispatched so the current event always sees its own
+    pending start. Malformed entries (a hand-edited / half-written state file)
+    are dropped rather than raising.
+    """
+    pending = state.get("pending_tools")
+    if not isinstance(pending, dict) or not pending:
+        return
+    cutoff = now_ns - _PENDING_TTL_S * 1_000_000_000
+    fresh: List[Any] = []  # (start_ns, key)
+    for key, stack in pending.items():
+        if not isinstance(stack, list):
+            continue
+        fresh.extend(
+            (int(ns), key)
+            for ns in stack
+            if isinstance(ns, (int, float)) and ns >= cutoff
+        )
+    # Backstop against pathological growth inside the TTL window: keep the most
+    # recent starts (the ones a completing event is most likely to claim).
+    if len(fresh) > _MAX_PENDING_STARTS:
+        fresh.sort(reverse=True)
+        del fresh[_MAX_PENDING_STARTS:]
+    rebuilt: Dict[str, List[int]] = {}
+    for ns, key in sorted(fresh):  # ascending → each stack stays LIFO-correct
+        rebuilt.setdefault(key, []).append(ns)
+    state["pending_tools"] = rebuilt
 
 
 def _tool_success(resp: Any) -> bool:
@@ -710,8 +754,8 @@ def _emit_tool_span(
         extra["tool.duration_ms"] = duration_ms
 
     attrs = _scope_attrs(state)
-    # Same per-call id as the marker so the Timeline pairs this completed span to
-    # its own "(started)" marker among concurrent same-name calls (#62 P2).
+    attrs[KESTREL_TOOL_NAME] = tool_name
+    # The per-call id keeps concurrent same-name calls distinguishable (#62 P2).
     if tool_use_id:
         attrs[KESTREL_TOOL_CALL_ID] = str(tool_use_id)
     if not success:
@@ -899,8 +943,10 @@ def _dispatch(
         _start_turn(tracer, state, session_id, now_ns, prompt=payload.get("prompt"))
         return state
     if event == "PreToolUse":
+        # No span: the completing event owns the tool's only span (#82). The
+        # session root is still ensured so a later span never arrives orphaned.
         state = _ensure_session(tracer, state, session_id, project, now_ns)
-        _emit_tool_start(tracer, state, payload, now_ns)
+        _record_tool_start(state, payload, now_ns)
         return state
     if event in ("PostToolUse", "PostToolUseFailure"):
         state = _ensure_session(tracer, state, session_id, project, now_ns)
@@ -963,6 +1009,9 @@ def _handle(payload: Dict[str, Any], now_ns: Optional[int] = None) -> None:
             )
             if state is not None:
                 state["last_event_ns"] = now_ns
+                # Evict tool starts no completing event ever claimed (denied /
+                # blocked tools) so the state file stays bounded (#82).
+                _prune_pending(state, now_ns)
                 try:
                     _write_state_atomic(state_path, state)
                 except Exception as e:  # noqa: BLE001 - a write failure is non-fatal
