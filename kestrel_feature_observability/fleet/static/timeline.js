@@ -96,6 +96,7 @@ const HIGHLIGHT_COLOR = "#facc15"; // exact cross-view reveal
 const ABANDONED_FILL = "#475569"; // SIGKILL'd/never-completed run — muted slate
 const ABANDONED_HATCH = "#94a3b8"; // diagonal hatch over the muted fill
 const ABANDONED_STUB_PX = 24; // childless abandoned marker → fixed stub width (paint-time)
+const PENDING_STUB_PX = 6; // unpaired LEAF tool marker → short "pending" tick (paint-time)
 
 // A `kestrel.marker == "start"` attribute tags a provisional "<name> (started)"
 // span whose real closed span may not have arrived yet (talon in-flight): it
@@ -187,6 +188,9 @@ function startedBase(name) {
 // Annotates each span in place with the fields the layout/draw read:
 //   rHide      — never render (paired marker / folded summary)
 //   rOpen      — render open-ended (out to the live right edge)
+//   rPending   — an unpaired LEAF tool marker awaiting its imminent completion:
+//                a short fixed-width tick anchored at its start, NOT a bar out to
+//                the live edge (#80)
 //   rEnd       — effective closed end (== start for a true instant)
 //   rSummary   — folded summary stats {kind, turnCount, toolCount, successRatio, durationMs, end}
 //   rLabel     — informative band label ("turn 16 · 12 tools · 3m 40s"), else the bare name
@@ -256,6 +260,23 @@ function toolCallId(s) {
   return v != null && v !== "" ? String(v) : null;
 }
 
+// A "<tool> (started)" marker for a LEAF tool call — the innermost doll, a
+// point-in-time event whose completion is IMMINENT (its PostToolUse twin lands on
+// the next poll, ~POLL_MS later) — as opposed to a CONTAINER root marker, which is
+// held open by design for minutes. The two tool emitters stamp their tool-start
+// markers `TOOL` (hook.py / kestrel_obs_claude_hook.py `_emit_tool_start`, the
+// Claude one also stamping the per-call `tool.call_id`); talon only ever markers
+// its run/stage ROOTS, whose kinds are AGENT/LLM/CHAIN — never TOOL — and a turn
+// root is not a "(started)" marker at all. So a leaf tool marker renders as a
+// short pending tick while containers keep the open-ended band (#80).
+function isLeafToolMarker(s) {
+  // `isNamedStartMarker` already excludes turn roots — a turn root IS the
+  // marker=start span that is NOT named "(started)" — so only the container/leaf
+  // split is left to decide here.
+  if (!isNamedStartMarker(s)) return false;
+  return toolCallId(s) != null || s.kind === "TOOL";
+}
+
 // Read the folded summary stats off a "turn <n> summary" / "session summary" span.
 function summaryStats(sum) {
   const shared = spanSummaryOf(sum);
@@ -296,6 +317,7 @@ function turnLabel(s, stats) {
 // bands; a zero-width closed span is "instant"; an open span is "running").
 function durText(s) {
   if (s.rAbandoned) return "abandoned";
+  if (s.rPending) return "pending";
   if (isOpen(s)) return "running";
   if (s.rSummary && s.rSummary.durationMs != null) {
     const d = fmtDuration(s.rSummary.durationMs);
@@ -329,6 +351,7 @@ export function annotateRenderModel(spanIter, nowMs) {
   for (const s of list) {
     s.rHide = false;
     s.rOpen = s.openEnded === true;
+    s.rPending = false;
     s.rEnd = s.end;
     s.rSummary = null;
     s.rLabel = null;
@@ -444,12 +467,27 @@ export function annotateRenderModel(spanIter, nowMs) {
     }
   }
 
-  // 2c. Any named start marker still unpaired is the single provisional open
-  //     band out to the live edge until its twin arrives.
+  // 2c. Any named start marker still unpaired is provisional until its twin
+  //     arrives — but HOW it paints depends on what it marks (#80):
+  //
+  //       - a LEAF tool marker is a point-in-time event whose completion is
+  //         imminent (the PostToolUse twin is polled seconds later), so it gets a
+  //         short PENDING tick anchored at its start. Stretching it to the live
+  //         edge painted an alarming staircase of "started bars that never end"
+  //         for every tool in flight during an active turn, even though the store
+  //         was clean and each one paired a poll later.
+  //       - a CONTAINER root marker (a turn root, or a talon run/stage root) is
+  //         held open BY DESIGN for minutes, so it keeps the single provisional
+  //         open band out to the live edge — that duration is real.
+  //
+  //     Either way the twin's arrival hides the marker (step 2a/2b) and the real
+  //     bar takes over, and either way the abandoned cap (step 5) eventually
+  //     retires a marker whose completion never comes.
   for (const s of list) {
     if (!isNamedStartMarker(s) || s.rHide) continue;
-    s.rOpen = true;
     s.rEnd = s.end;
+    if (isLeafToolMarker(s)) s.rPending = true;
+    else s.rOpen = true;
   }
 
   // 3. Turn roots: close at the summary child (step 1), else the next turn's
@@ -547,7 +585,9 @@ export function annotateRenderModel(spanIter, nowMs) {
     if (cur == null || act > cur) cohortActivity.set(key, act);
   }
   for (const s of list) {
-    if (s.rOpen !== true) continue;
+    // A still-open span OR a leaf tool marker still showing its pending tick (#80):
+    // a session killed mid-tool must not leave a lingering pending tick either.
+    if (s.rOpen !== true && s.rPending !== true) continue;
     if (nowMs - s.start <= STALE_MARKER_MS) continue; // recent → genuinely live
     // The run is in-flight if ANYTHING in its cohort started or ended within the
     // window — a sibling tool under a held-open run counts, unlike the marker's
@@ -569,6 +609,7 @@ export function annotateRenderModel(spanIter, nowMs) {
     }
     s.rAbandoned = true;
     s.rOpen = false;
+    s.rPending = false; // the abandoned treatment supersedes the pending tick
     s.rEnd = latestEnd; // latest child end, else s.start (childless → instant stub)
     // Visual cap ≠ giving up on ingestion. For a BOUNDED grace past the
     // staleness threshold, keep anchoring the live re-fetch floor so a late,
@@ -581,9 +622,14 @@ export function annotateRenderModel(spanIter, nowMs) {
   return list;
 }
 
-// Live-poll re-fetch floor per project: the EARLIEST start among still-open
-// spans (as resolved by `annotateRenderModel` — call it first). The producers
-// backdate every close/summary/twin to an earlier start — a completed tool span
+// Live-poll re-fetch floor per project: the EARLIEST start among still-open spans
+// — PLUS pending leaf tool markers, whose whole point is that their twin is still
+// in flight (#80): rendering one as a short tick instead of an open-ended bar
+// changes only its PAINT, never its ingestion, so it must keep anchoring the floor
+// or its backdated completion would never be pulled and every tick would linger to
+// the abandoned cap. All as resolved by `annotateRenderModel` — call it first.
+//
+// The producers backdate every close/summary/twin to an earlier start — a completed tool span
 // starts at its pre-tool marker's timestamp, a turn/session summary at its
 // turn/session start — so a forward-only `startTime > watermark` poll, whose
 // watermark already passed those anchors, would NEVER re-fetch them and the turn
@@ -597,9 +643,9 @@ export function annotateRenderModel(spanIter, nowMs) {
 // and un-abandon it — the grace bound then drops truly-dead runs (#67 P1). Pure
 // + exported for the render-model tests.
 export function openStartFloors(spanIter) {
-  const floors = new Map(); // projectId → earliest open/reconciling span start
+  const floors = new Map(); // projectId → earliest open/pending/reconciling span start
   for (const s of spanIter) {
-    if (s.rOpen !== true && s.rReconcile !== true) continue;
+    if (s.rOpen !== true && s.rPending !== true && s.rReconcile !== true) continue;
     const key = s.projectId != null ? s.projectId : null;
     const cur = floors.get(key);
     if (cur == null || s.start < cur) floors.set(key, s.start);
@@ -1674,6 +1720,25 @@ export function mount(container, opts = {}) {
             ctx.fillText(`⚠ ${s.rLabel || s.name}`, cx + 3, ry + bh / 2);
             ctx.restore();
           }
+          drawn.push({ x: cx, y: ry, w, h: bh, span: s });
+          continue;
+        }
+        if (s.rPending) {
+          // Unpaired LEAF tool marker (#80): its completion is imminent (polled
+          // seconds later), so paint a short fixed-width tick anchored at the
+          // start — styled live, but NEVER stretched to the live edge, which
+          // painted a staircase of "started bars that never end" for every tool
+          // in flight. When the twin lands the marker pairs (rHide) and the real
+          // (short) tool bar takes over. Not coalesced.
+          flush();
+          const x = timeToX(s.start);
+          const cx = Math.max(GUTTER_W, x);
+          const w = Math.max(2, x + PENDING_STUB_PX - cx);
+          ctx.fillStyle = s.status === "error" ? ERROR_COLOR : OPEN_EDGE_COLOR;
+          ctx.globalAlpha = 0.7;
+          ctx.fillRect(cx, ry, w, bh);
+          ctx.globalAlpha = 1;
+          drawHighlightRect(cx, ry, w, bh, s);
           drawn.push({ x: cx, y: ry, w, h: bh, span: s });
           continue;
         }

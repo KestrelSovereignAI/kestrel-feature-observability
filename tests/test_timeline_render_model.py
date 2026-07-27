@@ -5,7 +5,9 @@ The Timeline's raw geometry can't paint three producer span shapes directly:
 - ``"<x> (started)"`` markers — instant points whose real bar is a SIBLING
   (the emitter / Claude-hook tool-start marker, paired with its ``PostToolUse``
   span) OR a PARENT (talon parents the marker UNDER the span it marks). A marker
-  must never draw its own open-ended bar when its twin exists.
+  must never draw its own open-ended bar when its twin exists — and while
+  unpaired, only a CONTAINER root marker (turn root, talon run/stage root) draws
+  one at all: an unpaired LEAF tool marker is a short pending tick (#80).
 - turn roots (``"<agent> turn <n>"``, ``kestrel.marker=start``) — instant points
   that ARE the turn's start; the close signal is the ``"turn <n> summary"`` CHILD,
   then the next turn's start, then session end, then the live right edge.
@@ -94,26 +96,34 @@ const LATE = 10_000_000;
 // place spans just inside / just outside the abandoned + reconcile windows.
 const STALE = 15 * 60 * 1000; // STALE_MARKER_MS
 const RECONCILE = 15 * 60 * 1000; // STALE_RECONCILE_MS (grace past staleness)
-const pick = (s) => ({ rHide: s.rHide, rOpen: s.rOpen, rEnd: s.rEnd, rLabel: s.rLabel, rSummary: s.rSummary, rAbandoned: s.rAbandoned });
+// Span kinds matter to the #80 leaf-vs-container split, so the talon scenarios
+// below carry their REAL producer kinds: talon markers only ever its run/stage
+// ROOTS (kestreltalon/observability.py `_emit_start_marker`), whose kinds are
+// AGENT (run, coordinate), LLM (implement, review) or CHAIN (gate) — never TOOL.
+// Only the two TOOL emitters (hook.py / kestrel_obs_claude_hook.py
+// `_emit_tool_start`) stamp a "(started)" marker TOOL, and only the Claude one
+// adds the per-call `tool.call_id`.
+const pick = (s) => ({ rHide: s.rHide, rOpen: s.rOpen, rPending: s.rPending, rEnd: s.rEnd, rLabel: s.rLabel, rSummary: s.rSummary, rAbandoned: s.rAbandoned });
 const out = {};
 
 // talon: marker parented UNDER a CLOSED real span → marker dropped, real is the bar.
 {
-  const real = span({ name: "implement", start: 100, end: 500, spanId: "impl", sessionId: "run#1" });
-  const marker = span({ name: "implement (started)", start: 100, marker: "start", spanId: "im2", parentId: "impl", sessionId: "run#1" });
+  const real = span({ name: "implement", start: 100, end: 500, kind: "LLM", spanId: "impl", sessionId: "run#1" });
+  const marker = span({ name: "implement (started)", start: 100, marker: "start", kind: "LLM", spanId: "im2", parentId: "impl", sessionId: "run#1" });
   annotateRenderModel([real, marker], NOW);
   out.talonClosed = { marker: pick(marker), real: pick(real) };
 }
 // talon: marker under an OPEN (in-flight) real span → marker dropped, parent is the open band.
 {
-  const real = span({ name: "review", start: 100, openEnded: true, spanId: "rv", sessionId: "run#1" });
-  const marker = span({ name: "review (started)", start: 100, marker: "start", spanId: "rv2", parentId: "rv", sessionId: "run#1" });
+  const real = span({ name: "review", start: 100, openEnded: true, kind: "LLM", spanId: "rv", sessionId: "run#1" });
+  const marker = span({ name: "review (started)", start: 100, marker: "start", kind: "LLM", spanId: "rv2", parentId: "rv", sessionId: "run#1" });
   annotateRenderModel([real, marker], NOW);
   out.talonOpen = { marker: pick(marker), real: pick(real) };
 }
-// ORPHAN marker (twin not fetched yet) → survives as the single provisional open band.
+// ORPHAN talon stage marker (twin not fetched yet) → survives as the single
+// provisional open band: a held-open stage root is legitimately open for minutes.
 {
-  const orphan = span({ name: "coordinate (started)", start: 200, marker: "start", spanId: "orph", parentId: "MISSING", sessionId: "run#1" });
+  const orphan = span({ name: "coordinate (started)", start: 200, marker: "start", kind: "AGENT", spanId: "orph", parentId: "MISSING", sessionId: "run#1" });
   annotateRenderModel([orphan], NOW);
   out.orphan = pick(orphan);
 }
@@ -179,13 +189,13 @@ const out = {};
   const marker = span({ name: "Bash (started)", start: 120, marker: "start", spanId: "fm", parentId: "ft", sessionId: "F1", projectId: "P" });
   annotateRenderModel([turn, marker], NOW);
   const before = openStartFloors([turn, marker]);
-  const markerOpenBefore = marker.rOpen;
+  const markerPendingBefore = marker.rPending;
   const real = span({ name: "Bash", start: 120, end: 150, spanId: "fr", parentId: "ft", sessionId: "F1", projectId: "P" });
   annotateRenderModel([turn, marker, real], NOW);
   out.markerFloor = {
     floor: before.get("P"),
     coversTwin: before.get("P") != null && before.get("P") <= 120,
-    markerOpenBefore,
+    markerPendingBefore,
     markerHiddenAfter: marker.rHide === true,
   };
 }
@@ -217,7 +227,7 @@ const out = {};
 }
 // (b) unpaired "(started)" marker whose twin never arrived → abandoned.
 {
-  const marker = span({ name: "coordinate (started)", start: 1000, marker: "start", spanId: "kb1", parentId: "MISSING", sessionId: "K2" });
+  const marker = span({ name: "coordinate (started)", start: 1000, marker: "start", kind: "AGENT", spanId: "kb1", parentId: "MISSING", sessionId: "K2" });
   annotateRenderModel([marker], LATE);
   out.abandonedMarker = pick(marker);
 }
@@ -260,7 +270,7 @@ const out = {};
 // empty. An OLD marker whose cohort saw a RECENT sibling tool must stay open, not
 // be abandoned by the empty-subtree signal (the #67/#68 regression this fixes).
 {
-  const marker = span({ name: "implement (started)", start: 1000, marker: "start", spanId: "lm1", parentId: "0fe0ee7c0d", sessionId: "LIVE1" });
+  const marker = span({ name: "implement (started)", start: 1000, marker: "start", kind: "LLM", spanId: "lm1", parentId: "0fe0ee7c0d", sessionId: "LIVE1" });
   const tool = span({ name: "command_execution", start: LATE - 1000, end: LATE - 500, spanId: "lt1", parentId: "0fe0ee7c0d", sessionId: "LIVE1" });
   annotateRenderModel([marker, tool], LATE);
   out.liveTalonCohort = { marker: pick(marker), tool: pick(tool) };
@@ -269,7 +279,7 @@ const out = {};
 // cohort has been silent past the window (no recent sibling) → the held-open
 // marker still caps (the genuine SIGKILL case the guard exists for).
 {
-  const marker = span({ name: "implement (started)", start: 1000, marker: "start", spanId: "dm1", parentId: "deadstage", sessionId: "DEAD1" });
+  const marker = span({ name: "implement (started)", start: 1000, marker: "start", kind: "LLM", spanId: "dm1", parentId: "deadstage", sessionId: "DEAD1" });
   const tool = span({ name: "command_execution", start: 1200, end: 1500, spanId: "dt1", parentId: "deadstage", sessionId: "DEAD1" });
   annotateRenderModel([marker, tool], LATE);
   out.deadTalonCohort = { marker: pick(marker), tool: pick(tool) };
@@ -321,6 +331,72 @@ const out = {};
   annotateRenderModel([run], LATE);
   const floors = openStartFloors([run]);
   out.abandonedBeyondReconcile = { abandoned: run.rAbandoned, floorEmpty: floors.get("R2") == null };
+}
+
+// #80 — an unpaired LEAF tool marker is a PENDING TICK, never an open-ended bar.
+// During an active turn every in-flight tool marker used to stretch to the live
+// right edge until its PostToolUse was polled (~4s later), painting an alarming
+// staircase of "started bars that never end" even though the store was clean.
+// A leaf tool call is a point-in-time event whose completion is imminent, so it
+// gets a short stub anchored at its start instead.
+
+// (a) Claude leaf tool marker (TOOL kind + per-call tool.call_id) mid-turn, and
+//     the emitter shape (TOOL kind, no call id) → BOTH pending, neither open. The
+//     turn root that parents them is a CONTAINER: still open-ended (live tail).
+{
+  const turn = span({ name: "claude-code turn 1", start: 100, marker: "start", kind: "AGENT", spanId: "n1", sessionId: "N1", attrs: { kestrel: { turn_index: 1 } } });
+  const claude = span({ name: "Bash (started)", start: 120, marker: "start", kind: "TOOL", spanId: "n2", parentId: "n1", sessionId: "N1", attrs: { tool: { call_id: "toolu_9" } } });
+  const emitter = span({ name: "Read (started)", start: 130, marker: "start", kind: "TOOL", spanId: "n3", parentId: "n1", sessionId: "N1" });
+  annotateRenderModel([turn, claude, emitter], NOW);
+  out.leafPending = { claude: pick(claude), emitter: pick(emitter), turn: pick(turn), markerStart: claude.start };
+}
+// (b) the same leaf marker once its completion arrives on a later poll → the
+//     marker is HIDDEN (paired) and the real, SHORT tool bar is what renders.
+{
+  const turn = span({ name: "claude-code turn 1", start: 100, marker: "start", kind: "AGENT", spanId: "p1", sessionId: "N2", attrs: { kestrel: { turn_index: 1 } } });
+  const marker = span({ name: "Bash (started)", start: 120, marker: "start", kind: "TOOL", spanId: "p2", parentId: "p1", sessionId: "N2", attrs: { tool: { call_id: "toolu_9" } } });
+  const real = span({ name: "Bash", start: 120, end: 145, kind: "TOOL", spanId: "p3", parentId: "p1", sessionId: "N2", attrs: { tool: { call_id: "toolu_9" } } });
+  annotateRenderModel([turn, marker, real], NOW);
+  out.leafPaired = { marker: pick(marker), real: pick(real) };
+}
+// (c) CONTAINERS are untouched: a talon run root marker (AGENT) and a stage root
+//     marker (LLM) are held open by design for minutes → still open-ended, never
+//     a pending tick.
+{
+  const run = span({ name: "owner/repo#80 (started)", start: 100, marker: "start", kind: "AGENT", spanId: "q1", parentId: "MISSINGRUN", sessionId: "N3" });
+  const stage = span({ name: "implement (started)", start: 110, marker: "start", kind: "LLM", spanId: "q2", parentId: "MISSINGSTAGE", sessionId: "N3" });
+  annotateRenderModel([run, stage], NOW);
+  out.containerOpen = { run: pick(run), stage: pick(stage) };
+}
+// (d) a pending tick that NEVER pairs still falls through to the abandoned
+//     treatment past the threshold — a session killed mid-tool must not leave a
+//     lingering pending tick either.
+{
+  const marker = span({ name: "Bash (started)", start: 1000, marker: "start", kind: "TOOL", spanId: "r1", parentId: "MISSING", sessionId: "N4", attrs: { tool: { call_id: "toolu_dead" } } });
+  annotateRenderModel([marker], LATE);
+  out.leafPendingAbandoned = pick(marker);
+}
+// (e) rendering a leaf marker as a tick changes only its PAINT, never ingestion:
+//     it must KEEP anchoring the live re-fetch floor, because its completion is
+//     BACKDATED to the marker's own start and a forward-only poll would never
+//     pull it. Once the twin lands the marker pairs and the floor clears.
+//     The floor is read over the marker ALONE so the (open) turn root that also
+//     anchors it can't mask a pending marker that stopped anchoring.
+{
+  const turn = span({ name: "claude-code turn 1", start: 400, marker: "start", kind: "AGENT", spanId: "u0", sessionId: "N5", projectId: "U", attrs: { kestrel: { turn_index: 1 } } });
+  const marker = span({ name: "Bash (started)", start: 500, marker: "start", kind: "TOOL", spanId: "u1", parentId: "u0", sessionId: "N5", projectId: "U", attrs: { tool: { call_id: "toolu_5" } } });
+  annotateRenderModel([turn, marker], NOW);
+  const pendingBefore = marker.rPending;
+  const floor = openStartFloors([marker]).get("U");
+  const real = span({ name: "Bash", start: 500, end: 560, kind: "TOOL", spanId: "u2", parentId: "u0", sessionId: "N5", projectId: "U", attrs: { tool: { call_id: "toolu_5" } } });
+  annotateRenderModel([turn, marker, real], NOW);
+  out.pendingFloor = {
+    pendingBefore,
+    floor,
+    coversTwin: floor != null && floor <= 500,
+    hiddenAfter: marker.rHide === true,
+    afterEmpty: openStartFloors([marker, real]).get("U") == null,
+  };
 }
 
 process.stdout.write(JSON.stringify(out));
@@ -392,27 +468,28 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
 
     # P2: concurrent same-name markers with ONE completed twin (no correlation
     # ids) — exactly one marker is consumed one-to-one and the still-running one
-    # survives as an open band. The pre-fix `some(...)` sibling test hid BOTH.
+    # survives (as a #80 pending tick, these being leaf TOOL markers). The pre-fix
+    # `some(...)` sibling test hid BOTH.
     cn = r["concurrentName"]
     assert cn["r1"]["rHide"] is False
     assert [cn["m1"]["rHide"], cn["m2"]["rHide"]].count(True) == 1
-    assert [cn["m1"]["rOpen"], cn["m2"]["rOpen"]].count(True) == 1
-    # Deterministic: the earlier-started marker pairs, the later one stays open.
+    assert [cn["m1"]["rPending"], cn["m2"]["rPending"]].count(True) == 1
+    # Deterministic: the earlier-started marker pairs, the later one stays pending.
     assert cn["m1"]["rHide"] is True
-    assert cn["m2"]["rOpen"] is True
+    assert cn["m2"]["rPending"] is True
 
     # P2: correlation-id (tool.call_id) pairing — the id=1 marker pairs its OWN
-    # twin; the id=2 marker's twin hasn't arrived, so it stays open even though a
+    # twin; the id=2 marker's twin hasn't arrived, so it survives even though a
     # same-name completed `Bash` exists.
     ci = r["correlId"]
     assert ci["m1"]["rHide"] is True
     assert ci["m2"]["rHide"] is False
-    assert ci["m2"]["rOpen"] is True
+    assert ci["m2"]["rPending"] is True
 
     # P1: an unpaired marker's twin is BACKDATED to the marker's start, so the
     # live-poll floor must reach <= it; once the twin arrives the marker pairs.
     mf = r["markerFloor"]
-    assert mf["markerOpenBefore"] is True
+    assert mf["markerPendingBefore"] is True
     assert mf["floor"] is not None
     assert mf["coversTwin"] is True
     assert mf["markerHiddenAfter"] is True
@@ -512,3 +589,58 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     abr = r["abandonedBeyondReconcile"]
     assert abr["abandoned"] is True
     assert abr["floorEmpty"] is True
+
+    # #80 — an unpaired LEAF tool marker is a short PENDING tick anchored at its
+    # own start, NOT a bar stretched to the live edge: a leaf tool call is a
+    # point-in-time event whose completion is imminent (the next poll), so the
+    # open-ended treatment painted a staircase of "started bars that never end"
+    # for every tool in flight. Both leaf shapes qualify — the Claude marker (TOOL
+    # kind + per-call `tool.call_id`) and the emitter's (TOOL kind, no call id).
+    lp = r["leafPending"]
+    for leaf in (lp["claude"], lp["emitter"]):
+        assert leaf["rHide"] is False
+        assert leaf["rPending"] is True
+        assert leaf["rOpen"] is False
+        assert leaf["rAbandoned"] is False
+    assert lp["claude"]["rEnd"] == lp["markerStart"]  # anchored at its start
+    # ...while the CONTAINER that parents them — a turn root with no summary yet —
+    # is unchanged: genuinely the live tail, still open-ended.
+    assert lp["turn"]["rOpen"] is True
+    assert lp["turn"]["rPending"] is False
+
+    # Once the completion arrives on a later poll the existing pairing takes over
+    # unchanged: the marker is hidden and the real (short) tool bar renders.
+    lpr = r["leafPaired"]
+    assert lpr["marker"]["rHide"] is True
+    assert lpr["marker"]["rPending"] is False
+    assert lpr["real"]["rHide"] is False
+    assert lpr["real"]["rOpen"] is False
+    assert lpr["real"]["rEnd"] == 145
+
+    # Containers keep the open-ended-to-live-edge treatment: a talon run root
+    # (AGENT) / stage root (LLM) marker is held open BY DESIGN for minutes, so its
+    # open duration is real — talon never markers a leaf tool at all.
+    co = r["containerOpen"]
+    for cont in (co["run"], co["stage"]):
+        assert cont["rOpen"] is True
+        assert cont["rPending"] is False
+
+    # A pending tick whose completion NEVER comes still falls through to the
+    # abandoned treatment past the threshold, so a session killed mid-tool doesn't
+    # leave a lingering pending tick either.
+    lpa = r["leafPendingAbandoned"]
+    assert lpa["rAbandoned"] is True
+    assert lpa["rPending"] is False
+    assert lpa["rOpen"] is False
+    assert lpa["rEnd"] == 1000
+
+    # The tick is a PAINT change only, never an ingestion one: a pending marker
+    # keeps anchoring the live re-fetch floor (its completion is backdated to the
+    # marker's own start, so a forward-only poll would never pull it) and the
+    # floor clears once the twin lands and the marker pairs.
+    pf = r["pendingFloor"]
+    assert pf["pendingBefore"] is True
+    assert pf["floor"] == 500
+    assert pf["coversTwin"] is True
+    assert pf["hiddenAfter"] is True
+    assert pf["afterEmpty"] is True
