@@ -22,9 +22,9 @@ def _package_from_lock(name: str) -> dict:
     return next(package for package in lock["package"] if package["name"] == name)
 
 
-def test_release_version_is_0_17_5_in_project_and_lock():
-    assert _pyproject()["project"]["version"] == "0.17.5"
-    assert _package_from_lock("kestrel-feature-observability")["version"] == "0.17.5"
+def test_release_version_is_0_17_6_in_project_and_lock():
+    assert _pyproject()["project"]["version"] == "0.17.6"
+    assert _package_from_lock("kestrel-feature-observability")["version"] == "0.17.6"
 
 
 def test_only_fleet_and_test_surfaces_use_the_narrow_sdk_contract():
