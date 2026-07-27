@@ -709,7 +709,7 @@ class TestSessionRootAndSummary:
 
 
 # ---------------------------------------------------------------------------
-# 3g. First-class turn spans: session ⊃ turn ⊃ tool ⊃ markers (#55)
+# 3g. First-class turn spans: session ⊃ turn ⊃ tool (#55)
 # ---------------------------------------------------------------------------
 
 class TestTurnSpans:
@@ -770,33 +770,57 @@ class TestTurnSpans:
         assert tool.context.trace_id == turn_root.context.trace_id
 
     @pytest.mark.asyncio
-    async def test_pre_tool_use_emits_start_marker(self):
+    async def test_pre_tool_use_emits_no_span(self):
+        # The completed PostToolUse span is a tool call's ONLY span (#82): a tool
+        # the security/permission layer blocks before it runs must leave nothing
+        # behind — an unpaired "(started)" marker renders pinned to the turn end.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        exporter.clear()
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        assert exporter.get_finished_spans() == ()
+
+    @pytest.mark.asyncio
+    async def test_denied_tool_leaves_no_span_and_no_count(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        # PreToolUse with no PostToolUse — the permission layer denied the call.
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("Stop"))
+        spans = _by_name(exporter.get_finished_spans())
+        assert not [name for name in spans if "Bash" in name]
+        assert spans["turn 1 summary"].attributes["kestrel.tool_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_executed_tool_is_exactly_one_span_naming_the_tool(self):
         hook, exporter = _memory_hook()
         await hook.execute(_make_input("SessionStart"))
         await hook.execute(_make_input("UserPromptSubmit"))
         await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
-        spans = _by_name(exporter.get_finished_spans())
-        marker, turn_root = spans["Bash (started)"], spans["test-agent turn 1"]
-        assert marker.attributes["openinference.span.kind"] == "TOOL"
-        assert marker.attributes[KESTREL_MARKER] == "start"
-        assert marker.attributes["tool.name"] == "Bash"
-        assert marker.attributes[KESTREL_TURN_ID] == "sess-1#1"
-        # Point span (instant), parented to the current turn.
-        assert marker.end_time == marker.start_time
-        assert marker.parent.span_id == turn_root.context.span_id
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        tools = [
+            s for s in exporter.get_finished_spans()
+            if s.attributes["openinference.span.kind"] == "TOOL"
+        ]
+        assert len(tools) == 1
+        assert tools[0].name == "Bash"
+        assert tools[0].attributes["tool.name"] == "Bash"
+        assert tools[0].end_time - tools[0].start_time == 5_000_000
 
     @pytest.mark.asyncio
-    async def test_start_marker_is_attribute_light(self):
-        # Keep it lean: no duration/feature/error, just name + session/turn ids.
+    async def test_pre_tool_use_still_exports_the_session_root_early(self):
+        # No marker, but the session root is still exported on the first event so
+        # a later tool span never arrives orphaned (#42).
         hook, exporter = _memory_hook()
-        await hook.execute(_make_input("SessionStart"))
-        await hook.execute(_make_input("UserPromptSubmit"))
-        await hook.execute(
-            _make_input("PreToolUse", tool_name="Bash", feature_name="Sec")
-        )
-        marker = _by_name(exporter.get_finished_spans())["Bash (started)"]
-        assert "tool.duration_ms" not in marker.attributes
-        assert "kestrel.feature_name" not in marker.attributes
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        assert "test-agent" in _by_name(exporter.get_finished_spans())
 
     @pytest.mark.asyncio
     async def test_session_ids_on_every_span_shape(self):
@@ -809,7 +833,6 @@ class TestTurnSpans:
         expected = {
             "test-agent",
             "test-agent turn 1",
-            "Bash (started)",
             "Bash",
             "turn 1 summary",
             "session summary",
@@ -847,7 +870,7 @@ class TestTurnSpans:
         await self._drive_turn(hook)
         spans = _by_name(exporter.get_finished_spans())
         # Every span EXCEPT the pre-turn session-marker root carries turn ids.
-        for name in ("test-agent turn 1", "Bash (started)", "Bash", "turn 1 summary"):
+        for name in ("test-agent turn 1", "Bash", "turn 1 summary"):
             attrs = spans[name].attributes
             assert attrs[KESTREL_TURN_ID] == "sess-1#1"
             assert attrs[KESTREL_TURN_INDEX] == 1
@@ -934,26 +957,14 @@ class TestTurnSpans:
         assert KESTREL_TURN_ID not in tool.attributes
 
     @pytest.mark.asyncio
-    async def test_scheduler_pre_tool_use_emits_no_start_marker(self):
-        # The scheduler pseudo-session must not emit a start marker for every
-        # (idle) tick — that would re-introduce the #42 noise and orphan the marker.
+    async def test_scheduler_pre_tool_use_emits_nothing(self):
+        # The scheduler pseudo-session gets a root only when a work-tick actually
+        # needs a parent — a PreToolUse tick must not mint one (#42).
         hook, exporter = _memory_hook()
         await hook.execute(
             _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
         )
         assert exporter.get_finished_spans() == ()
-
-    @pytest.mark.asyncio
-    async def test_scheduler_start_marker_opt_in(self):
-        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
-            hook, exporter = _memory_hook()
-        await hook.execute(
-            _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
-        )
-        assert (
-            _by_name(exporter.get_finished_spans()).get("restart_coordinator (started)")
-            is not None
-        )
 
 
 # ---------------------------------------------------------------------------

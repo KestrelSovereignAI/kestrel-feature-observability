@@ -6,9 +6,12 @@ Covers:
 1. Instant no-op (and no OTel import) when no OTLP endpoint is configured.
 2. ``main`` always returns 0 and prints NOTHING to stdout (even on garbage stdin).
 3. SessionStart mints an AGENT session-marker root (session_id / agent_name / orchestrator).
-4. The full cross-process flow: session ⊃ turn ⊃ tool ⊃ tool-start markers, one trace per turn,
+4. The full cross-process flow: session ⊃ turn ⊃ tool, one trace per turn,
    parented across separate invocations via the state file.
-5. PostToolUse duration is backdated from the paired PreToolUse (never negative).
+5. PreToolUse emits NO span — the completed span is the tool's only span, so a
+   denied/blocked tool leaves nothing orphaned — but its start is still recorded, so
+   PostToolUse duration is backdated from it (never negative), and unclaimed starts
+   are evicted by TTL/cap.
 6. tool_response success/error detection + error truncation to 200 chars (privacy).
 7. Stop → turn summary CHAIN; SessionEnd → session summary CHAIN + state cleanup.
 8. Projects = repos: git remote URL parsing + project resolution/caching.
@@ -178,7 +181,7 @@ class TestSessionStart:
 
 
 # ---------------------------------------------------------------------------
-# 4. Full cross-process flow (session ⊃ turn ⊃ tool ⊃ marker)
+# 4. Full cross-process flow (session ⊃ turn ⊃ tool)
 # ---------------------------------------------------------------------------
 
 class TestFullFlow:
@@ -204,7 +207,6 @@ class TestFullFlow:
         assert set(spans) == {
             "claude-code",
             "claude-code turn 1",
-            "Bash (started)",
             "Bash",
             "Explore",
             "turn 1 summary",
@@ -212,7 +214,6 @@ class TestFullFlow:
         }
         assert spans["claude-code"].attributes["openinference.span.kind"] == "AGENT"
         assert spans["claude-code turn 1"].attributes["openinference.span.kind"] == "AGENT"
-        assert spans["Bash (started)"].attributes["openinference.span.kind"] == "TOOL"
         assert spans["Bash"].attributes["openinference.span.kind"] == "TOOL"
         assert spans["Explore"].attributes["openinference.span.kind"] == "AGENT"
         assert spans["turn 1 summary"].attributes["openinference.span.kind"] == "CHAIN"
@@ -223,13 +224,12 @@ class TestFullFlow:
         spans = _by_name(emitter.get_finished_spans())
         turn = spans["claude-code turn 1"]
         tool = spans["Bash"]
-        marker = spans["Bash (started)"]
         summary = spans["turn 1 summary"]
 
-        # The tool span, its start marker and the turn summary all share the
-        # turn's trace and parent to the turn root — reconstructed across
-        # separate invocations purely from the state file.
-        for s in (tool, marker, summary):
+        # The tool span and the turn summary share the turn's trace and parent to
+        # the turn root — reconstructed across separate invocations purely from
+        # the state file.
+        for s in (tool, summary):
             assert s.context.trace_id == turn.context.trace_id
             assert s.parent.span_id == turn.context.span_id
 
@@ -251,11 +251,13 @@ class TestFullFlow:
         assert tool.attributes[chook.KESTREL_TURN_ID] == "sess-abc#1"
         assert tool.attributes[chook.KESTREL_TURN_INDEX] == 1
 
-    def test_markers_flag_start(self, emitter):
+    def test_turn_root_flags_start_and_tools_do_not(self, emitter):
+        # The turn root is still a live-visibility marker (its `turn <n> summary`
+        # closes it); a tool call is one completed span, never a marker (#82).
         self._run_flow()
         spans = _by_name(emitter.get_finished_spans())
         assert spans["claude-code turn 1"].attributes[chook.KESTREL_MARKER] == "start"
-        assert spans["Bash (started)"].attributes[chook.KESTREL_MARKER] == "start"
+        assert chook.KESTREL_MARKER not in spans["Bash"].attributes
 
     def test_summaries_carry_totals(self, emitter):
         self._run_flow()
@@ -658,9 +660,8 @@ class TestParallelTools:
         # A: 4ms - 1ms = 3ms; B: 6ms - 2ms = 4ms. LIFO-by-name would give 2/5ms.
         assert durations == pytest.approx([3.0, 4.0])
 
-    def test_tool_use_id_stamped_as_call_id_on_marker_and_span(self, emitter):
-        # The Timeline pairs concurrent same-name tools one-to-one by tool.call_id,
-        # so BOTH the "(started)" marker and the completed span must carry it (#62).
+    def test_tool_use_id_stamped_as_call_id_on_span(self, emitter):
+        # tool.call_id keeps concurrent same-name calls distinguishable (#62).
         ns = 9_500_000_000
         chook._handle(_payload("SessionStart"), now_ns=ns)
         chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
@@ -670,12 +671,11 @@ class TestParallelTools:
             now_ns=ns + 3,
         )
         by_name = _by_name(emitter.get_finished_spans())
-        assert by_name["Bash (started)"].attributes["tool.call_id"] == "tc-1"
         assert by_name["Bash"].attributes["tool.call_id"] == "tc-1"
+        assert by_name["Bash"].attributes["tool.name"] == "Bash"
 
     def test_missing_tool_use_id_omits_call_id(self, emitter):
-        # No id (the in-process emitter path shape) → no tool.call_id stamped; the
-        # Timeline falls back to name-order pairing.
+        # No id (the in-process emitter path shape) → no tool.call_id stamped.
         ns = 9_700_000_000
         chook._handle(_payload("SessionStart"), now_ns=ns)
         chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
@@ -685,7 +685,6 @@ class TestParallelTools:
             now_ns=ns + 3,
         )
         by_name = _by_name(emitter.get_finished_spans())
-        assert "tool.call_id" not in by_name["Bash (started)"].attributes
         assert "tool.call_id" not in by_name["Bash"].attributes
 
     def test_session_lock_is_clean_and_counts_accumulate(self, emitter):
@@ -780,3 +779,116 @@ class TestSummaryStats:
             sess.attributes["kestrel.duration_ms"]
             == sess.attributes["kestrel.session_duration_ms"]
         )
+
+
+# ---------------------------------------------------------------------------
+# 14. PreToolUse emits no span; pending starts stay bounded (#82)
+# ---------------------------------------------------------------------------
+
+def _pending(tmp_path, session_id="sess-abc"):
+    """The persisted ``pending_tools`` map for a session."""
+    state = chook._read_state(tmp_path / chook._state_filename(session_id))
+    return (state or {}).get("pending_tools") or {}
+
+
+class TestNoStartMarker:
+    def test_pre_tool_use_emits_no_tool_span(self, emitter):
+        # PreToolUse only records the start — the completing event owns the span.
+        ns = 12_000_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        emitter.clear()
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="p1"), now_ns=ns + 2)
+        assert emitter.get_finished_spans() == ()
+
+    def test_denied_tool_produces_no_span_at_all(self, emitter):
+        # A tool denied/blocked before it runs fires PreToolUse but never a
+        # completing event: it must leave NOTHING behind to orphan (#82).
+        ns = 12_100_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="d1"), now_ns=ns + 2)
+        chook._handle(_payload("Stop"), now_ns=ns + 3_000_000)
+        names = [s.name for s in emitter.get_finished_spans()]
+        assert not [n for n in names if "Bash" in n]
+        # ...and the denied call is not counted as a tool run.
+        summary = _by_name(emitter.get_finished_spans())["turn 1 summary"]
+        assert summary.attributes["kestrel.tool_count"] == 0
+
+    def test_executed_tool_is_exactly_one_span(self, emitter):
+        ns = 12_200_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="o1"), now_ns=ns + 1_000_000)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_use_id="o1", tool_response={"stdout": "ok"}),
+            now_ns=ns + 4_000_000,
+        )
+        bash = [s for s in emitter.get_finished_spans() if s.name.startswith("Bash")]
+        assert len(bash) == 1
+        # One span covering the REAL start→end, not an instant point.
+        assert bash[0].end_time - bash[0].start_time == 3_000_000
+
+
+class TestPendingBounded:
+    def test_completed_tool_clears_its_pending_entry(self, emitter, tmp_path):
+        ns = 12_300_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="c1"), now_ns=ns + 1)
+        assert _pending(tmp_path)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_use_id="c1", tool_response={}),
+            now_ns=ns + 2,
+        )
+        assert _pending(tmp_path) == {}
+
+    def test_denied_tool_entry_evicted_after_ttl(self, emitter, tmp_path):
+        ns = 12_400_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="x"), now_ns=ns + 1)
+        assert _pending(tmp_path)  # unclaimed — the tool was denied
+        # Still pending just inside the TTL (a long-running tool must NOT lose
+        # the start its duration is derived from).
+        chook._handle(_payload("Stop"), now_ns=ns + chook._PENDING_TTL_S * 1_000_000_000 - 1)
+        assert _pending(tmp_path)
+        # Past the TTL → evicted on the next event.
+        chook._handle(
+            _payload("UserPromptSubmit"),
+            now_ns=ns + chook._PENDING_TTL_S * 1_000_000_000 + 1_000_000_000,
+        )
+        assert _pending(tmp_path) == {}
+
+    def test_long_running_tool_keeps_its_real_duration(self, emitter, tmp_path):
+        # The TTL must exceed any realistic tool: a 10-minute build still pairs
+        # with its start instead of collapsing to a zero-duration point span.
+        ns = 12_500_000_000
+        ten_min_ns = 600 * 1_000_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="slow"), now_ns=ns + 2)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_use_id="slow", tool_response={}),
+            now_ns=ns + 2 + ten_min_ns,
+        )
+        tool = _by_name(emitter.get_finished_spans())["Bash"]
+        assert tool.attributes["tool.duration_ms"] == pytest.approx(600_000.0)
+
+    def test_pending_capped_keeping_most_recent(self, emitter, tmp_path):
+        ns = 12_600_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        overflow = chook._MAX_PENDING_STARTS + 20
+        for i in range(overflow):
+            chook._handle(
+                _payload("PreToolUse", tool_name="Bash", tool_use_id=f"cap-{i}"),
+                now_ns=ns + 1 + i,
+            )
+        pending = _pending(tmp_path)
+        assert sum(len(v) for v in pending.values()) == chook._MAX_PENDING_STARTS
+        # The most RECENT starts survive — the ones a completing event may claim.
+        assert f"id:cap-{overflow - 1}" in pending
+        assert "id:cap-0" not in pending
+
+    def test_prune_tolerates_malformed_state(self):
+        state = {"pending_tools": {"id:a": "not-a-list", "id:b": [None, "x", 5]}}
+        chook._prune_pending(state, now_ns=5)
+        assert state["pending_tools"] == {"id:b": [5]}

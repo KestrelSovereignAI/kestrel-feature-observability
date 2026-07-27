@@ -8,8 +8,8 @@ closing ``session summary`` span carrying totals. Spans are exported to whatever
 ``OTEL_EXPORTER_OTLP_ENDPOINT`` points at (e.g. a host-supervised Phoenix). This
 hook is purely observational: it never blocks, denies, or modifies anything.
 
-Span shape — session ⊃ turn ⊃ tool ⊃ tool-start markers (robust, real durations,
-no held-open spans; every span exports immediately — #42, #55):
+Span shape — session ⊃ turn ⊃ tool (robust, real durations, no held-open spans;
+every span exports immediately — #42, #55):
 
 - On the first lifecycle event of a session a short **session-marker** root span
   (OpenInference ``AGENT``) is opened AND ended immediately, so it is **exported
@@ -23,14 +23,18 @@ no held-open spans; every span exports immediately — #42, #55):
   **new trace root**; its ``SpanContext`` is kept in session state. Every span of
   the turn also carries ``kestrel.turn_id`` (``<session_id>#<n>``) and
   ``kestrel.turn_index`` (n).
-- On ``PreToolUse`` an instant tool-start marker (``<tool> (started)``,
-  ``kestrel.marker=start``) is emitted, parented to the current turn — the
-  innermost doll, paired with the ``PostToolUse`` tool span by the Timeline.
+- ``PreToolUse`` emits NO span: the completed ``PostToolUse`` span is the single
+  authoritative span for a tool call, so a tool blocked before it ever runs (the
+  security/permission layer or the approval queue denying it) produces no span at
+  all — correct, since it did not run. A start marker here would be orphaned (no
+  ``PostToolUse`` twin ever arrives) and the Timeline pins an unpaired marker to
+  the end of its turn (#82).
 - Each ``PostToolUse`` emits a child ``tool_span`` (OpenInference ``TOOL``)
   parented to the current turn (fallback: the session root, e.g. events arriving
-  before any prompt), carrying the tool name, real duration, and success. When no
-  duration is available the span is a zero-duration point span (start == end) —
-  never ``start > end`` (a negative duration).
+  before any prompt), carrying the tool name, real duration, and success — the
+  innermost doll, one completed span per executed tool. When no duration is
+  available the span is a zero-duration point span (start == end) — never
+  ``start > end`` (a negative duration).
 - On ``Stop`` a ``turn <n> summary`` (OpenInference ``CHAIN``, parented to the
   turn root) carries the per-turn totals (tool count, duration, success ratio).
   The session is NOT popped — it stays stable across turns.
@@ -79,7 +83,6 @@ from kestrel_feature_observability.tracing import (
     KestrelTracer,
     KIND_AGENT,
     KIND_CHAIN,
-    KIND_TOOL,
     configure as configure_tracing,
 )
 
@@ -99,15 +102,15 @@ except Exception:  # noqa: BLE001 - semantic-conventions fallback must not break
 # Both ``kestrel.session_id`` (Navigator/backward compatibility) and OpenInference
 # ``session.id`` (Phoenix Sessions) are stamped on EVERY span when a session id
 # exists; ``kestrel.turn_id`` / ``kestrel.turn_index`` label the one-trace-per-turn
-# spans; ``kestrel.marker`` flags the instant start spans (turn root + tool-start),
-# which the Timeline pairs with their close event.
+# spans; ``kestrel.marker`` flags the instant turn-root start span, which the
+# Timeline pairs with its ``turn <n> summary`` close event.
 KESTREL_SESSION_ID = "kestrel.session_id"
 KESTREL_TURN_ID = "kestrel.turn_id"
 KESTREL_TURN_INDEX = "kestrel.turn_index"
 KESTREL_MARKER = "kestrel.marker"
 KESTREL_TOOL_NAME = "tool.name"
 
-# ``kestrel.marker`` value stamped on the instant turn-root and tool-start spans.
+# ``kestrel.marker`` value stamped on the instant turn-root start span.
 _MARKER_START = "start"
 
 # OpenInference INPUT_VALUE attribute key — the user prompt stamped on the turn
@@ -317,7 +320,7 @@ class _SessionState:
 
 
 class ObservabilityHook(Hook):
-    """Per-agent emitter — emits OTel spans (session ⊃ turn ⊃ tool ⊃ markers) via KestrelTracer."""
+    """Per-agent emitter — emits OTel spans (session ⊃ turn ⊃ tool) via KestrelTracer."""
 
     def __init__(self, agent):
         super().__init__(
@@ -430,7 +433,7 @@ class ObservabilityHook(Hook):
         ``AGENT`` span (``<agent> turn <n>``, ``kestrel.marker=start``) as a **new
         trace root** (``root=True`` → fresh empty context, so it never inherits an
         ambient host span), keeping its ``SpanContext`` in session state so the
-        turn's tool spans/markers/summary parent to it. Keeps the #42 invariant:
+        turn's tool spans/summary parent to it. Keeps the #42 invariant:
         nothing is held open — the root is exported right away.
 
         When opt-in prompt capture is enabled (``KESTREL_OTEL_CAPTURE_PROMPTS=1``)
@@ -475,7 +478,7 @@ class ObservabilityHook(Hook):
     def _turn_parent(self, session: _SessionState) -> Any:
         """The current turn root, or the session root as a fallback.
 
-        Tool spans/markers parent to the live turn; before any prompt (e.g. the
+        Tool spans parent to the live turn; before any prompt (e.g. the
         scheduler pseudo-session, or events arriving pre-prompt) they fall back to
         the session-marker root as today.
         """
@@ -495,48 +498,6 @@ class ObservabilityHook(Hook):
             return True
         return _scheduler_tick_did_work(input.tool_response)
 
-    def _should_emit_tool_start(self, input: HookInput) -> bool:
-        """Whether this PreToolUse should emit a tool-start marker.
-
-        Normal agent tool calls always emit. Scheduler-sourced ticks (#42) are
-        suppressed unless ``KESTREL_OTEL_TRACE_SCHEDULER`` opts into full tick
-        tracing — at pre-tool time the tick's outcome isn't known yet, so a marker
-        on every idle scheduler tick would re-introduce exactly the every-minute
-        no-op noise (and orphan the marker, since the idle PostToolUse is dropped).
-        """
-        if input.session_id != _SCHEDULER_SESSION_ID:
-            return True
-        return self._trace_scheduler
-
-    def _emit_tool_start_marker(
-        self,
-        session: _SessionState,
-        session_id: Optional[str],
-        agent_name: str,
-        input: HookInput,
-    ) -> None:
-        """Emit an instant tool-start marker (``<tool> (started)``) on PreToolUse.
-
-        The innermost doll: an attribute-light ``TOOL`` marker (tool name +
-        session/turn ids + ``kestrel.marker=start``) parented to the current turn,
-        which the Timeline pairs with the completed ``PostToolUse`` tool span
-        (talon#80's start/close pairing convention).
-        """
-        attributes = self._scope_attrs(session, session_id)
-        attributes[KESTREL_MARKER] = _MARKER_START
-        attributes[KESTREL_TOOL_NAME] = input.tool_name
-
-        marker_ns = time.time_ns()
-        self._tracer.emit_span(
-            f"{input.tool_name} (started)",
-            KIND_TOOL,
-            parent=self._turn_parent(session),
-            start_time=marker_ns,
-            end_time=marker_ns,
-            agent_name=agent_name,
-            attributes=attributes,
-        )
-
     def _emit_tool_span(
         self,
         session: _SessionState,
@@ -555,6 +516,7 @@ class ObservabilityHook(Hook):
             extra["tool.duration_ms"] = input.execution_time_ms
 
         attributes = self._scope_attrs(session, session_id)
+        attributes[KESTREL_TOOL_NAME] = input.tool_name
         if input.feature_name:
             attributes["kestrel.feature_name"] = input.feature_name
         if not success and isinstance(input.tool_response, dict):
@@ -729,14 +691,6 @@ class ObservabilityHook(Hook):
                     if self._should_emit_tool_span(input):
                         session = self._ensure_session(session_id, agent_name, input)
                         self._emit_tool_span(session, session_id, agent_name, input)
-                elif event_type == "PreToolUse" and input.tool_name:
-                    # Innermost doll: an instant tool-start marker parented to the
-                    # current turn — the Timeline pairs it with the PostToolUse span.
-                    if self._should_emit_tool_start(input):
-                        session = self._ensure_session(session_id, agent_name, input)
-                        self._emit_tool_start_marker(
-                            session, session_id, agent_name, input
-                        )
                 elif event_type == "UserPromptSubmit":
                     # Start a turn: a new per-turn trace root under the session.
                     # Use the post-rewrite prompt (an earlier hook may have
@@ -753,9 +707,11 @@ class ObservabilityHook(Hook):
                     # End the session (true session summary aggregating turns).
                     self._close_session(session_id, agent_name)
                 elif session_id != _SCHEDULER_SESSION_ID:
-                    # Real agent session: export the root marker early so children
-                    # never arrive orphaned (#42). The scheduler pseudo-session
-                    # gets a root only when a work-tick actually needs a parent.
+                    # Every other event — ``PreToolUse`` included, which emits no
+                    # span of its own (#82). Real agent session: export the root
+                    # marker early so children never arrive orphaned (#42). The
+                    # scheduler pseudo-session gets a root only when a work-tick
+                    # actually needs a parent.
                     self._ensure_session(session_id, agent_name, input)
             except Exception as e:  # noqa: BLE001 - tracing must never break the agent
                 logger.debug("ObservabilityHook tracing error (non-fatal): %s", e)
