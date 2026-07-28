@@ -6,12 +6,11 @@ Covers:
 1. Instant no-op (and no OTel import) when no OTLP endpoint is configured.
 2. ``main`` always returns 0 and prints NOTHING to stdout (even on garbage stdin).
 3. SessionStart mints an AGENT session-marker root (session_id / agent_name / orchestrator).
-4. The full cross-process flow: session ⊃ turn ⊃ tool, one trace per turn,
-   parented across separate invocations via the state file.
-5. PreToolUse emits NO span — the completed span is the tool's only span, so a
-   denied/blocked tool leaves nothing orphaned — but its start is still recorded, so
-   PostToolUse duration is backdated from it (never negative), and unclaimed starts
-   are evicted by TTL/cap.
+4. The full cross-process flow: session ⊃ turn ⊃ tool ⊃ tool-start markers, one
+   trace per turn, parented across separate invocations via the state file.
+5. PreToolUse emits a ``(started)`` marker and records the start, so PostToolUse
+   duration is backdated from it (never negative) and unclaimed starts are
+   evicted by TTL/cap.
 6. tool_response success/error detection + error truncation to 200 chars (privacy).
 7. Stop → turn summary CHAIN; SessionEnd → session summary CHAIN + state cleanup.
 8. Projects = repos: git remote URL parsing + project resolution/caching.
@@ -20,6 +19,9 @@ Covers:
 11. PostToolUseFailure (failed tools are a separate event with top-level error/duration_ms).
 12. SessionStart during compaction/resume/fork preserves the active session.
 13. Parallel tools pair by tool_use_id; per-session lock serializes state writes.
+14. Every tool ends in exactly one terminal span: completed / denied
+    (``PermissionDenied``) / incomplete (turn-end reconciliation), the last two
+    zero-duration and counted apart from executed tools (#84).
 """
 
 from __future__ import annotations
@@ -181,7 +183,7 @@ class TestSessionStart:
 
 
 # ---------------------------------------------------------------------------
-# 4. Full cross-process flow (session ⊃ turn ⊃ tool)
+# 4. Full cross-process flow (session ⊃ turn ⊃ tool ⊃ marker)
 # ---------------------------------------------------------------------------
 
 class TestFullFlow:
@@ -207,6 +209,7 @@ class TestFullFlow:
         assert set(spans) == {
             "claude-code",
             "claude-code turn 1",
+            "Bash (started)",
             "Bash",
             "Explore",
             "turn 1 summary",
@@ -214,6 +217,7 @@ class TestFullFlow:
         }
         assert spans["claude-code"].attributes["openinference.span.kind"] == "AGENT"
         assert spans["claude-code turn 1"].attributes["openinference.span.kind"] == "AGENT"
+        assert spans["Bash (started)"].attributes["openinference.span.kind"] == "TOOL"
         assert spans["Bash"].attributes["openinference.span.kind"] == "TOOL"
         assert spans["Explore"].attributes["openinference.span.kind"] == "AGENT"
         assert spans["turn 1 summary"].attributes["openinference.span.kind"] == "CHAIN"
@@ -224,12 +228,13 @@ class TestFullFlow:
         spans = _by_name(emitter.get_finished_spans())
         turn = spans["claude-code turn 1"]
         tool = spans["Bash"]
+        marker = spans["Bash (started)"]
         summary = spans["turn 1 summary"]
 
-        # The tool span and the turn summary share the turn's trace and parent to
-        # the turn root — reconstructed across separate invocations purely from
-        # the state file.
-        for s in (tool, summary):
+        # The tool span, its start marker and the turn summary all share the
+        # turn's trace and parent to the turn root — reconstructed across
+        # separate invocations purely from the state file.
+        for s in (tool, marker, summary):
             assert s.context.trace_id == turn.context.trace_id
             assert s.parent.span_id == turn.context.span_id
 
@@ -251,12 +256,13 @@ class TestFullFlow:
         assert tool.attributes[chook.KESTREL_TURN_ID] == "sess-abc#1"
         assert tool.attributes[chook.KESTREL_TURN_INDEX] == 1
 
-    def test_turn_root_flags_start_and_tools_do_not(self, emitter):
-        # The turn root is still a live-visibility marker (its `turn <n> summary`
-        # closes it); a tool call is one completed span, never a marker (#82).
+    def test_markers_flag_start(self, emitter):
+        # The turn root and each tool-start marker are live-visibility markers;
+        # the terminal tool span that closes the marker never is (#84).
         self._run_flow()
         spans = _by_name(emitter.get_finished_spans())
         assert spans["claude-code turn 1"].attributes[chook.KESTREL_MARKER] == "start"
+        assert spans["Bash (started)"].attributes[chook.KESTREL_MARKER] == "start"
         assert chook.KESTREL_MARKER not in spans["Bash"].attributes
 
     def test_summaries_carry_totals(self, emitter):
@@ -660,8 +666,9 @@ class TestParallelTools:
         # A: 4ms - 1ms = 3ms; B: 6ms - 2ms = 4ms. LIFO-by-name would give 2/5ms.
         assert durations == pytest.approx([3.0, 4.0])
 
-    def test_tool_use_id_stamped_as_call_id_on_span(self, emitter):
-        # tool.call_id keeps concurrent same-name calls distinguishable (#62).
+    def test_tool_use_id_stamped_as_call_id_on_marker_and_span(self, emitter):
+        # The Timeline pairs concurrent same-name tools one-to-one by tool.call_id,
+        # so BOTH the "(started)" marker and the completed span must carry it (#62).
         ns = 9_500_000_000
         chook._handle(_payload("SessionStart"), now_ns=ns)
         chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
@@ -671,11 +678,13 @@ class TestParallelTools:
             now_ns=ns + 3,
         )
         by_name = _by_name(emitter.get_finished_spans())
+        assert by_name["Bash (started)"].attributes["tool.call_id"] == "tc-1"
         assert by_name["Bash"].attributes["tool.call_id"] == "tc-1"
         assert by_name["Bash"].attributes["tool.name"] == "Bash"
 
     def test_missing_tool_use_id_omits_call_id(self, emitter):
-        # No id (the in-process emitter path shape) → no tool.call_id stamped.
+        # No id (the in-process emitter path shape) → no tool.call_id stamped; the
+        # Timeline falls back to name-order pairing.
         ns = 9_700_000_000
         chook._handle(_payload("SessionStart"), now_ns=ns)
         chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
@@ -685,6 +694,7 @@ class TestParallelTools:
             now_ns=ns + 3,
         )
         by_name = _by_name(emitter.get_finished_spans())
+        assert "tool.call_id" not in by_name["Bash (started)"].attributes
         assert "tool.call_id" not in by_name["Bash"].attributes
 
     def test_session_lock_is_clean_and_counts_accumulate(self, emitter):
@@ -782,7 +792,7 @@ class TestSummaryStats:
 
 
 # ---------------------------------------------------------------------------
-# 14. PreToolUse emits no span; pending starts stay bounded (#82)
+# 14. Three tool outcomes; pending starts stay bounded (#84)
 # ---------------------------------------------------------------------------
 
 def _pending(tmp_path, session_id="sess-abc"):
@@ -791,31 +801,25 @@ def _pending(tmp_path, session_id="sess-abc"):
     return (state or {}).get("pending_tools") or {}
 
 
-class TestNoStartMarker:
-    def test_pre_tool_use_emits_no_tool_span(self, emitter):
-        # PreToolUse only records the start — the completing event owns the span.
+def _terminal(spans, tool="Bash"):
+    """The terminal (non-marker) spans for a tool — its completed/denied/incomplete twins."""
+    return [s for s in spans if s.name == tool]
+
+
+class TestToolOutcomes:
+    def test_pre_tool_use_emits_a_start_marker(self, emitter):
+        # PreToolUse fires BEFORE the permission check, so even a to-be-denied
+        # tool is visible the moment it is attempted (#84 reverts #82's drop).
         ns = 12_000_000_000
         chook._handle(_payload("SessionStart"), now_ns=ns)
         chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
         emitter.clear()
         chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="p1"), now_ns=ns + 2)
-        assert emitter.get_finished_spans() == ()
+        marker = _by_name(emitter.get_finished_spans())["Bash (started)"]
+        assert marker.attributes[chook.KESTREL_MARKER] == "start"
+        assert marker.end_time == marker.start_time
 
-    def test_denied_tool_produces_no_span_at_all(self, emitter):
-        # A tool denied/blocked before it runs fires PreToolUse but never a
-        # completing event: it must leave NOTHING behind to orphan (#82).
-        ns = 12_100_000_000
-        chook._handle(_payload("SessionStart"), now_ns=ns)
-        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
-        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="d1"), now_ns=ns + 2)
-        chook._handle(_payload("Stop"), now_ns=ns + 3_000_000)
-        names = [s.name for s in emitter.get_finished_spans()]
-        assert not [n for n in names if "Bash" in n]
-        # ...and the denied call is not counted as a tool run.
-        summary = _by_name(emitter.get_finished_spans())["turn 1 summary"]
-        assert summary.attributes["kestrel.tool_count"] == 0
-
-    def test_executed_tool_is_exactly_one_span(self, emitter):
+    def test_completed_tool_stamps_the_completed_outcome(self, emitter):
         ns = 12_200_000_000
         chook._handle(_payload("SessionStart"), now_ns=ns)
         chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
@@ -824,10 +828,280 @@ class TestNoStartMarker:
             _payload("PostToolUse", tool_name="Bash", tool_use_id="o1", tool_response={"stdout": "ok"}),
             now_ns=ns + 4_000_000,
         )
-        bash = [s for s in emitter.get_finished_spans() if s.name.startswith("Bash")]
-        assert len(bash) == 1
+        terminal = _terminal(emitter.get_finished_spans())
+        assert len(terminal) == 1
+        assert terminal[0].attributes[chook.KESTREL_TOOL_OUTCOME] == "completed"
         # One span covering the REAL start→end, not an instant point.
-        assert bash[0].end_time - bash[0].start_time == 3_000_000
+        assert terminal[0].end_time - terminal[0].start_time == 3_000_000
+
+    def test_permission_denied_emits_a_terminal_denied_span(self, emitter):
+        # The classifier refusing a call is an explicit, emittable signal: pair it
+        # to the marker by tool_use_id and label it `denied` right away.
+        ns = 12_050_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="d1"), now_ns=ns + 2_000_000)
+        chook._handle(
+            _payload("PermissionDenied", tool_name="Bash", tool_use_id="d1"),
+            now_ns=ns + 5_000_000,
+        )
+        spans = _by_name(emitter.get_finished_spans())
+        denied, marker = spans["Bash"], spans["Bash (started)"]
+        assert denied.attributes[chook.KESTREL_TOOL_OUTCOME] == "denied"
+        assert denied.attributes[chook.KESTREL_TOOL_DENIED_BY] == "classifier"
+        assert denied.attributes["tool.success"] is False
+        assert denied.attributes["tool.call_id"] == "d1"
+        # It never RAN: a zero-duration point at the recorded start, never a bar
+        # spanning start→now (the phantom-duration failure this shape avoids).
+        assert denied.start_time == denied.end_time == marker.start_time
+        # Paired to the turn its marker belongs to, in the same trace.
+        assert denied.parent.span_id == spans["claude-code turn 1"].context.span_id
+
+    def test_denied_span_survives_a_missing_start(self, emitter):
+        # The marker may have been pruned (or predate this release): the denial
+        # still emits, anchored at now, rather than being silently dropped.
+        ns = 12_060_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(
+            _payload("PermissionDenied", tool_name="Bash", tool_use_id="gone"),
+            now_ns=ns + 5_000_000,
+        )
+        denied = _terminal(emitter.get_finished_spans())[0]
+        assert denied.attributes[chook.KESTREL_TOOL_OUTCOME] == "denied"
+        assert denied.start_time == denied.end_time == ns + 5_000_000
+
+    def test_stop_reconciles_an_unresolved_tool_as_incomplete(self, emitter):
+        # A guard/permission-rule denial fires NO event at all — the backbone is
+        # turn-end reconciliation, which must stand alone (#84).
+        ns = 12_100_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="i1"), now_ns=ns + 2_000_000)
+        chook._handle(_payload("Stop"), now_ns=ns + 9_000_000)
+        spans = _by_name(emitter.get_finished_spans())
+        incomplete, marker = spans["Bash"], spans["Bash (started)"]
+        assert incomplete.attributes[chook.KESTREL_TOOL_OUTCOME] == "incomplete"
+        assert incomplete.attributes["tool.success"] is False
+        assert chook.KESTREL_TOOL_DENIED_BY not in incomplete.attributes
+        # Zero-duration at the start, NOT start→Stop: it never ran.
+        assert incomplete.start_time == incomplete.end_time == marker.start_time
+        assert incomplete.parent.span_id == spans["claude-code turn 1"].context.span_id
+
+    def test_refusals_are_counted_apart_from_executed_tools(self, emitter):
+        # A refusal is not an agent error: tool_count/success_ratio stay over
+        # EXECUTED tools, and the refusals get their own additive dimensions.
+        ns = 12_150_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Read", tool_use_id="ok"), now_ns=ns + 1_000_000)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Read", tool_use_id="ok", tool_response={}),
+            now_ns=ns + 2_000_000,
+        )
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="dn"), now_ns=ns + 3_000_000)
+        chook._handle(
+            _payload("PermissionDenied", tool_name="Bash", tool_use_id="dn"),
+            now_ns=ns + 4_000_000,
+        )
+        chook._handle(_payload("PreToolUse", tool_name="Edit", tool_use_id="ic"), now_ns=ns + 5_000_000)
+        chook._handle(_payload("Stop"), now_ns=ns + 6_000_000)
+        chook._handle(_payload("SessionEnd", reason="other"), now_ns=ns + 7_000_000)
+        spans = _by_name(emitter.get_finished_spans())
+        for summary in (spans["turn 1 summary"], spans["session summary"]):
+            assert summary.attributes["kestrel.tool_count"] == 1
+            assert summary.attributes["kestrel.error_count"] == 0
+            assert summary.attributes["kestrel.success_ratio"] == 1.0
+            assert summary.attributes[chook.KESTREL_DENIED_COUNT] == 1
+            assert summary.attributes[chook.KESTREL_INCOMPLETE_COUNT] == 1
+
+    def test_reconciliation_runs_before_the_turn_summary(self, emitter):
+        # Both fire on Stop, so the ordering silently decides whether the count
+        # lands: the summary must already see the incomplete tool.
+        ns = 12_160_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="r1"), now_ns=ns + 2)
+        chook._handle(_payload("Stop"), now_ns=ns + 3_000_000)
+        summary = _by_name(emitter.get_finished_spans())["turn 1 summary"]
+        assert summary.attributes[chook.KESTREL_INCOMPLETE_COUNT] == 1
+
+    def test_interrupted_turn_reconciles_into_its_own_turn(self, emitter):
+        # An interrupt fires no Stop, so leftovers are reconciled at the next
+        # UserPromptSubmit — into the ORIGINAL turn, never the new one, and the
+        # stranded turn gets its retroactive summary so it is closed exactly once.
+        ns = 12_170_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="k1"), now_ns=ns + 2_000_000)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 9_000_000)  # interrupted
+        spans = _by_name(emitter.get_finished_spans())
+        incomplete = spans["Bash"]
+        turn1, turn2 = spans["claude-code turn 1"], spans["claude-code turn 2"]
+        assert incomplete.attributes[chook.KESTREL_TOOL_OUTCOME] == "incomplete"
+        assert incomplete.parent.span_id == turn1.context.span_id
+        assert incomplete.context.trace_id == turn1.context.trace_id
+        assert incomplete.context.trace_id != turn2.context.trace_id
+        assert incomplete.attributes[chook.KESTREL_TURN_ID] == "sess-abc#1"
+        # The interrupted turn is summarized retroactively — closing its band in
+        # its OWN trace, no later than the turn that supersedes it, instead of
+        # being left open to the abandoned-cap.
+        summary = spans["turn 1 summary"]
+        assert summary.attributes[chook.KESTREL_INCOMPLETE_COUNT] == 1
+        assert summary.parent.span_id == turn1.context.span_id
+        assert summary.context.trace_id == turn1.context.trace_id
+        assert summary.end_time <= turn2.start_time
+
+    def test_every_turn_is_summarized_exactly_once(self, emitter):
+        ns = 12_180_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="s1"), now_ns=ns + 2)
+        chook._handle(_payload("Stop"), now_ns=ns + 3_000_000)
+        chook._handle(_payload("SessionEnd", reason="other"), now_ns=ns + 4_000_000)
+        names = [s.name for s in emitter.get_finished_spans()]
+        assert names.count("turn 1 summary") == 1
+        assert names.count("Bash") == 1  # exactly one terminal span for the tool
+
+    def test_session_end_mid_turn_leaves_nothing_unrepresented(self, emitter):
+        ns = 12_190_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="e1"), now_ns=ns + 2)
+        chook._handle(_payload("SessionEnd", reason="other"), now_ns=ns + 5_000_000)
+        spans = _by_name(emitter.get_finished_spans())
+        assert spans["Bash"].attributes[chook.KESTREL_TOOL_OUTCOME] == "incomplete"
+        assert spans["turn 1 summary"].attributes[chook.KESTREL_INCOMPLETE_COUNT] == 1
+        assert spans["session summary"].attributes[chook.KESTREL_INCOMPLETE_COUNT] == 1
+
+    def test_parallel_same_name_tools_reconcile_independently(self, emitter):
+        # tool_use_id keying means the completed twin claims only ITS start; the
+        # other stays pending and reconciles as its own incomplete span.
+        ns = 12_195_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="a"), now_ns=ns + 1_000_000)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="b"), now_ns=ns + 2_000_000)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_use_id="a", tool_response={}),
+            now_ns=ns + 4_000_000,
+        )
+        chook._handle(_payload("Stop"), now_ns=ns + 8_000_000)
+        outcomes = {
+            s.attributes["tool.call_id"]: s.attributes[chook.KESTREL_TOOL_OUTCOME]
+            for s in _terminal(emitter.get_finished_spans())
+        }
+        assert outcomes == {"a": "completed", "b": "incomplete"}
+
+    def test_late_completion_never_adds_a_second_terminal_span(self, emitter):
+        # Hook events are separate processes: the per-session lock serializes
+        # writes but guarantees nothing about ORDER, so a PostToolUse can land
+        # after Stop already reconciled its call. One call gets ONE terminal span
+        # — an exported OTel span cannot be re-labeled incomplete → completed, so
+        # the span already exported wins and the late duplicate is dropped.
+        ns = 12_196_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="L1"), now_ns=ns + 1_000_000)
+        chook._handle(_payload("Stop"), now_ns=ns + 5_000_000)  # reconciles → incomplete
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_use_id="L1", tool_response={}),
+            now_ns=ns + 6_000_000,
+        )
+        terminal = _terminal(emitter.get_finished_spans())
+        assert [s.attributes[chook.KESTREL_TOOL_OUTCOME] for s in terminal] == ["incomplete"]
+        # ...and it is not counted a second time in the session totals either.
+        chook._handle(_payload("SessionEnd", reason="other"), now_ns=ns + 7_000_000)
+        summary = _by_name(emitter.get_finished_spans())["session summary"]
+        assert summary.attributes["kestrel.tool_count"] == 0
+        assert summary.attributes[chook.KESTREL_INCOMPLETE_COUNT] == 1
+
+    def test_late_failure_after_a_denial_never_adds_a_second_span(self, emitter):
+        # Same barrier, the other terminal event and the other outcome.
+        ns = 12_197_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="L2"), now_ns=ns + 1_000_000)
+        chook._handle(
+            _payload("PermissionDenied", tool_name="Bash", tool_use_id="L2"),
+            now_ns=ns + 2_000_000,
+        )
+        chook._handle(
+            _payload("PostToolUseFailure", tool_name="Bash", tool_use_id="L2", error="boom"),
+            now_ns=ns + 3_000_000,
+        )
+        terminal = _terminal(emitter.get_finished_spans())
+        assert [s.attributes[chook.KESTREL_TOOL_OUTCOME] for s in terminal] == ["denied"]
+
+    def test_repeated_permission_denied_emits_one_span(self, emitter):
+        ns = 12_198_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="L3"), now_ns=ns + 1_000_000)
+        for offset in (2_000_000, 3_000_000):
+            chook._handle(
+                _payload("PermissionDenied", tool_name="Bash", tool_use_id="L3"),
+                now_ns=ns + offset,
+            )
+        assert len(_terminal(emitter.get_finished_spans())) == 1
+
+    def test_tombstone_absorbs_only_one_late_completion(self, emitter):
+        # Claiming CONSUMES the tombstone, so a genuinely new call with the same
+        # tool_use_id-less name still emits its own span afterwards.
+        ns = 12_199_000_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash"), now_ns=ns + 1_000_000)
+        chook._handle(_payload("Stop"), now_ns=ns + 2_000_000)  # → incomplete
+        chook._handle(  # late, absorbed
+            _payload("PostToolUse", tool_name="Bash", tool_response={}),
+            now_ns=ns + 3_000_000,
+        )
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 4_000_000)
+        chook._handle(_payload("PreToolUse", tool_name="Bash"), now_ns=ns + 5_000_000)
+        chook._handle(
+            _payload("PostToolUse", tool_name="Bash", tool_response={}),
+            now_ns=ns + 6_000_000,
+        )
+        outcomes = sorted(
+            s.attributes[chook.KESTREL_TOOL_OUTCOME]
+            for s in _terminal(emitter.get_finished_spans())
+        )
+        assert outcomes == ["completed", "incomplete"]
+
+    def test_completion_is_parented_by_its_start_not_the_live_turn(self, emitter):
+        # The tool started in turn 1; its completion lands while turn 2 is live.
+        # It belongs to turn 1 — parenting/counting it against the live turn is
+        # the phantom attribution this span shape exists to kill. Driven through
+        # the emitter directly since every dispatch path reconciles first.
+        ns = 12_199_500_000
+        chook._handle(_payload("SessionStart"), now_ns=ns)
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 1)
+        chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="P1"), now_ns=ns + 1_000_000)
+        state = chook._read_state(chook._state_path("sess-abc"))
+        pending = dict(state["pending_tools"])
+        chook._handle(_payload("UserPromptSubmit"), now_ns=ns + 2_000_000)  # turn 2
+        state = chook._read_state(chook._state_path("sess-abc"))
+        state["pending_tools"] = pending  # the start its completion still holds
+        state["terminalized"] = {}
+        tracer, _provider = chook._build_tracer("http://x", None)
+        chook._emit_tool_span(
+            tracer, state,
+            _payload("PostToolUse", tool_name="Bash", tool_use_id="P1", tool_response={}),
+            ns + 3_000_000,
+        )
+        spans = _by_name(emitter.get_finished_spans())
+        completed = [
+            s for s in _terminal(emitter.get_finished_spans())
+            if s.attributes[chook.KESTREL_TOOL_OUTCOME] == "completed"
+        ][0]
+        turn1, turn2 = spans["claude-code turn 1"], spans["claude-code turn 2"]
+        assert completed.parent.span_id == turn1.context.span_id
+        assert completed.context.trace_id == turn1.context.trace_id
+        assert completed.context.trace_id != turn2.context.trace_id
+        assert completed.attributes[chook.KESTREL_TURN_ID] == "sess-abc#1"
+        # Counted against its own (now closed) turn, never the live one.
+        assert int(state["current_turn"]["tool_count"]) == 0
 
 
 class TestPendingBounded:
@@ -842,21 +1116,27 @@ class TestPendingBounded:
         )
         assert _pending(tmp_path) == {}
 
-    def test_denied_tool_entry_evicted_after_ttl(self, emitter, tmp_path):
+    def test_unclaimed_entry_evicted_after_ttl(self, emitter, tmp_path):
+        # Reconciliation normally drains pending starts at turn end, so the TTL is
+        # a pure backstop for a session abandoned mid-turn — driven here with
+        # events that never close the turn (#84).
         ns = 12_400_000_000
         chook._handle(_payload("SessionStart"), now_ns=ns)
         chook._handle(_payload("PreToolUse", tool_name="Bash", tool_use_id="x"), now_ns=ns + 1)
-        assert _pending(tmp_path)  # unclaimed — the tool was denied
+        assert _pending(tmp_path)  # unclaimed — the tool never completed
         # Still pending just inside the TTL (a long-running tool must NOT lose
         # the start its duration is derived from).
-        chook._handle(_payload("Stop"), now_ns=ns + chook._PENDING_TTL_S * 1_000_000_000 - 1)
-        assert _pending(tmp_path)
+        chook._handle(
+            _payload("PreToolUse", tool_name="Read", tool_use_id="y"),
+            now_ns=ns + chook._PENDING_TTL_S * 1_000_000_000 - 1,
+        )
+        assert "id:x" in _pending(tmp_path)
         # Past the TTL → evicted on the next event.
         chook._handle(
-            _payload("UserPromptSubmit"),
+            _payload("PreToolUse", tool_name="Read", tool_use_id="z"),
             now_ns=ns + chook._PENDING_TTL_S * 1_000_000_000 + 1_000_000_000,
         )
-        assert _pending(tmp_path) == {}
+        assert "id:x" not in _pending(tmp_path)
 
     def test_long_running_tool_keeps_its_real_duration(self, emitter, tmp_path):
         # The TTL must exceed any realistic tool: a 10-minute build still pairs
@@ -891,4 +1171,19 @@ class TestPendingBounded:
     def test_prune_tolerates_malformed_state(self):
         state = {"pending_tools": {"id:a": "not-a-list", "id:b": [None, "x", 5]}}
         chook._prune_pending(state, now_ns=5)
-        assert state["pending_tools"] == {"id:b": [5]}
+        # Unparseable entries are dropped; the legacy bare-int start survives,
+        # normalized into the record shape reconciliation needs (#84).
+        assert state["pending_tools"] == {
+            "id:b": [
+                {"tool_name": "tool", "start_ns": 5, "tool_use_id": None, "turn": None}
+            ]
+        }
+
+    def test_legacy_bare_int_entry_reconciles_by_name(self):
+        # A state file written before the record schema holds bare timestamps: a
+        # NAME-keyed one still recovers its tool name and reconciles.
+        state = {"pending_tools": {"name:Bash": [7]}}
+        record = chook._pop_pending(state, "Bash", None)
+        assert record == {
+            "tool_name": "Bash", "start_ns": 7, "tool_use_id": None, "turn": None,
+        }

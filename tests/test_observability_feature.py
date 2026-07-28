@@ -14,6 +14,7 @@ Covers:
 10. Prometheus metrics still emitted
 """
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -35,6 +36,9 @@ from kestrel_feature_observability.hook import (
     KESTREL_TURN_ID,
     KESTREL_TURN_INDEX,
     KESTREL_MARKER,
+    KESTREL_TOOL_OUTCOME,
+    KESTREL_DENIED_COUNT,
+    KESTREL_INCOMPLETE_COUNT,
 )
 from kestrel_feature_observability.feature import ObservabilityFeature
 from kestrel_feature_observability.tracing import (
@@ -709,7 +713,7 @@ class TestSessionRootAndSummary:
 
 
 # ---------------------------------------------------------------------------
-# 3g. First-class turn spans: session ⊃ turn ⊃ tool (#55)
+# 3g. First-class turn spans: session ⊃ turn ⊃ tool ⊃ markers (#55)
 # ---------------------------------------------------------------------------
 
 class TestTurnSpans:
@@ -770,31 +774,36 @@ class TestTurnSpans:
         assert tool.context.trace_id == turn_root.context.trace_id
 
     @pytest.mark.asyncio
-    async def test_pre_tool_use_emits_no_span(self):
-        # The completed PostToolUse span is a tool call's ONLY span (#82): a tool
-        # the security/permission layer blocks before it runs must leave nothing
-        # behind — an unpaired "(started)" marker renders pinned to the turn end.
+    async def test_pre_tool_use_emits_start_marker(self):
         hook, exporter = _memory_hook()
         await hook.execute(_make_input("SessionStart"))
         await hook.execute(_make_input("UserPromptSubmit"))
-        exporter.clear()
         await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
-        assert exporter.get_finished_spans() == ()
-
-    @pytest.mark.asyncio
-    async def test_denied_tool_leaves_no_span_and_no_count(self):
-        hook, exporter = _memory_hook()
-        await hook.execute(_make_input("SessionStart"))
-        await hook.execute(_make_input("UserPromptSubmit"))
-        # PreToolUse with no PostToolUse — the permission layer denied the call.
-        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
-        await hook.execute(_make_input("Stop"))
         spans = _by_name(exporter.get_finished_spans())
-        assert not [name for name in spans if "Bash" in name]
-        assert spans["turn 1 summary"].attributes["kestrel.tool_count"] == 0
+        marker, turn_root = spans["Bash (started)"], spans["test-agent turn 1"]
+        assert marker.attributes["openinference.span.kind"] == "TOOL"
+        assert marker.attributes[KESTREL_MARKER] == "start"
+        assert marker.attributes["tool.name"] == "Bash"
+        assert marker.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        # Point span (instant), parented to the current turn.
+        assert marker.end_time == marker.start_time
+        assert marker.parent.span_id == turn_root.context.span_id
 
     @pytest.mark.asyncio
-    async def test_executed_tool_is_exactly_one_span_naming_the_tool(self):
+    async def test_start_marker_is_attribute_light(self):
+        # Keep it lean: no duration/feature/error, just name + session/turn ids.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(
+            _make_input("PreToolUse", tool_name="Bash", feature_name="Sec")
+        )
+        marker = _by_name(exporter.get_finished_spans())["Bash (started)"]
+        assert "tool.duration_ms" not in marker.attributes
+        assert "kestrel.feature_name" not in marker.attributes
+
+    @pytest.mark.asyncio
+    async def test_executed_tool_is_exactly_one_terminal_span(self):
         hook, exporter = _memory_hook()
         await hook.execute(_make_input("SessionStart"))
         await hook.execute(_make_input("UserPromptSubmit"))
@@ -808,16 +817,18 @@ class TestTurnSpans:
         tools = [
             s for s in exporter.get_finished_spans()
             if s.attributes["openinference.span.kind"] == "TOOL"
+            and KESTREL_MARKER not in s.attributes
         ]
         assert len(tools) == 1
         assert tools[0].name == "Bash"
         assert tools[0].attributes["tool.name"] == "Bash"
+        assert tools[0].attributes[KESTREL_TOOL_OUTCOME] == "completed"
         assert tools[0].end_time - tools[0].start_time == 5_000_000
 
     @pytest.mark.asyncio
     async def test_pre_tool_use_still_exports_the_session_root_early(self):
-        # No marker, but the session root is still exported on the first event so
-        # a later tool span never arrives orphaned (#42).
+        # The session root is still exported on the first event so neither the
+        # marker nor a later tool span ever arrives orphaned (#42).
         hook, exporter = _memory_hook()
         await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
         assert "test-agent" in _by_name(exporter.get_finished_spans())
@@ -833,6 +844,7 @@ class TestTurnSpans:
         expected = {
             "test-agent",
             "test-agent turn 1",
+            "Bash (started)",
             "Bash",
             "turn 1 summary",
             "session summary",
@@ -870,7 +882,7 @@ class TestTurnSpans:
         await self._drive_turn(hook)
         spans = _by_name(exporter.get_finished_spans())
         # Every span EXCEPT the pre-turn session-marker root carries turn ids.
-        for name in ("test-agent turn 1", "Bash", "turn 1 summary"):
+        for name in ("test-agent turn 1", "Bash (started)", "Bash", "turn 1 summary"):
             attrs = spans[name].attributes
             assert attrs[KESTREL_TURN_ID] == "sess-1#1"
             assert attrs[KESTREL_TURN_INDEX] == 1
@@ -957,14 +969,271 @@ class TestTurnSpans:
         assert KESTREL_TURN_ID not in tool.attributes
 
     @pytest.mark.asyncio
-    async def test_scheduler_pre_tool_use_emits_nothing(self):
-        # The scheduler pseudo-session gets a root only when a work-tick actually
-        # needs a parent — a PreToolUse tick must not mint one (#42).
+    async def test_scheduler_pre_tool_use_emits_no_start_marker(self):
+        # The scheduler pseudo-session must not emit a start marker for every
+        # (idle) tick — that would re-introduce the #42 noise, and since it never
+        # sees a Stop the pending entry would linger instead of reconciling.
         hook, exporter = _memory_hook()
         await hook.execute(
             _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
         )
         assert exporter.get_finished_spans() == ()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_start_marker_opt_in(self):
+        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
+        )
+        assert (
+            _by_name(exporter.get_finished_spans()).get("restart_coordinator (started)")
+            is not None
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3g-bis. Terminal tool outcomes: turn-end reconciliation (#84)
+# ---------------------------------------------------------------------------
+
+def _terminal_tools(exporter):
+    """The terminal (non-marker) TOOL spans — a tool's completed/incomplete twin."""
+    return [
+        s for s in exporter.get_finished_spans()
+        if s.attributes["openinference.span.kind"] == "TOOL"
+        and KESTREL_MARKER not in s.attributes
+    ]
+
+
+class TestToolOutcomes:
+    """The SDK HookInput has no per-call id and no deny event, so the in-process
+    emitter pairs pending starts by tool NAME and produces `completed` /
+    `incomplete` only — never `denied`. Reconciliation is the whole backbone."""
+
+    @pytest.mark.asyncio
+    async def test_unresolved_tool_reconciles_as_incomplete_at_stop(self):
+        # A guard/permission layer refusing a call fires no event the hook can
+        # see: the tool is simply still pending when its turn ends (#84).
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("Stop"))
+        spans = _by_name(exporter.get_finished_spans())
+        incomplete, marker = spans["Bash"], spans["Bash (started)"]
+        assert incomplete.attributes[KESTREL_TOOL_OUTCOME] == "incomplete"
+        assert incomplete.attributes["tool.success"] is False
+        # Zero-duration at the recorded start, NOT start→Stop: it never ran, so
+        # it must never draw a bar claiming runtime it did not have.
+        assert incomplete.start_time == incomplete.end_time == marker.start_time
+        assert incomplete.parent.span_id == spans["test-agent turn 1"].context.span_id
+
+    @pytest.mark.asyncio
+    async def test_refusals_counted_apart_from_executed_tools(self):
+        # A refusal is not an agent error: tool_count/error_count/success_ratio
+        # stay over EXECUTED tools, with incomplete_count as its own dimension.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Read"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Read",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("Stop"))
+        await hook.execute(_make_input("AgentTerminate"))
+        spans = _by_name(exporter.get_finished_spans())
+        for summary in (spans["turn 1 summary"], spans["session summary"]):
+            assert summary.attributes["kestrel.tool_count"] == 1
+            assert summary.attributes["kestrel.error_count"] == 0
+            assert summary.attributes["kestrel.success_ratio"] == 1.0
+            assert summary.attributes[KESTREL_INCOMPLETE_COUNT] == 1
+            # No deny signal exists in the SDK contract — always zero here.
+            assert summary.attributes[KESTREL_DENIED_COUNT] == 0
+
+    @pytest.mark.asyncio
+    async def test_completed_tool_leaves_nothing_to_reconcile(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        await hook.execute(_make_input("Stop"))
+        terminal = _terminal_tools(exporter)
+        assert [s.attributes[KESTREL_TOOL_OUTCOME] for s in terminal] == ["completed"]
+        assert _by_name(exporter.get_finished_spans())[
+            "turn 1 summary"
+        ].attributes[KESTREL_INCOMPLETE_COUNT] == 0
+
+    @pytest.mark.asyncio
+    async def test_interrupted_turn_reconciles_into_its_own_turn(self):
+        # An interrupt fires no Stop, so the leftover is reconciled when the next
+        # prompt closes the stale turn — into the ORIGINAL turn, never the new
+        # one (the phantom-attribution class this fix exists to kill).
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("UserPromptSubmit"))  # interrupted
+        spans = _by_name(exporter.get_finished_spans())
+        incomplete = spans["Bash"]
+        turn1, turn2 = spans["test-agent turn 1"], spans["test-agent turn 2"]
+        assert incomplete.attributes[KESTREL_TOOL_OUTCOME] == "incomplete"
+        assert incomplete.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        assert incomplete.parent.span_id == turn1.context.span_id
+        assert incomplete.context.trace_id == turn1.context.trace_id
+        assert incomplete.context.trace_id != turn2.context.trace_id
+        # ...and the interrupted turn is still summarized exactly once.
+        names = [s.name for s in exporter.get_finished_spans()]
+        assert names.count("turn 1 summary") == 1
+
+    @pytest.mark.asyncio
+    async def test_session_close_mid_turn_reconciles_before_totals(self):
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("AgentTerminate"))
+        spans = _by_name(exporter.get_finished_spans())
+        assert spans["Bash"].attributes[KESTREL_TOOL_OUTCOME] == "incomplete"
+        assert spans["turn 1 summary"].attributes[KESTREL_INCOMPLETE_COUNT] == 1
+        assert spans["session summary"].attributes[KESTREL_INCOMPLETE_COUNT] == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_name_tools_pair_lifo(self):
+        # Name-keyed pairing is all the SDK contract allows: the completion
+        # claims the most recent start, the other reconciles as its own span.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        await hook.execute(_make_input("Stop"))
+        outcomes = sorted(s.attributes[KESTREL_TOOL_OUTCOME] for s in _terminal_tools(exporter))
+        assert outcomes == ["completed", "incomplete"]
+
+    @pytest.mark.asyncio
+    async def test_late_completion_never_adds_a_second_terminal_span(self):
+        # A PostToolUse landing AFTER reconciliation already terminalized the
+        # call must not emit a second terminal span: one call, one terminal span.
+        # An exported OTel span cannot be re-labeled incomplete → completed, so
+        # the span already exported wins and the late duplicate is dropped.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("Stop"))          # reconciles → incomplete
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        terminal = _terminal_tools(exporter)
+        assert [s.attributes[KESTREL_TOOL_OUTCOME] for s in terminal] == ["incomplete"]
+        # ...and it is not double-counted into the session totals either.
+        await hook.execute(_make_input("AgentTerminate"))
+        session_summary = _by_name(exporter.get_finished_spans())["session summary"]
+        assert session_summary.attributes["kestrel.tool_count"] == 0
+        assert session_summary.attributes[KESTREL_INCOMPLETE_COUNT] == 1
+
+    @pytest.mark.asyncio
+    async def test_tombstone_absorbs_only_one_late_completion(self):
+        # The tombstone is consumed on claim, so a genuinely NEW same-name call
+        # with its own start still emits normally afterwards.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(_make_input("Stop"))          # reconciles → incomplete
+        await hook.execute(_make_input("PostToolUse", tool_name="Bash",
+                                       tool_response={"success": True}))  # dropped
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            )
+        )
+        outcomes = sorted(s.attributes[KESTREL_TOOL_OUTCOME] for s in _terminal_tools(exporter))
+        assert outcomes == ["completed", "incomplete"]
+        assert hook._sessions["sess-1"].terminalized == deque()
+
+    @pytest.mark.asyncio
+    async def test_completion_is_parented_by_its_start_not_the_live_turn(self):
+        # A claimed start carries the turn the tool STARTED in, and the terminal
+        # span must follow it — parenting/counting against whatever turn is live
+        # when the completion lands is the phantom attribution this span shape
+        # exists to kill. Driven directly: the dispatch paths all reconcile first,
+        # so this guards the wiring itself against a future barrier change.
+        hook, exporter = _memory_hook()
+        await hook.execute(_make_input("SessionStart"))
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="Bash"))
+        session = hook._sessions["sess-1"]
+        record = session.pending_tools["Bash"][-1]  # stamped with turn 1
+        turn_one = record.turn
+        await hook.execute(_make_input("UserPromptSubmit"))  # turn 2 is now live
+        hook._emit_tool_span(
+            session, "sess-1", "test-agent",
+            _make_input(
+                "PostToolUse", tool_name="Bash",
+                execution_time_ms=5, tool_response={"success": True},
+            ),
+            record,
+        )
+        spans = _by_name(exporter.get_finished_spans())
+        completed = [
+            s for s in _terminal_tools(exporter)
+            if s.attributes[KESTREL_TOOL_OUTCOME] == "completed"
+        ][0]
+        turn1, turn2 = spans["test-agent turn 1"], spans["test-agent turn 2"]
+        assert completed.parent.span_id == turn1.context.span_id
+        assert completed.context.trace_id == turn1.context.trace_id
+        assert completed.context.trace_id != turn2.context.trace_id
+        assert completed.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        # Counted against its own turn, never the live one.
+        assert turn_one.tool_count == 1
+        assert session.current_turn.tool_count == 0
+
+    @pytest.mark.asyncio
+    async def test_filtered_idle_scheduler_tick_leaves_nothing_pending(self):
+        # A successful idle tick is deliberately span-less (#42) — dropping its
+        # pending start too is what stops reconciliation from later mislabeling
+        # it as refused, and stops the entry leaking (scheduler sees no Stop).
+        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
+            hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input("PreToolUse", session_id="scheduler", tool_name="tick")
+        )
+        # The tick did no work → _should_emit_tool_span is False (the opt-in only
+        # covers markers/ticks that reach the emit path).
+        with patch.dict("os.environ", {}, clear=False):
+            hook._trace_scheduler = False
+            await hook.execute(
+                _make_input(
+                    "PostToolUse", session_id="scheduler", tool_name="tick",
+                    tool_response={"status": "ok", "data": {"executed": False, "pending": 0}},
+                )
+            )
+        session = hook._sessions["scheduler"]
+        assert session.pending_tools == {}
+        assert not _terminal_tools(exporter)
 
 
 # ---------------------------------------------------------------------------
