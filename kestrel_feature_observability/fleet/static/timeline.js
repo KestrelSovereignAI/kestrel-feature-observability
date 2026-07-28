@@ -96,12 +96,27 @@ const HIGHLIGHT_COLOR = "#facc15"; // exact cross-view reveal
 const ABANDONED_FILL = "#475569"; // SIGKILL'd/never-completed run — muted slate
 const ABANDONED_HATCH = "#94a3b8"; // diagonal hatch over the muted fill
 const ABANDONED_STUB_PX = 24; // childless abandoned marker → fixed stub width (paint-time)
+// A denied/incomplete tool never RAN, so the producers emit it as a truthful
+// zero-duration point span — which would paint as an unreadable 2px tick, making
+// a refusal LESS visible than the orphaned band it used to leave (#84). Paint
+// separates from data (the ABANDONED_STUB_PX precedent): the span data stays
+// zero-duration, while the bar gets a fixed width wide enough to carry its
+// "<tool> · denied" label. Visible and labeled, never claiming runtime it
+// didn't have.
+const OUTCOME_STUB_PX = 72;
 
 // A `kestrel.marker == "start"` attribute tags a provisional "<name> (started)"
 // span whose real closed span may not have arrived yet (talon in-flight): it
 // renders open-ended until the closed span pairs with it by name.
 const ATTR_MARKER = "kestrel.marker";
 const MARKER_START = "start";
+
+// How a tool call ended (`kestrel.tool_outcome`, #84): "completed" (it ran),
+// else "denied" / "incomplete" — a tool refused or aborted before it ever ran.
+// The terminal non-completed span pairs with its "(started)" marker like any
+// other twin, so the refusal renders as one visible stub instead of an orphan.
+const ATTR_TOOL_OUTCOME = "kestrel.tool_outcome";
+const OUTCOME_COMPLETED = "completed";
 
 // A non-sensitive per-call correlation id (the Claude hook's `tool_use_id`)
 // stamped on BOTH the "<tool> (started)" marker and its completed tool span, so
@@ -256,6 +271,16 @@ function toolCallId(s) {
   return v != null && v !== "" ? String(v) : null;
 }
 
+// The non-completed tool outcome of a span ("denied" / "incomplete"), else null.
+// A completed tool — and any span with no outcome stamped (older producers, non
+// tool spans) — is null, so only an explicit refusal gets the stub treatment.
+function unfinishedOutcome(s) {
+  const v = getAttr(s.attrs, ATTR_TOOL_OUTCOME);
+  if (v == null || v === "") return null;
+  const outcome = String(v);
+  return outcome === OUTCOME_COMPLETED ? null : outcome;
+}
+
 // Read the folded summary stats off a "turn <n> summary" / "session summary" span.
 function summaryStats(sum) {
   const shared = spanSummaryOf(sum);
@@ -334,6 +359,7 @@ export function annotateRenderModel(spanIter, nowMs) {
     s.rLabel = null;
     s.rAbandoned = false;
     s.rReconcile = false;
+    s.rOutcome = null;
   }
 
   // 1. Fold summaries into their owning root. A turn root absorbs the summary
@@ -450,6 +476,20 @@ export function annotateRenderModel(spanIter, nowMs) {
     if (!isNamedStartMarker(s) || s.rHide) continue;
     s.rOpen = true;
     s.rEnd = s.end;
+  }
+
+  // 2d. Terminal denied/incomplete tool spans (#84): a refused tool never ran,
+  //     so its span is honestly zero-duration — which alone would paint as an
+  //     unlabeled 2px tick. Flag it so the draw layer gives it a fixed visible
+  //     stub, and name the outcome in the label. Its "(started)" marker was
+  //     already paired away above, so the stub is the ONE bar for that call.
+  for (const s of list) {
+    if (s.rHide) continue;
+    const outcome = unfinishedOutcome(s);
+    if (!outcome) continue;
+    s.rOutcome = outcome;
+    s.rOpen = false; // terminal: never a live/provisional band
+    if (s.rLabel == null) s.rLabel = `${s.name} · ${outcome}`;
   }
 
   // 3. Turn roots: close at the summary child (step 1), else the next turn's
@@ -1680,14 +1720,21 @@ export function mount(container, opts = {}) {
         const open = isOpen(s);
         const closedEnd = s.rEnd != null ? s.rEnd : s.end;
         const sEnd = open ? rightT : closedEnd;
+        // A denied/incomplete tool is zero-duration in the DATA (it never ran),
+        // so give it a fixed visible stub at PAINT time instead of an unreadable
+        // tick — a refusal is an event operators must SEE (#84). Never coalesced
+        // into a density strip, and never wider than its own (zero) extent
+        // implies elsewhere: the stub is paint, not a duration claim.
+        const stub = !open && s.rOutcome != null;
         // A true instant (zero-width) is a tick; a turn root whose band end was
         // folded in from its summary (rEnd > start) paints as a labeled bar.
-        const tick = !open && closedEnd <= s.start;
+        const tick = !open && !stub && closedEnd <= s.start;
         const x = timeToX(s.start);
-        const rawW = tick ? 2 : (sEnd - s.start) * pxPerMs();
+        const extentW = (sEnd - s.start) * pxPerMs();
+        const rawW = tick ? 2 : stub ? Math.max(OUTCOME_STUB_PX, extentW) : extentW;
         const cx = Math.max(GUTTER_W, x);
         const w = Math.max(1, x + rawW - cx);
-        if (!tick && w < MIN_BLOCK_PX && !isHighlighted(s)) {
+        if (!tick && !stub && w < MIN_BLOCK_PX && !isHighlighted(s)) {
           // Coalesce sub-pixel blocks into a density strip.
           if (run && cx <= run.x1 + 1) {
             run.x1 = Math.max(run.x1, cx + w);

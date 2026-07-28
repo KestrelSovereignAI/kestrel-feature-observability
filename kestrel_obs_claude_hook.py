@@ -10,8 +10,8 @@ produces (:mod:`kestrel_feature_observability.hook`, #55), so Claude Code sessio
 show up in the fleet Observability Timeline exactly like kestrel agents and talon
 runs.
 
-Span shape (mirrors the #55 conventions — session ⊃ turn ⊃ tool, one trace per
-turn):
+Span shape (mirrors the #55 conventions — session ⊃ turn ⊃ tool ⊃ tool-start
+markers, one trace per turn):
 
 - ``SessionStart`` → an immediately-ended ``AGENT`` session-marker root, a fresh
   trace whose ``SpanContext`` every later span parents to. Both
@@ -24,23 +24,57 @@ turn):
 - ``UserPromptSubmit`` → a labeled ``<agent> turn <n>`` ``AGENT`` root (a **new**
   trace), ``kestrel.turn_id`` = ``<session_id>#<n>``, ``kestrel.turn_index`` = n,
   ``kestrel.marker=start``.
-- ``PreToolUse`` → NO span. Only the tool's start time is recorded (keyed by
-  ``tool_use_id`` so parallel same-name tools pair correctly) so the completing
-  event can backdate a real duration. A tool that never runs — denied or blocked
-  before execution by the permission classifier, a ``PreToolUse`` guard, or user
-  rejection — therefore produces no span at all, which is correct: the obs hook
-  can't see the guard's decision, and an unpaired ``(started)`` marker would be
-  orphaned and rendered pinned to the end of its turn (#82).
-- ``PostToolUse`` / ``PostToolUseFailure`` → the SINGLE authoritative ``TOOL``
-  span for the call: one completed span spanning the real start→end, parented to
+- ``PreToolUse`` → an instant ``<tool> (started)`` ``TOOL`` marker
+  (``kestrel.marker=start``) parented to the current turn; the start is recorded
+  as *pending* (keyed by ``tool_use_id`` so parallel same-name tools pair
+  correctly) along with the turn that was live at the time. The ``tool_use_id``
+  is also stamped as ``tool.call_id`` on the marker AND its terminal span so the
+  Timeline pairs concurrent same-name calls one-to-one.
+- ``PostToolUse`` / ``PostToolUseFailure`` → a completed ``TOOL`` span parented to
   the current turn (``tool.name`` / ``tool.success`` / truncated ``tool.error``,
-  plus ``tool.call_id`` = ``tool_use_id`` when provided). ``PostToolUse`` derives
-  success from ``tool_response``; ``PostToolUseFailure`` reports the outcome
-  out-of-band via top-level ``error`` / ``duration_ms`` and is always a failure.
-  Duration prefers the payload's own ``duration_ms`` (the real tool runtime),
-  else the gap to the recorded ``PreToolUse`` start (never negative).
-- ``Stop`` → a ``turn <n> summary`` ``CHAIN`` spanning turn-start→now (tool count,
-  duration, success ratio). The session stays open.
+  ``kestrel.tool_outcome=completed``). ``PostToolUse`` derives success from
+  ``tool_response``; ``PostToolUseFailure`` reports the outcome out-of-band via
+  top-level ``error`` / ``duration_ms`` and is always a failure. Duration prefers
+  the payload's own ``duration_ms`` (the real tool runtime), else the gap to the
+  paired ``PreToolUse`` (never negative).
+- Every tool gets exactly ONE terminal span — the three outcomes are stamped as
+  ``kestrel.tool_outcome`` (#84):
+
+  - ``PermissionDenied`` (Claude Code's auto-mode classifier refusing a call) →
+    a terminal ``TOOL`` span ``kestrel.tool_outcome=denied`` +
+    ``tool.denied_by=classifier``, paired to its marker by ``tool_use_id``.
+  - Everything else that never runs — a ``PreToolUse``-hook guard or a
+    permission rule denying the call, or an abort — fires NO event at all, so
+    the backbone is **turn-end reconciliation**: on ``Stop`` every still-pending
+    start becomes a terminal ``TOOL`` span ``kestrel.tool_outcome=incomplete``.
+    Since a turn does not end until its tools resolve, anything still open at
+    ``Stop`` was refused or aborted. Reconciliation stands alone — the explicit
+    ``PermissionDenied`` event only upgrades the label and emits sooner.
+
+  Both are **zero-duration point spans at the recorded start**: the tool never
+  ran, so it must never draw a bar claiming runtime. Each pairs with its
+  ``(started)`` marker, so a refused tool renders as a visible terminal stub —
+  not an orphaned open-ended band (#82), and not nothing at all.
+
+  "Exactly one" survives out-of-order events: each hook event is its own
+  process, so the per-session lock serializes state writes but says nothing
+  about lifecycle ORDER, and a ``PostToolUse`` can land after ``Stop`` already
+  reconciled its call. Reconciliation and ``PermissionDenied`` therefore leave a
+  bounded **tombstone** (:func:`_mark_terminalized`); a terminal event that finds
+  no pending start but does find a tombstone claims it and emits NOTHING. An
+  exported OTel span cannot be re-labeled ``incomplete`` → ``completed``, so the
+  span already exported stands rather than the late duplicate being emitted a
+  second time — double-counted and mis-parented into whatever turn is live then.
+- ``Stop`` → reconciliation, THEN a ``turn <n> summary`` ``CHAIN`` spanning
+  turn-start→now. ``kestrel.tool_count`` / ``kestrel.error_count`` /
+  ``kestrel.success_ratio`` cover **executed** tools only (a refused tool is not
+  an agent error); the distinct ``kestrel.denied_count`` /
+  ``kestrel.incomplete_count`` carry the refusals. The session stays open.
+- A turn interrupted before its ``Stop`` is reconciled at the next
+  ``UserPromptSubmit`` / ``SessionEnd``: leftovers become ``incomplete`` spans in
+  **their own** (stamped) turn context, and that turn gets its retroactive
+  ``turn <n> summary`` — so every turn is summarized exactly once and nothing is
+  attributed to the wrong turn.
 - ``SessionEnd`` (and a defensive staleness sweep) → a ``session summary``
   ``CHAIN`` aggregating the turns, then the session state file is removed.
 - ``SubagentStop`` → a nested ``AGENT`` span under the current turn (best effort).
@@ -104,19 +138,42 @@ KESTREL_TURN_INDEX = "kestrel.turn_index"
 KESTREL_MARKER = "kestrel.marker"
 KESTREL_TOOL_NAME = "tool.name"
 # Non-sensitive per-call correlation id (Claude Code's ``tool_use_id``) stamped
-# on the completed tool span so concurrent same-name calls stay distinguishable
-# (#62 P2).
+# on BOTH the ``<tool> (started)`` marker and its terminal span so the Timeline
+# pairs concurrent same-name tools one-to-one instead of the first close hiding
+# every same-name marker (#62 P2).
 KESTREL_TOOL_CALL_ID = "tool.call_id"
 _MARKER_START = "start"
+
+# How a tool call ended, stamped on EVERY terminal tool span so the three
+# outcomes are a first-class, queryable dimension rather than an inference from
+# absence (#84). ``denied`` carries ``tool.denied_by`` naming the refusing layer.
+KESTREL_TOOL_OUTCOME = "kestrel.tool_outcome"
+KESTREL_TOOL_DENIED_BY = "tool.denied_by"
+TOOL_OUTCOME_COMPLETED = "completed"
+TOOL_OUTCOME_DENIED = "denied"
+TOOL_OUTCOME_INCOMPLETE = "incomplete"
+# The only refusal Claude Code signals with an event: the auto-mode permission
+# classifier. Guard/permission-rule denials fire nothing and surface as
+# ``incomplete`` via reconciliation instead.
+_DENIED_BY_CLASSIFIER = "classifier"
+
+# Distinct summary dimensions for refused/aborted tools. Deliberately NOT folded
+# into ``kestrel.tool_count`` / ``kestrel.error_count`` / ``kestrel.success_ratio``,
+# which stay over EXECUTED tools only ("of the tools that ran, how many
+# succeeded"): a user/guard blocking a tool is not the agent erroring. Additive
+# keys → existing dashboards keep their exact semantics (#84).
+KESTREL_DENIED_COUNT = "kestrel.denied_count"
+KESTREL_INCOMPLETE_COUNT = "kestrel.incomplete_count"
+
 # OpenInference INPUT_VALUE key — the user prompt stamped on the turn root when
 # opt-in prompt capture is enabled (see ``_CAPTURE_PROMPTS_ENV``).
 _INPUT_VALUE_KEY = "input.value"
 
 # OpenInference span-kind values (uppercase literals — identical to
-# ``tracing.KIND_*`` on both the SDK-present and fallback paths). ``TOOL`` is not
-# needed here: the one tool span per call goes through ``emit_tool_span``.
+# ``tracing.KIND_*`` on both the SDK-present and fallback paths).
 _KIND_AGENT = "AGENT"
 _KIND_CHAIN = "CHAIN"
+_KIND_TOOL = "TOOL"
 
 # Standard OTLP endpoint env vars — drive the no-op-when-unset behavior.
 _ENDPOINT_ENVS = (
@@ -150,13 +207,14 @@ _DEFAULT_TTL_S = 6 * 3600
 _MAX_STALE_SWEEP = 16
 
 # Unclaimed tool-start bookkeeping (#82). A ``PreToolUse`` start is popped by its
-# completing event; a tool denied/blocked before it runs never fires one, so its
-# entry would leak into the state file forever. Evict entries older than this TTL
-# on every event — comfortably longer than any realistic tool runtime (so a
-# still-running tool never loses the start that gives its span a real duration),
-# far shorter than the session TTL (so leaked entries die well within a session).
-# No env knob: the TTL is the mechanism, the entry cap is a pure backstop against
-# pathological growth inside the window.
+# completing event, and turn-end reconciliation drains whatever is left (#84), so
+# this sweep is a pure BACKSTOP for a session abandoned mid-turn (no ``Stop``, no
+# ``SessionEnd``). Evict entries older than this TTL on every event — comfortably
+# longer than any realistic tool runtime (so a still-running tool never loses the
+# start that gives its span a real duration), far shorter than the session TTL (so
+# leaked entries die well within a session). No env knob: the TTL is the
+# mechanism, the entry cap is a pure backstop against pathological growth inside
+# the window.
 _PENDING_TTL_S = 30 * 60
 _MAX_PENDING_STARTS = 256
 
@@ -479,14 +537,22 @@ def _remote_parent(ids: Dict[str, str]) -> Any:
 # Span emission (mirrors kestrel_feature_observability.hook)
 # ---------------------------------------------------------------------------
 
-def _scope_attrs(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Session + current-turn ids stamped on every span of a turn."""
+def _turn_attrs(state: Dict[str, Any], turn: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Session + (given) turn ids stamped on every span of a turn.
+
+    Taking the turn explicitly is what lets reconciliation stamp a leftover tool
+    with its OWN turn rather than whichever turn happens to be current (#84).
+    """
     attrs = _session_attrs(state.get("session_id"))
-    turn = state.get("current_turn")
     if turn:
         attrs[KESTREL_TURN_ID] = turn["turn_id"]
         attrs[KESTREL_TURN_INDEX] = turn["index"]
     return attrs
+
+
+def _scope_attrs(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Session + CURRENT-turn ids stamped on every span of a turn."""
+    return _turn_attrs(state, state.get("current_turn"))
 
 
 def _session_attrs(session_id: Any) -> Dict[str, Any]:
@@ -530,8 +596,11 @@ def _new_session(
         "turn_count": 0,
         "tool_count": 0,
         "success_count": 0,
+        "denied_count": 0,
+        "incomplete_count": 0,
         "current_turn": None,
         "pending_tools": {},
+        "terminalized": {},
     }
 
 
@@ -593,29 +662,76 @@ def _start_turn(
         "started_ns": now_ns,
         "tool_count": 0,
         "success_count": 0,
+        "denied_count": 0,
+        "incomplete_count": 0,
     }
 
 
-def _record_tool_start(state: Dict[str, Any], payload: Dict[str, Any], now_ns: int) -> None:
-    """``PreToolUse`` → record the start; emit NOTHING (#82).
+def _emit_tool_start(tracer: Any, state: Dict[str, Any], payload: Dict[str, Any], now_ns: int) -> None:
+    """``PreToolUse`` → an instant ``<tool> (started)`` marker parented to the current turn.
 
-    The completing ``PostToolUse`` / ``PostToolUseFailure`` span is the single
-    authoritative tool span, so a tool denied/blocked before it ever runs simply
-    produces no span — correct, since it did not run. (This hook is a separate
-    ``PreToolUse`` hook and cannot see a guard's decision, so a marker emitted
-    here would be orphaned: no completing twin, and the Timeline pins an unpaired
-    marker to the end of its turn.)
-
-    The start is still recorded so the completing event can backdate a real
-    duration: keyed by ``tool_use_id`` when Claude Code provides one so
-    concurrent same-name tools (parallel Bash calls) pair to their OWN start,
-    else by name. Entries never claimed by a completing event are evicted by
-    :func:`_prune_pending`.
+    ``PreToolUse`` fires BEFORE the permission check, so even a to-be-denied tool
+    emits this marker — a tool attempt is visible the moment it starts. Its
+    terminal twin always follows (completed / denied / reconciled-incomplete), so
+    the marker is never left orphaned (#84).
     """
     tool_name = str(payload.get("tool_name") or "tool")
+    tool_use_id = payload.get("tool_use_id")
+    attrs = _scope_attrs(state)
+    attrs[KESTREL_MARKER] = _MARKER_START
+    attrs[KESTREL_TOOL_NAME] = tool_name
+    # Stamp the per-call id so the Timeline pairs THIS marker with its own
+    # terminal span even when concurrent same-name tools share the turn (#62 P2).
+    if tool_use_id:
+        attrs[KESTREL_TOOL_CALL_ID] = str(tool_use_id)
+    tracer.emit_span(
+        f"{tool_name} (started)",
+        _KIND_TOOL,
+        parent=_turn_parent(state),
+        start_time=now_ns,
+        end_time=now_ns,
+        agent_name=_AGENT_NAME,
+        attributes=attrs,
+    )
+    # Record the start so the completing event can backdate a real duration and
+    # turn-end reconciliation can represent a tool that never completes. Keyed by
+    # tool_use_id when Claude Code provides one so concurrent same-name tools
+    # (parallel Bash calls) pair to their OWN start; fall back to the name. The
+    # entry carries the turn that was live at PreToolUse time, so a leftover
+    # reconciled later still lands in ITS OWN turn (#84).
     pending = state.setdefault("pending_tools", {})
-    key = _pending_key(tool_name, payload.get("tool_use_id"))
-    pending.setdefault(key, []).append(now_ns)
+    key = _pending_key(tool_name, tool_use_id)
+    pending.setdefault(key, []).append(
+        {
+            "tool_name": tool_name,
+            "start_ns": now_ns,
+            "tool_use_id": str(tool_use_id) if tool_use_id else None,
+            "turn": _turn_snapshot(state),
+        }
+    )
+
+
+def _turn_snapshot(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A frozen copy of the live turn (ids + counters) to stamp into a pending entry.
+
+    The state file round-trips through JSON between invocations, so a pending
+    entry can't hold a reference — it holds this snapshot. When the turn is still
+    live at reconciliation time the LIVE dict is preferred (accurate counters);
+    the snapshot is the fallback for a turn that has already been closed.
+    """
+    turn = state.get("current_turn")
+    return dict(turn) if turn else None
+
+
+def _turn_of_record(state: Dict[str, Any], record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The pending entry's turn — the LIVE dict when it is the same turn, else the snapshot."""
+    stamped = record.get("turn")
+    if not stamped:
+        return None
+    live = state.get("current_turn")
+    if live and live.get("index") == stamped.get("index"):
+        return live
+    return stamped
 
 
 def _pending_key(tool_name: str, tool_use_id: Any) -> str:
@@ -625,53 +741,293 @@ def _pending_key(tool_name: str, tool_use_id: Any) -> str:
     return f"name:{tool_name}"
 
 
-def _pop_pending(state: Dict[str, Any], tool_name: str, tool_use_id: Any) -> Optional[int]:
-    """Pop the start paired to this call (by ``tool_use_id``, else the tool name LIFO)."""
+def _name_from_key(key: Any) -> str:
+    """The tool name a pending key encodes — recoverable only for name-keyed entries."""
+    text = str(key)
+    return text[len("name:"):] if text.startswith("name:") else "tool"
+
+
+def _pending_record(key: Any, entry: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a persisted pending entry, tolerating the legacy bare-``int`` form.
+
+    Reconciliation needs the tool NAME (unrecoverable from an ``id:<tool_use_id>``
+    key), so entries are records now; a state file written by an older release
+    still holds bare start timestamps and must not crash or be dropped. Anything
+    unparseable yields ``None`` and is discarded.
+    """
+    if isinstance(entry, dict):
+        try:
+            start_ns = int(entry["start_ns"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        turn = entry.get("turn")
+        return {
+            "tool_name": str(entry.get("tool_name") or _name_from_key(key)),
+            "start_ns": start_ns,
+            "tool_use_id": entry.get("tool_use_id"),
+            "turn": turn if isinstance(turn, dict) else None,
+        }
+    if isinstance(entry, (int, float)) and not isinstance(entry, bool):
+        return {
+            "tool_name": _name_from_key(key),
+            "start_ns": int(entry),
+            "tool_use_id": None,
+            "turn": None,
+        }
+    return None
+
+
+def _pop_pending(
+    state: Dict[str, Any], tool_name: str, tool_use_id: Any
+) -> Optional[Dict[str, Any]]:
+    """Pop the record paired to this call (by ``tool_use_id``, else the tool name LIFO)."""
     pending = state.get("pending_tools") or {}
     key = _pending_key(tool_name, tool_use_id)
-    stack: List[int] = pending.get(key) or []
+    stack: List[Any] = pending.get(key) or []
+    while stack:
+        record = _pending_record(key, stack.pop())
+        if not stack:
+            pending.pop(key, None)
+        if record is not None:
+            return record
+    return None
+
+
+def _mark_terminalized(state: Dict[str, Any], record: Dict[str, Any], now_ns: int) -> None:
+    """Tombstone a call that got its terminal span WITHOUT a completing event (#84).
+
+    Reconciliation (``incomplete``) and ``PermissionDenied`` (``denied``) both
+    terminalize a call whose ``PostToolUse`` / ``PostToolUseFailure`` may still be
+    in flight — hook events run as separate processes, so the per-session lock
+    serializes writes but guarantees nothing about lifecycle ORDER. The tombstone
+    is what lets the late event recognize that this call is already terminal.
+
+    Completed calls are deliberately NOT tombstoned: their terminal event has by
+    definition already arrived, and tombstoning every call would let the
+    name-keyed fallback (no ``tool_use_id``) swallow a later same-name call.
+    """
+    key = _pending_key(record["tool_name"], record.get("tool_use_id"))
+    state.setdefault("terminalized", {}).setdefault(key, []).append(now_ns)
+
+
+def _claim_terminalized(state: Dict[str, Any], tool_name: str, tool_use_id: Any) -> bool:
+    """Whether this terminal event closes a call that is ALREADY terminal (#84).
+
+    A ``PostToolUse`` arriving after reconciliation emitted the call's
+    ``incomplete`` span would otherwise be treated as a brand-new call: a SECOND
+    terminal span for one call, double-counted and parented to whatever turn is
+    current by then. An OTLP span cannot be retroactively re-labeled
+    ``incomplete`` → ``completed``, so the honest resolution is to keep the
+    terminal span already exported and drop the late duplicate.
+
+    With a ``tool_use_id`` the match is exact; the name-keyed fallback is LIFO,
+    the same imprecision :func:`_pop_pending` already accepts. Claiming consumes
+    the tombstone, so only ONE late event per terminalized call is absorbed.
+    """
+    tombstones = state.get("terminalized")
+    if not isinstance(tombstones, dict) or not tombstones:
+        return False
+    key = _pending_key(tool_name, tool_use_id)
+    stack = tombstones.get(key)
+    if not isinstance(stack, list) or not stack:
+        return False
+    stack.pop()
     if not stack:
-        return None
-    start = stack.pop()
-    if not stack:
-        pending.pop(key, None)
-    return int(start)
+        tombstones.pop(key, None)
+    return True
+
+
+def _prune_terminalized(state: Dict[str, Any], now_ns: int) -> None:
+    """Bound the tombstones — same TTL/cap backstop as the pending starts.
+
+    A late terminal event follows its reconciliation closely, so anything older
+    than :data:`_PENDING_TTL_S` has no completion left to absorb. Runs AFTER
+    dispatch so the current event always sees its own tombstone.
+    """
+    tombstones = state.get("terminalized")
+    if not isinstance(tombstones, dict) or not tombstones:
+        return
+    cutoff = now_ns - _PENDING_TTL_S * 1_000_000_000
+    fresh: List[Any] = []  # (ns, key)
+    for key, stack in tombstones.items():
+        if not isinstance(stack, list):
+            continue
+        for entry in stack:
+            if not isinstance(entry, (int, float)) or isinstance(entry, bool):
+                continue
+            if int(entry) < cutoff:
+                continue
+            fresh.append((int(entry), key))
+    if len(fresh) > _MAX_PENDING_STARTS:
+        fresh.sort(key=lambda item: item[0], reverse=True)
+        del fresh[_MAX_PENDING_STARTS:]
+    rebuilt: Dict[str, List[Any]] = {}
+    for ns, key in sorted(fresh, key=lambda item: item[0]):
+        rebuilt.setdefault(key, []).append(ns)
+    state["terminalized"] = rebuilt
 
 
 def _prune_pending(state: Dict[str, Any], now_ns: int) -> None:
     """Bound the unclaimed tool starts — TTL first, then a hard cap (#82).
 
-    A tool denied/blocked before it runs fires ``PreToolUse`` but never a
-    completing event, so :func:`_pop_pending` never claims its entry. Sweeping on
-    every event keeps the state file bounded without ever evicting a start a
-    still-running tool still needs (:data:`_PENDING_TTL_S` is far longer than any
-    realistic tool, so a long build never collapses to a zero-duration span).
-    Runs AFTER the event is dispatched so the current event always sees its own
-    pending start. Malformed entries (a hand-edited / half-written state file)
-    are dropped rather than raising.
+    Turn-end reconciliation drains pending starts into terminal ``incomplete``
+    spans (#84), so this is a pure BACKSTOP for a session abandoned mid-turn
+    (neither ``Stop`` nor ``SessionEnd`` ever arrives). It keeps the state file
+    bounded without ever evicting a start a still-running tool needs
+    (:data:`_PENDING_TTL_S` is far longer than any realistic tool, so a long build
+    never collapses to a zero-duration span). Runs AFTER the event is dispatched
+    so the current event always sees its own pending start. Malformed entries (a
+    hand-edited / half-written state file) are dropped rather than raising.
     """
     pending = state.get("pending_tools")
     if not isinstance(pending, dict) or not pending:
         return
     cutoff = now_ns - _PENDING_TTL_S * 1_000_000_000
-    fresh: List[Any] = []  # (start_ns, key)
+    fresh: List[Any] = []  # (start_ns, key, record)
     for key, stack in pending.items():
         if not isinstance(stack, list):
             continue
-        fresh.extend(
-            (int(ns), key)
-            for ns in stack
-            if isinstance(ns, (int, float)) and ns >= cutoff
-        )
+        for entry in stack:
+            record = _pending_record(key, entry)
+            if record is None or record["start_ns"] < cutoff:
+                continue
+            fresh.append((record["start_ns"], key, record))
     # Backstop against pathological growth inside the TTL window: keep the most
     # recent starts (the ones a completing event is most likely to claim).
     if len(fresh) > _MAX_PENDING_STARTS:
-        fresh.sort(reverse=True)
+        fresh.sort(key=lambda item: item[0], reverse=True)
         del fresh[_MAX_PENDING_STARTS:]
-    rebuilt: Dict[str, List[int]] = {}
-    for ns, key in sorted(fresh):  # ascending → each stack stays LIFO-correct
-        rebuilt.setdefault(key, []).append(ns)
+    rebuilt: Dict[str, List[Any]] = {}
+    # Ascending → each stack stays LIFO-correct.
+    for _ns, key, record in sorted(fresh, key=lambda item: item[0]):
+        rebuilt.setdefault(key, []).append(record)
     state["pending_tools"] = rebuilt
+
+
+def _emit_outcome_span(
+    tracer: Any,
+    state: Dict[str, Any],
+    record: Dict[str, Any],
+    turn: Optional[Dict[str, Any]],
+    outcome: str,
+    denied_by: Optional[str] = None,
+) -> None:
+    """Emit the terminal span for a tool that never ran (denied / incomplete).
+
+    A **zero-duration point span at the recorded start**: the tool never
+    executed, so a start→now bar would claim runtime it never had (the phantom
+    long-bar failure this shape exists to avoid). Parented to the pending
+    record's OWN turn so a leftover reconciled after that turn ended still nests
+    where it belongs — and pairs with its ``(started)`` marker there.
+    """
+    start_ns = int(record["start_ns"])
+    attrs = _turn_attrs(state, turn)
+    attrs[KESTREL_TOOL_NAME] = record["tool_name"]
+    attrs[KESTREL_TOOL_OUTCOME] = outcome
+    if denied_by:
+        attrs[KESTREL_TOOL_DENIED_BY] = denied_by
+    if record.get("tool_use_id"):
+        attrs[KESTREL_TOOL_CALL_ID] = str(record["tool_use_id"])
+    parent_ids = (turn or {}).get("root") or state.get("session_root")
+    tracer.emit_tool_span(
+        record["tool_name"],
+        parent=_remote_parent(parent_ids) if parent_ids else None,
+        start_time=start_ns,
+        end_time=start_ns,
+        agent_name=_AGENT_NAME,
+        extra={"tool.success": False},
+        attributes=attrs,
+    )
+
+
+def _emit_denied_span(
+    tracer: Any, state: Dict[str, Any], payload: Dict[str, Any], now_ns: int
+) -> None:
+    """``PermissionDenied`` → an explicit terminal ``denied`` span (#84).
+
+    The one refusal Claude Code signals with an event (the auto-mode permission
+    classifier). Best effort by design: reconciliation is the guaranteed backbone,
+    and this only upgrades the label from ``incomplete`` to ``denied`` and emits
+    sooner. A denial with no recorded start (e.g. the marker was pruned) still
+    emits, anchored at ``now``.
+    """
+    tool_name = str(payload.get("tool_name") or "tool")
+    tool_use_id = payload.get("tool_use_id")
+    record = _pop_pending(state, tool_name, tool_use_id)
+    if record is None:
+        # No pending start: either reconciliation already terminalized this call
+        # (then it HAS its span — never emit a second) or the marker was pruned
+        # (then anchor the denial at ``now``).
+        if _claim_terminalized(state, tool_name, tool_use_id):
+            return
+        record = {
+            "tool_name": tool_name,
+            "start_ns": now_ns,
+            "tool_use_id": str(tool_use_id) if tool_use_id else None,
+            "turn": _turn_snapshot(state),
+        }
+    turn = _turn_of_record(state, record)
+    _emit_outcome_span(
+        tracer, state, record, turn, TOOL_OUTCOME_DENIED, denied_by=_DENIED_BY_CLASSIFIER
+    )
+    # The tool never ran, so its ``PostToolUse`` never fires — but tombstone it
+    # anyway so a stray completing event can't add a second terminal span (#84).
+    _mark_terminalized(state, record, now_ns)
+    if turn is not None:
+        turn["denied_count"] = int(turn.get("denied_count", 0)) + 1
+    state["denied_count"] = int(state.get("denied_count", 0)) + 1
+
+
+def _reconcile_pending(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
+    """Turn-end reconciliation — the backbone of honest tool outcomes (#84).
+
+    A turn does not end until its tools resolve, so anything still pending here
+    was refused (a ``PreToolUse`` guard or a permission rule — neither fires any
+    event this hook can see) or aborted. Each becomes a terminal ``incomplete``
+    span in its own turn, counted in the distinct ``incomplete_count`` dimension
+    rather than as an agent error.
+
+    A leftover can only belong to a turn that never saw its ``Stop`` (a normal
+    ``Stop`` reconciles everything pending), so any stranded turn is also given
+    its retroactive ``turn <n> summary`` — bounded to the last activity observed
+    in it, never the live edge.
+    """
+    pending = state.get("pending_tools")
+    if not isinstance(pending, dict) or not pending:
+        return
+    records: List[Dict[str, Any]] = []
+    for key, stack in pending.items():
+        if not isinstance(stack, list):
+            continue
+        for entry in stack:
+            record = _pending_record(key, entry)
+            if record is not None:
+                records.append(record)
+    state["pending_tools"] = {}
+    records.sort(key=lambda record: record["start_ns"])
+
+    live = state.get("current_turn")
+    stranded: Dict[Any, List[Any]] = {}  # turn index → [turn, last activity ns]
+    for record in records:
+        turn = _turn_of_record(state, record)
+        _emit_outcome_span(tracer, state, record, turn, TOOL_OUTCOME_INCOMPLETE)
+        # Tombstone the call: it now HAS its terminal span, so a ``PostToolUse``
+        # that lands after this barrier must not emit a second one (#84).
+        _mark_terminalized(state, record, now_ns)
+        state["incomplete_count"] = int(state.get("incomplete_count", 0)) + 1
+        if turn is None:
+            continue
+        turn["incomplete_count"] = int(turn.get("incomplete_count", 0)) + 1
+        if live and live.get("index") == turn.get("index"):
+            continue  # the live turn is summarized by the caller
+        seen = stranded.get(turn.get("index"))
+        if seen is None:
+            stranded[turn.get("index")] = [turn, record["start_ns"]]
+        else:
+            seen[1] = max(seen[1], record["start_ns"])
+
+    for turn, latest in stranded.values():
+        _emit_turn_summary(tracer, state, turn, latest)
 
 
 def _tool_success(resp: Any) -> bool:
@@ -731,14 +1087,25 @@ def _emit_tool_span(
     ``duration_ms`` and is ALWAYS a failure. Duration prefers the payload's own
     ``duration_ms`` (the real tool runtime), else the gap to the paired
     ``PreToolUse`` (never negative).
+
+    The span is parented, attributed AND counted against the turn the tool
+    STARTED in (stamped on its pending record), never whichever turn is current
+    now: a completion that lands after its turn closed belongs to its own turn,
+    not to the one that happens to be live (#84).
     """
     tool_name = str(payload.get("tool_name") or "tool")
     tool_use_id = payload.get("tool_use_id")
     success = False if failed else _tool_success(payload.get("tool_response"))
 
-    # Always pop the paired PreToolUse start so pending state can't leak, even
-    # when the payload's own duration_ms ultimately wins.
-    start_ns = _pop_pending(state, tool_name, tool_use_id)
+    # Always pop the paired PreToolUse start so it can't leak into reconciliation
+    # as a phantom `incomplete`, even when the payload's own duration_ms wins.
+    pending = _pop_pending(state, tool_name, tool_use_id)
+    if pending is None and _claim_terminalized(state, tool_name, tool_use_id):
+        # A completion for a call already terminalized as ``incomplete``/``denied``:
+        # emitting now would give ONE call two terminal spans, the second one
+        # double-counted and parented to the wrong turn (#84).
+        return
+    start_ns = pending["start_ns"] if pending is not None else None
     duration_ms = _payload_duration_ms(payload)
     if duration_ms is not None:
         span_start = max(now_ns - int(duration_ms * 1_000_000), 0)
@@ -753,9 +1120,19 @@ def _emit_tool_span(
     if duration_ms is not None:
         extra["tool.duration_ms"] = duration_ms
 
-    attrs = _scope_attrs(state)
+    # The turn the tool started in. A legacy pending entry (written before the
+    # turn stamp existed) carries none — the live turn is then the best available
+    # attribution, as is a completion whose start was never recorded.
+    if pending is not None and pending.get("turn"):
+        turn = _turn_of_record(state, pending)
+    else:
+        turn = state.get("current_turn")
+
+    attrs = _turn_attrs(state, turn)
     attrs[KESTREL_TOOL_NAME] = tool_name
-    # The per-call id keeps concurrent same-name calls distinguishable (#62 P2).
+    attrs[KESTREL_TOOL_OUTCOME] = TOOL_OUTCOME_COMPLETED
+    # The per-call id pairs this span with its own "(started)" marker among
+    # concurrent same-name calls (#62 P2).
     if tool_use_id:
         attrs[KESTREL_TOOL_CALL_ID] = str(tool_use_id)
     if not success:
@@ -763,9 +1140,10 @@ def _emit_tool_span(
         if err:
             attrs["tool.error"] = err
 
+    parent_ids = (turn or {}).get("root") or state.get("session_root")
     tracer.emit_tool_span(
         tool_name,
-        parent=_turn_parent(state),
+        parent=_remote_parent(parent_ids) if parent_ids else None,
         start_time=span_start,
         end_time=now_ns,
         agent_name=_AGENT_NAME,
@@ -776,7 +1154,6 @@ def _emit_tool_span(
     state["tool_count"] = int(state.get("tool_count", 0)) + 1
     if success:
         state["success_count"] = int(state.get("success_count", 0)) + 1
-    turn = state.get("current_turn")
     if turn:
         turn["tool_count"] = int(turn.get("tool_count", 0)) + 1
         if success:
@@ -797,34 +1174,59 @@ def _emit_subagent(tracer: Any, state: Dict[str, Any], payload: Dict[str, Any], 
     )
 
 
-def _close_turn(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
-    """``Stop`` → a ``turn <n> summary`` ``CHAIN`` (session stays open)."""
-    turn = state.get("current_turn")
-    if not turn:
+def _emit_turn_summary(
+    tracer: Any, state: Dict[str, Any], turn: Dict[str, Any], end_ns: int
+) -> None:
+    """A ``turn <n> summary`` ``CHAIN`` for the given turn, closing its band.
+
+    Also used retroactively for a turn interrupted before its ``Stop``, so every
+    turn — completed or interrupted — is summarized exactly once (#84).
+    """
+    if turn.get("summarized"):
         return
+    turn["summarized"] = True
+    started_ns = int(turn["started_ns"])
+    end_ns = max(end_ns, started_ns)
     tool_count = int(turn.get("tool_count", 0))
     success_count = int(turn.get("success_count", 0))
     success_ratio = (success_count / tool_count) if tool_count else 1.0
-    duration_ms = (now_ns - int(turn["started_ns"])) / 1_000_000
+    duration_ms = (end_ns - started_ns) / 1_000_000
     tracer.emit_span(
         f"turn {turn['index']} summary",
         _KIND_CHAIN,
         parent=_remote_parent(turn["root"]),
-        start_time=int(turn["started_ns"]),
-        end_time=now_ns,
+        start_time=started_ns,
+        end_time=end_ns,
         agent_name=_AGENT_NAME,
         extra={
+            # Executed tools only — a refused tool is not an agent error (#84).
             "kestrel.tool_count": tool_count,
             "kestrel.error_count": tool_count - success_count,
             "kestrel.success_ratio": success_ratio,
+            KESTREL_DENIED_COUNT: int(turn.get("denied_count", 0)),
+            KESTREL_INCOMPLETE_COUNT: int(turn.get("incomplete_count", 0)),
             # Unified go-forward duration key across turn + session summaries.
             "kestrel.duration_ms": duration_ms,
             # Legacy per-scope duration key, emitted alongside for back-compat
             # with existing dashboards / the #62 renderer; drop in a future major.
             "kestrel.turn_duration_ms": duration_ms,
         },
-        attributes=_scope_attrs(state),
+        attributes=_turn_attrs(state, turn),
     )
+
+
+def _close_turn(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
+    """End the turn: reconcile leftovers FIRST, then emit its summary.
+
+    Reconciliation runs before the summary so the turn's ``incomplete_count`` is
+    complete when the summary is stamped. Also drives ``UserPromptSubmit``, which
+    closes a turn interrupted before its ``Stop`` (#84).
+    """
+    _reconcile_pending(tracer, state, now_ns)
+    turn = state.get("current_turn")
+    if not turn:
+        return
+    _emit_turn_summary(tracer, state, turn, now_ns)
     state["current_turn"] = None
 
 
@@ -833,6 +1235,10 @@ def _close_session(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
     root = state.get("session_root")
     if not root:
         return
+    # Reconcile + summarize a turn abandoned without its ``Stop`` before the
+    # session totals are stamped, so no tool and no turn goes unrepresented when
+    # a session ends mid-turn (#84).
+    _close_turn(tracer, state, now_ns)
     tool_count = int(state.get("tool_count", 0))
     success_count = int(state.get("success_count", 0))
     success_ratio = (success_count / tool_count) if tool_count else 1.0
@@ -847,9 +1253,12 @@ def _close_session(tracer: Any, state: Dict[str, Any], now_ns: int) -> None:
         agent_name=_AGENT_NAME,
         extra={
             "kestrel.turn_count": int(state.get("turn_count", 0)),
+            # Executed tools only — a refused tool is not an agent error (#84).
             "kestrel.tool_count": tool_count,
             "kestrel.error_count": tool_count - success_count,
             "kestrel.success_ratio": success_ratio,
+            KESTREL_DENIED_COUNT: int(state.get("denied_count", 0)),
+            KESTREL_INCOMPLETE_COUNT: int(state.get("incomplete_count", 0)),
             # Unified go-forward duration key across turn + session summaries.
             "kestrel.duration_ms": duration_ms,
             # Legacy per-scope duration key (back-compat); drop in a future major.
@@ -940,19 +1349,28 @@ def _dispatch(
         return _new_session(tracer, session_id, project, now_ns)
     if event == "UserPromptSubmit":
         state = _ensure_session(tracer, state, session_id, project, now_ns)
+        # A turn still live here never saw its ``Stop`` (interrupted): close it —
+        # reconciling its leftovers into ITS OWN turn — before minting the next
+        # one, so nothing is ever attributed to the new turn (#84).
+        _close_turn(tracer, state, now_ns)
         _start_turn(tracer, state, session_id, now_ns, prompt=payload.get("prompt"))
         return state
     if event == "PreToolUse":
-        # No span: the completing event owns the tool's only span (#82). The
-        # session root is still ensured so a later span never arrives orphaned.
         state = _ensure_session(tracer, state, session_id, project, now_ns)
-        _record_tool_start(state, payload, now_ns)
+        _emit_tool_start(tracer, state, payload, now_ns)
         return state
     if event in ("PostToolUse", "PostToolUseFailure"):
         state = _ensure_session(tracer, state, session_id, project, now_ns)
         _emit_tool_span(
             tracer, state, payload, now_ns, failed=(event == "PostToolUseFailure")
         )
+        return state
+    if event == "PermissionDenied":
+        # The auto-mode permission classifier refused the call — the one denial
+        # Claude Code signals with an event. Reconciliation would catch it at
+        # ``Stop`` anyway; this only upgrades the label and emits sooner (#84).
+        state = _ensure_session(tracer, state, session_id, project, now_ns)
+        _emit_denied_span(tracer, state, payload, now_ns)
         return state
     if event == "Stop":
         if state is not None:
@@ -1009,9 +1427,12 @@ def _handle(payload: Dict[str, Any], now_ns: Optional[int] = None) -> None:
             )
             if state is not None:
                 state["last_event_ns"] = now_ns
-                # Evict tool starts no completing event ever claimed (denied /
-                # blocked tools) so the state file stays bounded (#82).
+                # Backstop only: turn-end reconciliation normally drains pending
+                # starts (#84); this bounds a session abandoned mid-turn (#82).
                 _prune_pending(state, now_ns)
+                # Same backstop for the terminalized-call tombstones, which a
+                # late completing event claims (or never comes for at all).
+                _prune_terminalized(state, now_ns)
                 try:
                     _write_state_atomic(state_path, state)
                 except Exception as e:  # noqa: BLE001 - a write failure is non-fatal
