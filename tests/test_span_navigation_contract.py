@@ -308,11 +308,18 @@ process.stdout.write(JSON.stringify({
         "toolCount": 3,
         "errorCount": 1,
         "successRatio": 0.666,
+        # Additive refusal/heartbeat dimensions (#88) — absent here, so null.
+        "deniedCount": None,
+        "incompleteCount": None,
+        "idleCount": None,
     }
     labels = [field["label"] for field in result["fields"]]
     assert labels == [
         "name",
         "kind",
+        # Derived marker-role, promoted to a first-class row (#88); this TOOL
+        # span has no outcome/feature/run/turn stamped, so those rows are omitted.
+        "role",
         "status",
         "state",
         "started",
@@ -354,6 +361,246 @@ process.stdout.write(JSON.stringify({
     assert nav["agentName"] == "talon"
     assert nav["sessionId"] == "session-1"
     assert result["workerlessNavigatorTarget"]["worker"] is None
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_detail_promotes_outcome_role_identity_and_membership(tmp_path):
+    """#88: hover/popover answer "what is this?" from already-stamped attributes.
+
+    Before this, a span hover read "Claw / Agent / Instant / Ok" and the popover
+    buried `tool_outcome` / `marker` / `feature_name` / `orchestrator` /
+    `run_id` / `turn_id` / `denied_count` / `incomplete_count` under the
+    collapsed "Raw attributes". They are promoted to first-class rows in the
+    SHARED contract, so the Timeline popover and the Navigator inspector cannot
+    drift apart — and the tooltip renders off that same normalized detail.
+    """
+    pkg = _module_dir(tmp_path)
+    (pkg / "detail.mjs").write_text(
+        r"""
+import {
+  normalizeSpanDetail,
+  spanDetailFields,
+  spanTooltipLines,
+  renderSpanDetail,
+} from "./phoenix.js";
+
+const T0 = Date.parse("2026-07-24T12:00:00.000Z");
+const iso = (ms) => new Date(ms).toISOString();
+const kestrel = (attrs) => JSON.stringify({ kestrel: attrs });
+
+// A classifier-refused tool carrying the full #88 attribute set. It is anchored
+// zero-duration at the recorded start — the tool never ran (#84).
+const denied = normalizeSpanDetail({
+  id: "denied-node",
+  name: "Bash",
+  spanKind: "TOOL",
+  startTime: iso(T0 + 2000),
+  endTime: iso(T0 + 2000),
+  latencyMs: 0,
+  statusCode: "ERROR",
+  parentId: "turn-span",
+  context: { spanId: "denied-span", traceId: "trace-3" },
+  attributes: kestrel({
+    agent_name: "claude-code",
+    session_id: "session-9",
+    tool_outcome: "denied",
+    feature_name: "ReflectionFeature",
+    orchestrator: "codex",
+    run_id: "run-77",
+    turn_id: "session-9#4",
+    turn_index: 4,
+    denied_count: 2,
+    incomplete_count: 1,
+    repo: "owner/repo",
+    agent_did: "did:key:zAbc",
+  }),
+});
+
+// A 0ms tool-start marker: a point in time, not a tool that ran in no time.
+const marker = normalizeSpanDetail({
+  id: "marker-node",
+  name: "Bash (started)",
+  spanKind: "TOOL",
+  startTime: iso(T0 + 1000),
+  endTime: iso(T0 + 1000),
+  latencyMs: 0,
+  statusCode: "OK",
+  parentId: "turn-span",
+  context: { spanId: "marker-span", traceId: "trace-3" },
+  attributes: kestrel({ marker: "start", session_id: "session-9" }),
+});
+
+// A 0ms turn root whose caller supplied what its subtree covers.
+const turnRoot = normalizeSpanDetail(
+  {
+    id: "turn-node",
+    name: "claude-code turn 4",
+    spanKind: "AGENT",
+    startTime: iso(T0),
+    endTime: iso(T0),
+    latencyMs: 0,
+    statusCode: "OK",
+    context: { spanId: "turn-span", traceId: "trace-3" },
+    attributes: kestrel({ marker: "start", turn_index: 4, session_id: "session-9" }),
+  },
+  { members: { count: 12, startMs: T0, endMs: T0 + 300_000 } },
+);
+
+// An idle scheduler heartbeat DID run — it just did nothing — so it stays a
+// completed interval, never a point event.
+const idle = normalizeSpanDetail({
+  id: "idle-node",
+  name: "scheduler tick",
+  spanKind: "TOOL",
+  startTime: iso(T0),
+  endTime: iso(T0 + 40),
+  latencyMs: 40,
+  statusCode: "OK",
+  parentId: "sched-root",
+  context: { spanId: "idle-span", traceId: "trace-4" },
+  attributes: kestrel({ tool_outcome: "idle", session_id: "scheduler" }),
+});
+
+// The virtual scheduler session band (#87): no summary ever reconciles it, so
+// its identity and heartbeat count ARE the answer.
+const band = normalizeSpanDetail(
+  { name: "session scheduler", kind: "session", start: T0, end: T0 + 3_600_000, rOpen: false },
+  {
+    sessionId: "scheduler",
+    durationMs: 3_600_000,
+    members: {
+      count: 43,
+      startMs: T0,
+      endMs: T0 + 3_600_000,
+      virtual: true,
+      heartbeatCount: 40,
+      workCount: 3,
+      features: ["StrategicMemoryFeature", "ReflectionFeature"],
+      lastIdleMs: T0 + 3_500_000,
+      lastWorkMs: T0 + 1_000_000,
+    },
+  },
+);
+
+// A bare span stamped with none of it: every promoted row must be absent.
+const bare = normalizeSpanDetail({
+  id: "bare-node",
+  name: "plain",
+  spanKind: "TOOL",
+  startTime: iso(T0),
+  endTime: iso(T0 + 500),
+  latencyMs: 500,
+  statusCode: "OK",
+  parentId: "turn-span",
+  context: { spanId: "bare-span", traceId: "trace-5" },
+  attributes: "{}",
+});
+
+const shape = (detail) => ({
+  role: detail.role,
+  outcome: detail.outcome,
+  state: detail.state,
+  fields: Object.fromEntries(spanDetailFields(detail).map((f) => [f.label, f.value])),
+  labels: spanDetailFields(detail).map((f) => f.label),
+  tip: spanTooltipLines(detail).map((line) => line.text),
+});
+
+process.stdout.write(JSON.stringify({
+  denied: { ...shape(denied), stats: denied.stats },
+  marker: shape(marker),
+  turnRoot: shape(turnRoot),
+  idle: shape(idle),
+  band: { ...shape(band), members: band.members, html: renderSpanDetail(band, { rawAttributes: false }) },
+  bare: shape(bare),
+}));
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [NODE, str(pkg / "detail.mjs")],
+        cwd=pkg,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    result = json.loads(proc.stdout)
+
+    # ── The refused tool: every stamped signal is a first-class row ──
+    denied = result["denied"]
+    assert denied["fields"]["role"] == "tool span"
+    assert denied["fields"]["outcome"] == "denied"
+    assert denied["fields"]["feature"] == "ReflectionFeature"
+    assert denied["fields"]["orchestrator"] == "codex"
+    assert denied["fields"]["run"] == "run-77"
+    assert denied["fields"]["turn"] == "4"
+    assert denied["fields"]["turn ID"] == "session-9#4"
+    assert denied["fields"]["denied"] == "2"
+    assert denied["fields"]["incomplete"] == "1"
+    assert denied["fields"]["repo"] == "owner/repo"
+    assert denied["fields"]["agent DID"] == "did:key:zAbc"
+    assert denied["stats"]["deniedCount"] == 2
+    assert denied["stats"]["incompleteCount"] == 1
+    # A refused tool never ran, so it is anchored zero-duration: "completed"
+    # would contradict the outcome row sitting right above it.
+    assert denied["state"] == "point event"
+    # The hover that used to read "Bash / TOOL / instant / ok".
+    assert denied["tip"][0] == "TOOL · tool span · denied · point event · error"
+    assert "feature: ReflectionFeature" in denied["tip"]
+    assert "orchestrator: codex" in denied["tip"]
+    assert "run run-77 · turn 4" in denied["tip"]
+    assert "2 denied · 1 incomplete" in denied["tip"]
+
+    # ── 0ms markers/roots read as what they are, not as "completed" ──
+    assert result["marker"]["role"] == "tool-start marker"
+    assert result["marker"]["state"] == "point event"
+    assert result["marker"]["tip"][0] == "TOOL · tool-start marker · point event · ok"
+    assert result["turnRoot"]["role"] == "turn root"
+    assert result["turnRoot"]["state"] == "point event"
+    # A root's own geometry is a point — what it COVERS is the useful answer.
+    assert result["turnRoot"]["fields"]["covers"] == "12 spans over 5m 0s"
+    assert "covers 12 spans over 5m 0s" in result["turnRoot"]["tip"]
+
+    # An idle heartbeat ran and did nothing — an interval, not a point event.
+    assert result["idle"]["outcome"] == "idle"
+    assert result["idle"]["state"] == "completed"
+
+    # ── The virtual scheduler band identifies itself ──
+    band = result["band"]
+    assert band["fields"]["session type"] == "virtual scheduler session"
+    assert band["fields"]["covers"] == "43 spans over 60m 0s"
+    assert band["fields"]["heartbeats"] == "40"
+    assert band["fields"]["work ticks"] == "3"
+    assert band["fields"]["scheduled features"] == (
+        "StrategicMemoryFeature, ReflectionFeature"
+    )
+    assert "last idle" in band["labels"]
+    assert "last work" in band["labels"]
+    assert "virtual scheduler session" in band["tip"]
+    assert "covers 43 spans over 60m 0s · 40 heartbeats · 3 ticks" in band["tip"]
+    assert "virtual scheduler session" in band["html"]
+
+    # ── Additive only: an unstamped span renders none of the new rows ──
+    bare_labels = result["bare"]["labels"]
+    for absent in (
+        "outcome",
+        "feature",
+        "orchestrator",
+        "run",
+        "turn",
+        "turn ID",
+        "repo",
+        "agent DID",
+        "denied",
+        "incomplete",
+        "idle",
+        "covers",
+        "heartbeats",
+        "work ticks",
+        "session type",
+    ):
+        assert absent not in bare_labels, f"blank {absent!r} row rendered"
+    assert result["bare"]["state"] == "completed"  # a real interval, honestly
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")

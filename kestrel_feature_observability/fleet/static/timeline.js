@@ -40,6 +40,12 @@ import {
   ATTR_OUTPUT_VALUE,
   ATTR_MODEL_NAME,
   ATTR_RUN_ID,
+  ATTR_MARKER,
+  MARKER_START,
+  ATTR_TOOL_OUTCOME,
+  ATTR_FEATURE_NAME,
+  OUTCOME_COMPLETED,
+  OUTCOME_IDLE,
   mintPhoenixSession,
   gql,
   PROJECTS_QUERY,
@@ -56,6 +62,7 @@ import {
   spanSummaryOf,
   normalizeSpanDetail,
   renderSpanDetail,
+  spanTooltipLines,
   buildNavigatorRevealTarget,
 } from "./phoenix.js";
 
@@ -115,20 +122,16 @@ const IDLE_COLOR = "#2dd4bf"; // teal — alive but idle
 const HEARTBEAT_PX = 3; // one heartbeat beat's paint width
 const HEARTBEAT_LABEL_PX = 56; // a coalesced run at least this wide is labeled
 
-// A `kestrel.marker == "start"` attribute tags a provisional "<name> (started)"
-// span whose real closed span may not have arrived yet (talon in-flight): it
-// renders open-ended until the closed span pairs with it by name.
-const ATTR_MARKER = "kestrel.marker";
-const MARKER_START = "start";
-
-// How a tool call ended (`kestrel.tool_outcome`, #84/#87): "completed" (it ran
-// and did something), "idle" (it ran and did nothing — a scheduler heartbeat),
-// else "denied" / "incomplete" — a tool refused or aborted before it ever ran.
-// The terminal non-completed span pairs with its "(started)" marker like any
-// other twin, so the refusal renders as one visible stub instead of an orphan.
-const ATTR_TOOL_OUTCOME = "kestrel.tool_outcome";
-const OUTCOME_COMPLETED = "completed";
-const OUTCOME_IDLE = "idle";
+// The marker / tool-outcome contract lives in phoenix.js (imported above), so the
+// Timeline's pairing rules and the shared detail model read the SAME keys:
+// `kestrel.marker == "start"` tags a provisional "<name> (started)" span whose
+// real closed span may not have arrived yet (talon in-flight) — it renders
+// open-ended until the closed span pairs with it by name — and
+// `kestrel.tool_outcome` (#84/#87) says how a tool call ended: "completed" (it
+// ran and did something), "idle" (it ran and did nothing — a scheduler
+// heartbeat), else "denied" / "incomplete" — refused or aborted before it ever
+// ran. The terminal non-completed span pairs with its "(started)" marker like
+// any other twin, so a refusal renders as one visible stub instead of an orphan.
 
 // The emitter's per-process scheduler pseudo-session (`kestrel.session_id`), the
 // VIRTUAL session every cron tick parents into. Its band is rendered as discrete
@@ -353,20 +356,6 @@ function turnLabel(s, stats) {
     }
   }
   return parts.join(" · ");
-}
-
-// Human duration for a span's own bar (folded summary duration wins for turn
-// bands; a zero-width closed span is "instant"; an open span is "running").
-function durText(s) {
-  if (s.rAbandoned) return "abandoned";
-  if (isOpen(s)) return "running";
-  if (s.rSummary && s.rSummary.durationMs != null) {
-    const d = fmtDuration(s.rSummary.durationMs);
-    if (d) return d;
-  }
-  const end = s.rEnd != null ? s.rEnd : s.end;
-  if (end <= s.start) return "instant";
-  return fmtDuration(end - s.start);
 }
 
 // Resolve the render model over a set of normalized spans (see block comment
@@ -755,6 +744,81 @@ export function schedulerBandModel(members) {
   };
 }
 
+// ── Member rollup: what a container span actually holds (#88) ──
+//
+// A session/turn root is a zero-duration POINT — its own geometry says nothing
+// about its subtree — and the virtual `scheduler` pseudo-root is the extreme
+// case (#87): the immortal band whose members are every heartbeat. Walk the same
+// parent index the layout uses, counting members, their true time extent, and
+// (for the scheduler) the heartbeat/work split, the features ticking under it
+// and when each last ran. Feeds the shared detail model's "covers N spans over
+// Xh" row, so hover, popover and the Navigator inspector all agree.
+//
+// Counting matches what the operator can SEE: `buildLayout` drops `rHide` spans
+// (paired-away "(started)" markers, folded turn/session summaries) from every
+// lane, so counting them here would report a 5-tool turn as ~11 spans — the same
+// rule `schedulerBandModel` already applies to its tick counts. Run
+// `annotateRenderModel` first; without it nothing is hidden and every span
+// counts.
+//
+// Pure + exported for the render-model tests: `spans` is the Phoenix node id →
+// span map and `childrenByParent` the parent OTel spanId → Set<node id> index,
+// exactly as `mount` maintains them.
+export function spanMemberRollup(s, spans, childrenByParent) {
+  const kids = s.spanId ? childrenByParent.get(s.spanId) : null;
+  if (!kids || !kids.size) return null;
+  const scheduler = isSchedulerSpan(s);
+  const stack = [...kids];
+  const seen = new Set();
+  const features = new Set();
+  let count = 0;
+  let firstMs = s.start;
+  let lastMs = s.rEnd != null ? s.rEnd : s.end;
+  let heartbeatCount = 0;
+  let workCount = 0;
+  let lastIdleMs = null;
+  let lastWorkMs = null;
+  while (stack.length) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const c = spans.get(id);
+    if (!c) continue;
+    // Time extent covers the WHOLE subtree, hidden spans included: a folded
+    // `turn <n> summary` never renders a bar but carries the turn's honest end.
+    if (c.start < firstMs) firstMs = c.start;
+    const cEnd = c.rEnd != null ? c.rEnd : c.end;
+    if (cEnd > lastMs) lastMs = cEnd;
+    for (const gid of childrenByParent.get(c.spanId) || []) stack.push(gid);
+    if (c.rHide) continue; // render chrome, not a member
+    count += 1;
+    const feature = getAttr(c.attrs, ATTR_FEATURE_NAME);
+    if (feature != null && feature !== "") features.add(String(feature));
+    if (isIdleBeat(c)) {
+      heartbeatCount += 1;
+      if (lastIdleMs == null || c.start > lastIdleMs) lastIdleMs = c.start;
+    } else if (c.kind === "TOOL" && !isMarker(c) && !isSummary(c)) {
+      workCount += 1;
+      if (lastWorkMs == null || c.start > lastWorkMs) lastWorkMs = c.start;
+    }
+  }
+  if (!count) return null;
+  return {
+    count,
+    startMs: firstMs,
+    endMs: lastMs,
+    virtual: scheduler,
+    // Heartbeats/ticks identify the virtual scheduler session; elsewhere they
+    // are noise, so they're reported only when the band IS one or actually has
+    // beats.
+    heartbeatCount: scheduler || heartbeatCount ? heartbeatCount : null,
+    workCount: scheduler ? workCount : null,
+    features: [...features],
+    lastIdleMs: scheduler ? lastIdleMs : null,
+    lastWorkMs: scheduler ? lastWorkMs : null,
+  };
+}
+
 // Local wall-clock HH:MM:SS for the ruler ticks and tooltips.
 function fmtClock(ms, withSeconds) {
   const d = new Date(ms);
@@ -819,6 +883,7 @@ export function mount(container, opts = {}) {
   const collapsed = new Set(); // collapsed project names
   let layout = { rows: [], contentH: 0 };
   let drawn = []; // {x,y,w,h,span?,density?,count} for hit-testing (per frame)
+  const rollupCache = new Map(); // spanId → memberRollup (invalidated by buildLayout)
 
   // ── DOM scaffold ──
   container.innerHTML = `
@@ -1478,6 +1543,9 @@ export function mount(container, opts = {}) {
 
   function buildLayout() {
     const nowMs = Date.now();
+    // Member rollups are derived from the spans + the annotations resolved just
+    // below, so both go stale here together.
+    rollupCache.clear();
     // Resolve the render model first: pair "(started)" markers with their twin,
     // close turn bands at their summary/next-turn, fold summaries. rHide spans
     // (paired markers, summary bars) are then excluded from every lane (#62).
@@ -2037,6 +2105,74 @@ export function mount(container, opts = {}) {
     return null;
   }
 
+  // ── Shared detail model (hover tooltip + click popover) ──
+  //
+  // Hover and click answer the same questions, so they resolve the same
+  // `normalizeSpanDetail` model — one contract with the Navigator inspector
+  // (#88). Only the surface differs: the tooltip renders `spanTooltipLines`,
+  // the popover the full field list.
+
+  // `mousemove` resolves a detail for every span it crosses, and a rollup is a
+  // whole-subtree walk — so memoize it. `rollupCache` (declared with the layout
+  // cache above) is cleared by `buildLayout`, the one place spans and their
+  // render annotations change (poll, history page, collapse, view change).
+  function memberRollupCached(s) {
+    if (!s.spanId) return spanMemberRollup(s, spans, childrenByParent);
+    if (rollupCache.has(s.spanId)) return rollupCache.get(s.spanId);
+    const rollup = spanMemberRollup(s, spans, childrenByParent);
+    rollupCache.set(s.spanId, rollup);
+    return rollup;
+  }
+
+  function spanDetail(s) {
+    return normalizeSpanDetail(s, {
+      sessionId: resolveSessionId(s),
+      members: memberRollupCached(s),
+    });
+  }
+
+  // The session band is not a span, but it answers the same questions — so it
+  // resolves through the same model, with its members standing in for a subtree.
+  function bandDetail(b) {
+    const end = b.open ? viewEnd : b.end;
+    const sch = b.scheduler;
+    const title = b.sessionId
+      ? `session ${b.sessionId}`
+      : b.traceId
+        ? `trace ${b.traceId}`
+        : "session";
+    return normalizeSpanDetail(
+      { name: title, kind: "session", start: b.start, end, rOpen: b.open === true },
+      {
+        sessionId: b.sessionId,
+        traceId: b.traceId,
+        summary: b.summary || undefined,
+        durationMs: end > b.start ? end - b.start : null,
+        members: {
+          count: b.count,
+          startMs: b.start,
+          endMs: end,
+          virtual: Boolean(sch),
+          heartbeatCount: sch ? sch.idleCount : null,
+          workCount: sch ? sch.workCount : null,
+        },
+      },
+    );
+  }
+
+  function tipHtml(detail) {
+    return (
+      `<b>${escapeHtml(detail.displayName)}</b>` +
+      spanTooltipLines(detail)
+        .map(
+          ({ text, tone }) =>
+            `<div class="${tone === "warn" ? "obs-tl__tipwarn" : "obs-tl__tipdim"}">` +
+            `${escapeHtml(text)}</div>`,
+        )
+        .join("")
+    );
+  }
+
   // ── Tooltip ──
   function showTip(d, clientX, clientY) {
     if (d.project) {
@@ -2047,36 +2183,13 @@ export function mount(container, opts = {}) {
     if (d.density) {
       html = `<b>${d.density} spans</b><div class="obs-tl__tipdim">coalesced · zoom in to expand</div>`;
     } else if (d.band) {
-      const b = d.band;
-      const title = b.sessionId
-        ? `session ${b.sessionId}`
-        : b.traceId
-          ? `trace ${b.traceId}`
-          : "session";
-      const dur = b.end > b.start ? fmtDuration((b.open ? viewEnd : b.end) - b.start) : "";
-      // Fold the session summary stats (tool count, success ratio) into the
-      // band hover when present (#62).
-      const sum = b.summary;
-      const stats = sum
-        ? `${sum.toolCount != null ? `${sum.toolCount} tool${sum.toolCount === 1 ? "" : "s"}` : ""}${
-            sum.successRatio != null ? ` · ${Math.round(sum.successRatio * 100)}% ok` : ""
-          }`
-        : "";
-      html =
-        `<b>${escapeHtml(title)}</b>` +
-        `<div class="obs-tl__tipdim">${b.count} span${b.count === 1 ? "" : "s"}${
-          dur ? ` · ${escapeHtml(dur)}` : ""
-        }${b.open ? " · live" : ""}</div>` +
-        (stats.trim() ? `<div class="obs-tl__tipdim">${escapeHtml(stats.trim())}</div>` : "");
+      html = tipHtml(bandDetail(d.band));
     } else if (d.span) {
-      const s = d.span;
-      html =
-        `<b>${escapeHtml(s.rLabel || s.name)}</b>` +
-        `<div class="obs-tl__tipdim">${escapeHtml(s.kind)} · ${escapeHtml(durText(s))} · ${escapeHtml(s.status)}</div>` +
-        (s.rAbandoned
-          ? `<div class="obs-tl__tipwarn">⚠ abandoned — no completion recorded</div>`
-          : "") +
-        (s.model ? `<div class="obs-tl__tipdim">model: ${escapeHtml(s.model)}</div>` : "");
+      // The hover reads off the SAME normalized detail the click popover
+      // renders — role/outcome/feature/orchestrator/run/turn, and for a
+      // container what it covers — instead of the old generic
+      // "<name> / AGENT / instant / ok" (#88).
+      html = tipHtml(spanDetail(d.span));
     } else {
       hideTip();
       return;
@@ -2124,8 +2237,7 @@ export function mount(container, opts = {}) {
   }
 
   function showPopover(s, clientX, clientY) {
-    const sessionId = resolveSessionId(s);
-    const detail = normalizeSpanDetail(s, { sessionId });
+    const detail = spanDetail(s);
     const canNav = Boolean(
       openNavigator &&
         detail.projectId &&
@@ -2180,31 +2292,19 @@ export function mount(container, opts = {}) {
 
   // The session band's click popover: the folded `session summary` stats (turn /
   // tool count, success ratio, duration) so the band answers "what was this
-  // session" without a duplicate summary bar (#62).
+  // session" without a duplicate summary bar (#62) — rendered through the shared
+  // detail contract, so a summary-LESS band (notably the virtual scheduler
+  // session, which never reconciles) still identifies itself and reports what it
+  // covers (#88).
   function showBandPopover(b, clientX, clientY) {
-    const sum = b.summary;
-    if (!sum) return;
-    const rows = [];
-    const add = (k, v) => {
-      if (v == null || v === "") return;
-      rows.push(
-        `<div class="obs-tl__prow"><span class="obs-tl__pk">${escapeHtml(k)}</span>` +
-          `<span class="obs-tl__pv">${escapeHtml(String(v))}</span></div>`,
-      );
-    };
-    if (sum.turnCount != null) add("turns", sum.turnCount);
-    if (sum.toolCount != null) add("tools", sum.toolCount);
-    if (sum.successRatio != null) add("success", `${Math.round(sum.successRatio * 100)}%`);
-    add("duration", fmtDuration((b.open ? viewEnd : b.end) - b.start));
-    if (b.sessionId) add("session", b.sessionId);
-    if (b.traceId) add("trace", b.traceId);
-    const title = b.sessionId ? `session ${b.sessionId}` : "session";
+    const detail = bandDetail(b);
+    const title = detail.displayName;
     popEl.innerHTML = `
       <div class="obs-tl__phead">
         <span class="obs-tl__ptitle" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
         <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
       </div>
-      <div class="obs-tl__pbody">${rows.join("")}</div>`;
+      <div class="obs-tl__pbody">${renderSpanDetail(detail, { rawAttributes: false })}</div>`;
     popEl.hidden = false;
     const rect = bodyEl.getBoundingClientRect();
     let x = clientX - rect.left + 12;
@@ -2307,9 +2407,7 @@ export function mount(container, opts = {}) {
       canvas.style.cursor = "pointer";
       showTip(d, e.clientX, e.clientY);
     } else if (d && d.band) {
-      // A band with folded summary stats is clickable (session popover); a bare
-      // grouping envelope stays informational.
-      canvas.style.cursor = d.band.summary ? "pointer" : "default";
+      canvas.style.cursor = "pointer";
       showTip(d, e.clientX, e.clientY);
     } else {
       canvas.style.cursor = d && d.project ? "pointer" : "default";
@@ -2348,10 +2446,9 @@ export function mount(container, opts = {}) {
       return;
     }
     if (d.band) {
-      // A band with folded summary stats opens a session popover; a bare
-      // grouping envelope stays decorative.
-      if (d.band.summary) showBandPopover(d.band, clientX, clientY);
-      else hidePopover();
+      // Every band opens its session popover: even without folded summary stats
+      // it names the session and reports what it covers (#88).
+      showBandPopover(d.band, clientX, clientY);
       return;
     }
     if (d.density) {
