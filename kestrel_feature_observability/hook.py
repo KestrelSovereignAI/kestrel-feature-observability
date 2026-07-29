@@ -64,19 +64,29 @@ no held-open spans; every span exports immediately — #42, #55):
   (:meth:`close`) — emitting the true ``session summary`` (parented to the session
   root) aggregating turns (turn count + totals). No held-open spans.
 
-Scheduler noise (#42): scheduler-sourced ACTION ticks (``session_id ==
-"scheduler"``) that performed no work are the every-minute infra no-op that
-buries real traces, so their spans are **not** emitted — only ticks that
-executed / deferred / failed something get a span. Set
-``KESTREL_OTEL_TRACE_SCHEDULER=1`` to re-enable full tick tracing for debugging.
+Scheduler heartbeats (#87, retiring the #42 drop): scheduler-sourced ACTION ticks
+(``session_id == "scheduler"``) that performed no work used to be **dropped** as
+every-minute infra noise. That made an idle-but-alive heartbeat indistinguishable
+from a dead one — you saw nothing either way — so the drop is gone: every tick
+emits, unconditionally. An idle tick is instead **labeled**
+``kestrel.tool_outcome=idle`` (the 4th outcome alongside
+``completed``/``denied``/``incomplete``) and counted on the additive
+``kestrel.idle_count`` summary key, kept OUT of
+``kestrel.tool_count``/``kestrel.error_count``/``kestrel.success_ratio`` exactly
+like the refusal dimensions — "executed successfully, did nothing" is its own
+legible category, not a success that dilutes the ratio. Volume is purely a
+render-time concern (the Timeline styles heartbeats distinctly and aggregates
+dense runs into a visible "N heartbeats" count); emission is never suppressed.
+``KESTREL_OTEL_TRACE_SCHEDULER`` is accepted but **ignored** (deprecated no-op).
+
 A scheduler tick's ``tool_response`` is the serialized ``ToolResult`` envelope a
 feature tool returns (``{"status": "ok", "confirmation": ..., "data": {...}}``,
 plus ``tool``/``success`` from the tool wrapper): the outcome ``status`` sits at
 the top level while the machine-readable **work counters live nested under
 ``data``** (e.g. ``restart_coordinator`` idles at
-``data={"executed": False, "pending": 0}``). The no-op filter therefore inspects
-BOTH the top level and the nested ``data`` payload — scanning only the top level
-never matches the real envelope.
+``data={"executed": False, "pending": 0}``). The idle classifier therefore
+inspects BOTH the top level and the nested ``data`` payload — scanning only the
+top level never matches the real envelope.
 
 INV-SOLO: when ``OTEL_EXPORTER_OTLP_ENDPOINT`` (or the traces-specific var) is
 unset, :class:`KestrelTracer` is a no-op — no provider, no exporter, no network —
@@ -137,28 +147,32 @@ KESTREL_TOOL_NAME = "tool.name"
 # ``kestrel.marker`` value stamped on the instant turn-root and tool-start spans.
 _MARKER_START = "start"
 
-# How a tool call ended — stamped on EVERY terminal tool span so the three
+# How a tool call ended — stamped on EVERY terminal tool span so the four
 # outcomes are a first-class, queryable dimension rather than an inference from
-# absence (#84). ``completed`` = it ran (the ``PostToolUse`` span); ``denied`` =
-# an explicit refusal signal; ``incomplete`` = it was still pending when its turn
-# ended (a guard/permission-rule denial or an abort — no event ever fires for
-# those, which is why turn-end reconciliation, not the deny signal, is the
-# backbone). ``denied``/``incomplete`` spans are zero-duration point spans: the
-# tool never ran, so it must never draw a bar claiming runtime.
+# absence (#84/#87). ``completed`` = it ran and did something (the ``PostToolUse``
+# span); ``idle`` = it ran successfully and did NOTHING (a scheduler heartbeat);
+# ``denied`` = an explicit refusal signal; ``incomplete`` = it was still pending
+# when its turn ended (a guard/permission-rule denial or an abort — no event ever
+# fires for those, which is why turn-end reconciliation, not the deny signal, is
+# the backbone). ``denied``/``incomplete`` spans are zero-duration point spans:
+# the tool never ran, so it must never draw a bar claiming runtime.
 KESTREL_TOOL_OUTCOME = "kestrel.tool_outcome"
 TOOL_OUTCOME_COMPLETED = "completed"
+TOOL_OUTCOME_IDLE = "idle"
 TOOL_OUTCOME_DENIED = "denied"
 TOOL_OUTCOME_INCOMPLETE = "incomplete"
 
-# Distinct summary dimensions for the refused/aborted tools. Deliberately NOT
-# folded into ``kestrel.tool_count`` / ``kestrel.error_count`` /
-# ``kestrel.success_ratio``, which stay over EXECUTED tools only ("of the tools
-# that ran, how many succeeded"): a user/guard blocking a tool is not the agent
-# erroring, and conflating them would make every denial read as a fault in
-# existing fleet dashboards. Additive keys → existing dashboards keep their exact
-# semantics while denials become their own visible dimension (#84).
+# Distinct summary dimensions for the refused/aborted tools and the idle
+# heartbeats. Deliberately NOT folded into ``kestrel.tool_count`` /
+# ``kestrel.error_count`` / ``kestrel.success_ratio``, which stay over EXECUTED,
+# WORKING tools only ("of the tools that did something, how many succeeded"): a
+# user/guard blocking a tool is not the agent erroring, and an every-minute idle
+# heartbeat is not a success worth diluting the ratio with. Additive keys →
+# existing dashboards keep their exact semantics while denials (#84) and
+# heartbeats (#87) become their own visible dimensions.
 KESTREL_DENIED_COUNT = "kestrel.denied_count"
 KESTREL_INCOMPLETE_COUNT = "kestrel.incomplete_count"
+KESTREL_IDLE_COUNT = "kestrel.idle_count"
 
 # Bound on the per-session tombstones for calls reconciliation already
 # terminalized (#84). Each reconciled tool leaves one entry so a LATE
@@ -166,6 +180,27 @@ KESTREL_INCOMPLETE_COUNT = "kestrel.incomplete_count"
 # terminal span; a late completion follows its reconciliation closely, so the
 # ``deque`` evicts the OLDEST entry once the cap is reached.
 _MAX_TERMINALIZED = 256
+
+# Bound on the per-tool-name pending starts one session may hold (#87). Pairing
+# is name-keyed LIFO — a completing event always claims the NEWEST start — so
+# once a stack is this deep, the entries at its BOTTOM can never be claimed by
+# any future completion: they are leftovers from calls that never completed.
+#
+# Turn-end reconciliation is normally what collects those, but it only runs from
+# ``_close_turn``/``_close_session`` — and the ``scheduler`` pseudo-session is
+# IMMORTAL: minted once per process and reused for its whole lifetime, it never
+# sees a ``Stop`` or ``AgentTerminate``, so it never reconciles. Every scheduler
+# tick now records a pending start (#87 retired the #42 suppression, because the
+# Timeline pairs the ``(started)`` marker with the tick's terminal span), which
+# makes this bound load-bearing rather than defensive: a cron tool that fires
+# ``PreToolUse`` and never completes would otherwise grow the stack once a minute
+# for the life of the process.
+#
+# Eviction is not a silent drop — the evicted leftover gets the same terminal
+# ``incomplete`` span + tombstone reconciliation would have given it, anchored at
+# its own recorded start, so it stays visible and honestly timed (#87's "an
+# unrepresented tool is worse than a noisy one").
+_MAX_PENDING_PER_TOOL = 64
 
 # OpenInference INPUT_VALUE attribute key — the user prompt stamped on the turn
 # root when opt-in prompt capture is enabled (see ``_CAPTURE_PROMPTS_ENV``).
@@ -190,10 +225,15 @@ _SERVICE_NAME = "kestrel-agent"
 
 # Session id the scheduler stamps on the PRE/POST_TOOL_USE hooks it fires on each
 # tick (kestrel_sovereign SchedulerFeature._run_tool_hook_gated). Used to single
-# out scheduler-sourced ticks for the no-op noise filter (#42).
+# out scheduler-sourced ticks so an idle one can be LABELED
+# ``kestrel.tool_outcome=idle`` (#87) — never to decide whether it is emitted.
 _SCHEDULER_SESSION_ID = "scheduler"
 
-# Env opt-in: re-enable full scheduler-tick tracing (including no-op ticks).
+# DEPRECATED no-op (#87). This used to opt back into tracing idle scheduler
+# ticks, which were dropped by default (#42). Idle ticks now always emit — an
+# idle heartbeat is activity and hiding it made "idle" indistinguishable from
+# "dead" — so the flag has nothing left to enable. Still read (and ignored) so an
+# operator whose wiring sets it keeps working unchanged.
 _TRACE_SCHEDULER_ENV = "KESTREL_OTEL_TRACE_SCHEDULER"
 
 # Explicit idle / no-op status markers a scheduler ACTION tick may report
@@ -297,12 +337,14 @@ def _tick_success(tool_response: Any) -> bool:
 def _scheduler_tick_did_work(tool_response: Any) -> bool:
     """Whether a scheduler ACTION tick actually did something this poll.
 
-    Emit a span only for ticks that executed / deferred / failed real work; a
-    successful tick that reports nothing done is the every-minute infra no-op
-    that buries real traces (#42) — e.g. ``restart_coordinator`` returning
+    Classifies the tick's OUTCOME — it no longer gates emission (#87). A
+    successful tick that reports nothing done is an idle heartbeat, e.g.
+    ``restart_coordinator`` returning
     ``{"status": "ok", "data": {"executed": False, "pending": 0}}`` on an idle
-    minute. Opaque or unrecognized results default to ``True`` (emit) so a real
-    trace is never dropped.
+    minute; its span is stamped ``kestrel.tool_outcome=idle`` so idle is
+    distinguishable from work at render time instead of being invisible. Opaque
+    or unrecognized results default to ``True`` (work) so a real tick is never
+    mislabeled a heartbeat.
 
     Feature tools return the serialized ``ToolResult`` envelope: the top level
     carries ``status``/``confirmation``/``error`` (+ ``tool``/``success`` from
@@ -346,8 +388,10 @@ class _TurnState:
 
     Holds only the ended turn-root span (for its ``SpanContext``, the new
     per-turn trace root) and counters — NEVER a held-open span (#42/#55).
-    ``tool_count``/``success_count`` cover EXECUTED tools only; refused/aborted
-    tools land in the distinct ``denied_count``/``incomplete_count`` (#84).
+    ``tool_count``/``success_count`` cover EXECUTED, WORKING tools only;
+    refused/aborted tools land in the distinct
+    ``denied_count``/``incomplete_count`` (#84) and idle scheduler heartbeats in
+    ``idle_count`` (#87).
     """
 
     root: Any            # the ended turn-root span (holds the turn trace root SpanContext)
@@ -358,6 +402,7 @@ class _TurnState:
     success_count: int = 0
     denied_count: int = 0
     incomplete_count: int = 0
+    idle_count: int = 0
     # Guards the "exactly one summary per turn" invariant: a turn interrupted
     # before its ``Stop`` is summarized retroactively at the next prompt/session
     # close, and must not be summarized twice if a late ``Stop`` still arrives.
@@ -397,6 +442,7 @@ class _SessionState:
     success_count: int = 0
     denied_count: int = 0
     incomplete_count: int = 0
+    idle_count: int = 0
     turn_count: int = 0                       # monotonic turn counter
     current_turn: Optional[_TurnState] = None  # the live turn, if any
     # Tool starts awaiting a completing event, keyed by tool name (the SDK's
@@ -424,7 +470,9 @@ class ObservabilityHook(Hook):
         # Frozen at construction. A no-op tracer when OTEL_EXPORTER_OTLP_ENDPOINT
         # (or the traces-specific var) is unset — never blocks, never networks.
         self._tracer: KestrelTracer = configure_tracing(service_name=_SERVICE_NAME)
-        # Frozen at construction: whether to trace no-op scheduler ticks too.
+        # Read but DELIBERATELY UNUSED — the deprecated #42 opt-in (#87). Idle
+        # scheduler ticks now always emit, so there is nothing to enable; parsed
+        # here so existing wiring that sets it neither errors nor changes behavior.
         self._trace_scheduler: bool = _env_flag(_TRACE_SCHEDULER_ENV)
         # Frozen at construction: opt-in turn-root prompt capture + its cap.
         self._capture_prompts: bool = _env_flag(_CAPTURE_PROMPTS_ENV)
@@ -588,20 +636,6 @@ class ObservabilityHook(Hook):
     # Tool lifecycle: start marker → pending bookkeeping → terminal span
     # ------------------------------------------------------------------
 
-    def _should_emit_tool_start(self, input: HookInput) -> bool:
-        """Whether this PreToolUse should emit a tool-start marker + pending entry.
-
-        Normal agent tool calls always emit. Scheduler-sourced ticks (#42) are
-        suppressed unless ``KESTREL_OTEL_TRACE_SCHEDULER`` opts into full tick
-        tracing — at pre-tool time the tick's outcome isn't known yet, so a marker
-        on every idle scheduler tick would re-introduce exactly the every-minute
-        no-op noise, and (since the ``scheduler`` pseudo-session never sees a
-        ``Stop``) its pending entry would linger instead of reconciling.
-        """
-        if input.session_id != _SCHEDULER_SESSION_ID:
-            return True
-        return self._trace_scheduler
-
     def _emit_tool_start_marker(
         self,
         session: _SessionState,
@@ -631,13 +665,24 @@ class ObservabilityHook(Hook):
             agent_name=agent_name,
             attributes=attributes,
         )
-        session.pending_tools.setdefault(input.tool_name, []).append(
+        stack = session.pending_tools.setdefault(input.tool_name, [])
+        stack.append(
             _PendingTool(
                 tool_name=input.tool_name,
                 start_ns=marker_ns,
                 turn=session.current_turn,
             )
         )
+        # Bound the stack (#87). Under LIFO pairing the OLDEST entry is the one
+        # no future completion can reach, so it — not the newest — is what a
+        # depth this far past any real concurrency represents: a call that never
+        # completed. Terminalize it exactly as reconciliation would, so the
+        # immortal ``scheduler`` pseudo-session (which never reconciles) cannot
+        # accumulate leftovers for the life of the process.
+        while len(stack) > _MAX_PENDING_PER_TOOL:
+            self._terminalize_pending(
+                session, session_id, agent_name, stack.pop(0)
+            )
 
     def _pop_pending_tool(
         self, session: _SessionState, tool_name: Optional[str]
@@ -710,6 +755,30 @@ class ObservabilityHook(Hook):
             attributes=attributes,
         )
 
+    def _terminalize_pending(
+        self,
+        session: _SessionState,
+        session_id: Optional[str],
+        agent_name: str,
+        record: _PendingTool,
+    ) -> None:
+        """Give one leftover start its terminal ``incomplete`` span + tombstone.
+
+        The single source of truth for "this pending call never completed", shared
+        by turn-end reconciliation and the ``_MAX_PENDING_PER_TOOL`` eviction that
+        bounds the never-reconciled ``scheduler`` pseudo-session (#87). Tombstones
+        the call so a LATE ``PostToolUse`` is absorbed rather than emitting a
+        second terminal span for it (#84), and counts it on the distinct
+        ``incomplete`` dimension — never as an agent error.
+        """
+        self._emit_outcome_span(
+            session, session_id, agent_name, record, TOOL_OUTCOME_INCOMPLETE
+        )
+        session.terminalized.append(record.tool_name)
+        session.incomplete_count += 1
+        if record.turn is not None:
+            record.turn.incomplete_count += 1
+
     def _reconcile_pending(
         self, session: _SessionState, session_id: Optional[str], agent_name: str
     ) -> None:
@@ -735,17 +804,12 @@ class ObservabilityHook(Hook):
 
         stranded: Dict[int, Any] = {}  # turn index → (turn, last activity ns)
         for record in records:
-            self._emit_outcome_span(
-                session, session_id, agent_name, record, TOOL_OUTCOME_INCOMPLETE
-            )
-            # Tombstone the call: this tool now HAS its terminal span, so a late
-            # ``PostToolUse`` must not emit a second one (#84).
-            session.terminalized.append(record.tool_name)
-            session.incomplete_count += 1
+            # Terminal span + tombstone + counters (shared with the pending-cap
+            # eviction, so both paths represent a leftover identically).
+            self._terminalize_pending(session, session_id, agent_name, record)
             turn = record.turn
             if turn is None:
                 continue
-            turn.incomplete_count += 1
             if turn is not session.current_turn:
                 previous = stranded.get(turn.index)
                 latest = (
@@ -760,18 +824,21 @@ class ObservabilityHook(Hook):
                 session, session_id, agent_name, turn=turn, end_ns=latest
             )
 
-    def _should_emit_tool_span(self, input: HookInput) -> bool:
-        """Whether this PostToolUse should be recorded as a span.
+    def _completion_outcome(self, input: HookInput) -> str:
+        """The ``kestrel.tool_outcome`` for a completing tool call (#87).
 
-        Normal agent tool calls always emit. Scheduler-sourced ticks emit only
-        when they did real work — unless ``KESTREL_OTEL_TRACE_SCHEDULER`` opts
-        into full tick tracing (#42).
+        ``idle`` for a scheduler-sourced tick that ran successfully and did
+        nothing this poll — the every-minute heartbeat — else ``completed``.
+        This LABELS the span; it never decides whether one is emitted: every tool
+        call, every tick included, gets exactly one terminal span. An idle
+        heartbeat is activity, and the #42 drop that hid it made an idle
+        scheduler indistinguishable from a dead one.
         """
         if input.session_id != _SCHEDULER_SESSION_ID:
-            return True
-        if self._trace_scheduler:
-            return True
-        return _scheduler_tick_did_work(input.tool_response)
+            return TOOL_OUTCOME_COMPLETED
+        if _scheduler_tick_did_work(input.tool_response):
+            return TOOL_OUTCOME_COMPLETED
+        return TOOL_OUTCOME_IDLE
 
     def _emit_tool_span(
         self,
@@ -788,13 +855,20 @@ class ObservabilityHook(Hook):
         whatever turn is current now — a completion that lands after its turn
         closed (an interrupt, or a late event) belongs to the turn it started in,
         never to the turn that happens to be live (#84). With no record (a tool
-        whose start was never seen, e.g. the filtered scheduler path) the live
-        turn stays the best available attribution.
+        whose start was never seen) the live turn stays the best available
+        attribution.
+
+        The span is stamped ``completed`` — or ``idle`` for a scheduler heartbeat
+        that ran successfully and did nothing (#87). An idle tick is counted on
+        the additive ``idle_count`` only: it never moves
+        ``tool_count``/``success_count``, so the every-minute heartbeat can't
+        drown the success ratio of the ticks that actually worked.
         """
         # Derive success from the envelope: prefer top-level ``success`` but fall
         # back to ``status`` for external-feature ToolResults that omit it (#42),
         # so an errored scheduler tick isn't stamped tool.success=True.
         success = _tick_success(input.tool_response)
+        outcome = self._completion_outcome(input)
 
         extra: Dict[str, Any] = {"tool.success": success}
         if input.execution_time_ms is not None:
@@ -803,7 +877,7 @@ class ObservabilityHook(Hook):
         turn = record.turn if record is not None else session.current_turn
         attributes = self._turn_attrs(session_id, turn)
         attributes[KESTREL_TOOL_NAME] = input.tool_name
-        attributes[KESTREL_TOOL_OUTCOME] = TOOL_OUTCOME_COMPLETED
+        attributes[KESTREL_TOOL_OUTCOME] = outcome
         if input.feature_name:
             attributes["kestrel.feature_name"] = input.feature_name
         if not success and isinstance(input.tool_response, dict):
@@ -833,6 +907,13 @@ class ObservabilityHook(Hook):
             extra=extra,
             attributes=attributes,
         )
+        if outcome == TOOL_OUTCOME_IDLE:
+            # Additive dimension only — an idle heartbeat is neither an executed
+            # tool nor an error, so the existing ratios keep their semantics (#87).
+            session.idle_count += 1
+            if turn is not None:
+                turn.idle_count += 1
+            return
         session.tool_count += 1
         if success:
             session.success_count += 1
@@ -873,6 +954,7 @@ class ObservabilityHook(Hook):
             "kestrel.success_ratio": success_ratio,
             KESTREL_DENIED_COUNT: turn.denied_count,
             KESTREL_INCOMPLETE_COUNT: turn.incomplete_count,
+            KESTREL_IDLE_COUNT: turn.idle_count,
             # Unified go-forward duration key across turn + session summaries.
             "kestrel.duration_ms": duration_ms,
             # Legacy per-scope duration key, emitted alongside for back-compat
@@ -940,6 +1022,7 @@ class ObservabilityHook(Hook):
             "kestrel.success_ratio": success_ratio,
             KESTREL_DENIED_COUNT: state.denied_count,
             KESTREL_INCOMPLETE_COUNT: state.incomplete_count,
+            KESTREL_IDLE_COUNT: state.idle_count,
             # Unified go-forward duration key across turn + session summaries.
             "kestrel.duration_ms": duration_ms,
             # Legacy per-scope duration key (back-compat); drop in a future major.
@@ -1009,43 +1092,34 @@ class ObservabilityHook(Hook):
             # --- OTel spans (no-op when the OTLP endpoint is unset) ---
             try:
                 if event_type == "PostToolUse" and input.tool_name:
-                    if self._should_emit_tool_span(input):
-                        session = self._ensure_session(session_id, agent_name, input)
-                        record = self._pop_pending_tool(session, input.tool_name)
-                        if record is None and self._claim_terminalized(
-                            session, input.tool_name
-                        ):
-                            # A completion for a call reconciliation already
-                            # terminalized as ``incomplete``: emitting now would
-                            # give ONE call two terminal spans, the second one
-                            # counted twice and parented to the wrong turn (#84).
-                            pass
-                        else:
-                            # Pass the claimed start so the span nests + counts in
-                            # the turn the tool STARTED in, not the current one.
-                            self._emit_tool_span(
-                                session, session_id, agent_name, input, record
-                            )
+                    # EVERY completing call gets its terminal span — a scheduler
+                    # heartbeat that did nothing is labeled ``idle`` rather than
+                    # dropped (#87).
+                    session = self._ensure_session(session_id, agent_name, input)
+                    record = self._pop_pending_tool(session, input.tool_name)
+                    if record is None and self._claim_terminalized(
+                        session, input.tool_name
+                    ):
+                        # A completion for a call reconciliation already
+                        # terminalized as ``incomplete``: emitting now would
+                        # give ONE call two terminal spans, the second one
+                        # counted twice and parented to the wrong turn (#84).
+                        pass
                     else:
-                        # A filtered idle scheduler tick (#42) emits no span, so
-                        # drop its pending start too — otherwise reconciliation
-                        # would later mislabel a SUCCESSFUL idle tick as refused.
-                        existing = self._sessions.get(session_id)
-                        if existing is not None:
-                            if self._pop_pending_tool(existing, input.tool_name) is None:
-                                # Nothing pending: retire any tombstone instead, so
-                                # a filtered tick can't strand one.
-                                self._claim_terminalized(existing, input.tool_name)
+                        # Pass the claimed start so the span nests + counts in
+                        # the turn the tool STARTED in, not the current one.
+                        self._emit_tool_span(
+                            session, session_id, agent_name, input, record
+                        )
                 elif event_type == "PreToolUse" and input.tool_name:
                     # Innermost doll: an instant tool-start marker parented to the
                     # current turn — the Timeline pairs it with the tool's terminal
                     # span, and the recorded start lets turn-end reconciliation
                     # represent a tool that never completes (#84).
-                    if self._should_emit_tool_start(input):
-                        session = self._ensure_session(session_id, agent_name, input)
-                        self._emit_tool_start_marker(
-                            session, session_id, agent_name, input
-                        )
+                    session = self._ensure_session(session_id, agent_name, input)
+                    self._emit_tool_start_marker(
+                        session, session_id, agent_name, input
+                    )
                 elif event_type == "UserPromptSubmit":
                     # Start a turn: a new per-turn trace root under the session.
                     # Use the post-rewrite prompt (an earlier hook may have
@@ -1067,10 +1141,10 @@ class ObservabilityHook(Hook):
                 elif event_type == "AgentTerminate":
                     # End the session (true session summary aggregating turns).
                     self._close_session(session_id, agent_name)
-                elif session_id != _SCHEDULER_SESSION_ID:
-                    # Real agent session: export the root marker early so children
-                    # never arrive orphaned (#42). The scheduler pseudo-session
-                    # gets a root only when a work-tick actually needs a parent.
+                else:
+                    # Export the root marker early so children never arrive
+                    # orphaned (#42) — the scheduler pseudo-session included, now
+                    # that every tick emits and needs a parent (#87).
                     self._ensure_session(session_id, agent_name, input)
             except Exception as e:  # noqa: BLE001 - tracing must never break the agent
                 logger.debug("ObservabilityHook tracing error (non-fatal): %s", e)

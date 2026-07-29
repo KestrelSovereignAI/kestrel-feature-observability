@@ -39,6 +39,11 @@ from kestrel_feature_observability.hook import (
     KESTREL_TOOL_OUTCOME,
     KESTREL_DENIED_COUNT,
     KESTREL_INCOMPLETE_COUNT,
+    KESTREL_IDLE_COUNT,
+    TOOL_OUTCOME_COMPLETED,
+    TOOL_OUTCOME_IDLE,
+    TOOL_OUTCOME_INCOMPLETE,
+    _MAX_PENDING_PER_TOOL,
 )
 from kestrel_feature_observability.feature import ObservabilityFeature
 from kestrel_feature_observability.tracing import (
@@ -386,10 +391,10 @@ class TestNoNegativeDurations:
 
 
 # ---------------------------------------------------------------------------
-# 3e. Scheduler no-op tick noise filter (#42 defect 1)
+# 3e. Scheduler heartbeats: idle ticks EMIT, labeled `idle` (#87, retiring #42)
 # ---------------------------------------------------------------------------
 
-class TestSchedulerNoiseFilter:
+class TestSchedulerHeartbeats:
     # These exercise the REAL production contract: the every-minute
     # ``restart_coordinator`` cron ACTION goes through the scheduler's tool-lookup
     # path (it is a feature @tool, not a builtin_handler), so it fires the
@@ -397,9 +402,12 @@ class TestSchedulerNoiseFilter:
     # ``ToolResult`` envelope — outcome ``status`` at the top level, work counters
     # nested under ``data`` (verified against kestrel-sovereign
     # restart_coordinator/feature.py + the tool wrapper's ToolResult.to_dict()).
+    #
+    # #42 DROPPED these idle ticks as noise, which made an idle-but-alive
+    # scheduler indistinguishable from a dead one. They now always emit, labeled
+    # ``kestrel.tool_outcome=idle`` so idle vs work is legible at render time.
 
-    # The exact idle envelope restart_coordinator emits every idle minute — the
-    # 81%-noise no-op the issue targets.
+    # The exact idle envelope restart_coordinator emits every idle minute.
     IDLE_RESPONSE = {
         "status": "ok",
         "confirmation": "No pending restart requests",
@@ -409,10 +417,10 @@ class TestSchedulerNoiseFilter:
     }
 
     @pytest.mark.asyncio
-    async def test_idle_restart_coordinator_tick_emits_no_spans(self):
-        # The real every-minute no-op: counters (executed) live under `data`, not
-        # at the top level. A top-level-only scan would miss them and emit — this
-        # asserts the nested-envelope filter actually drops the noise.
+    async def test_idle_restart_coordinator_tick_emits_idle_span(self):
+        # The real every-minute heartbeat: counters (executed) live under `data`,
+        # not at the top level. It used to produce NO span at all (#42); it now
+        # produces one, stamped `idle` — visibly alive, distinct from work.
         hook, exporter = _memory_hook()
         await hook.execute(
             _make_input(
@@ -421,10 +429,13 @@ class TestSchedulerNoiseFilter:
                 tool_response=self.IDLE_RESPONSE,
             )
         )
-        assert exporter.get_finished_spans() == ()
+        tick = _by_name(exporter.get_finished_spans())["restart_coordinator"]
+        assert tick.attributes[KESTREL_TOOL_OUTCOME] == TOOL_OUTCOME_IDLE
+        # It RAN — it just did nothing. Never mislabeled a failure.
+        assert tick.attributes["tool.success"] is True
 
     @pytest.mark.asyncio
-    async def test_noop_tick_with_nested_idle_status_emits_no_spans(self):
+    async def test_noop_tick_with_nested_idle_status_emits_idle_span(self):
         # A tool that stamps an explicit idle marker inside its `data` payload.
         hook, exporter = _memory_hook()
         await hook.execute(
@@ -440,7 +451,23 @@ class TestSchedulerNoiseFilter:
                 },
             )
         )
-        assert exporter.get_finished_spans() == ()
+        tick = _by_name(exporter.get_finished_spans())["signal_dispatch"]
+        assert tick.attributes[KESTREL_TOOL_OUTCOME] == TOOL_OUTCOME_IDLE
+
+    @pytest.mark.asyncio
+    async def test_idle_tick_is_a_zero_duration_point_span(self):
+        # The scheduler never stamps execution_time_ms, so a heartbeat is an
+        # instant point event — never a bar claiming runtime it didn't have.
+        hook, exporter = _memory_hook()
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response=self.IDLE_RESPONSE,
+            )
+        )
+        tick = _by_name(exporter.get_finished_spans())["restart_coordinator"]
+        assert tick.end_time == tick.start_time
 
     @pytest.mark.asyncio
     async def test_tick_that_executed_work_emits_span(self):
@@ -464,10 +491,9 @@ class TestSchedulerNoiseFilter:
                 },
             )
         )
-        assert (
-            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
-            is not None
-        )
+        tick = _by_name(exporter.get_finished_spans())["restart_coordinator"]
+        # A tick that DID something is `completed`, never a heartbeat.
+        assert tick.attributes[KESTREL_TOOL_OUTCOME] == TOOL_OUTCOME_COMPLETED
 
     @pytest.mark.asyncio
     async def test_tick_that_only_deferred_emits_span(self):
@@ -541,8 +567,12 @@ class TestSchedulerNoiseFilter:
         assert _by_name(exporter.get_finished_spans()).get("ext_action") is not None
 
     @pytest.mark.asyncio
-    async def test_env_opt_in_traces_noop_ticks(self):
-        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
+    @pytest.mark.parametrize("flag", ["1", "0", "", "off"])
+    async def test_legacy_trace_scheduler_env_is_an_accepted_no_op(self, flag):
+        # The #42 opt-in is DEPRECATED (#87): parsed without error, but it can no
+        # longer change anything — there is no suppression path left to enable or
+        # disable, so an idle tick emits identically at every setting.
+        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": flag}):
             hook, exporter = _memory_hook()
         await hook.execute(
             _make_input(
@@ -551,14 +581,13 @@ class TestSchedulerNoiseFilter:
                 tool_response=self.IDLE_RESPONSE,
             )
         )
-        assert (
-            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
-            is not None
-        )
+        tick = _by_name(exporter.get_finished_spans())["restart_coordinator"]
+        assert tick.attributes[KESTREL_TOOL_OUTCOME] == TOOL_OUTCOME_IDLE
 
     @pytest.mark.asyncio
-    async def test_filter_is_scheduler_only(self):
-        # A normal agent tool call always emits, even with an idle no-op response.
+    async def test_idle_label_is_scheduler_only(self):
+        # A normal agent tool call is `completed` even with an idle-looking
+        # response: `idle` means "scheduler heartbeat", not "returned zeroes".
         hook, exporter = _memory_hook()
         await hook.execute(
             _make_input(
@@ -566,10 +595,42 @@ class TestSchedulerNoiseFilter:
                 tool_response=self.IDLE_RESPONSE,
             )
         )
-        assert (
-            _by_name(exporter.get_finished_spans()).get("restart_coordinator")
-            is not None
+        tick = _by_name(exporter.get_finished_spans())["restart_coordinator"]
+        assert tick.attributes[KESTREL_TOOL_OUTCOME] == TOOL_OUTCOME_COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_idle_ticks_ride_on_idle_count_not_the_success_ratio(self):
+        # The #84 precedent for denied/incomplete: additive key, excluded from
+        # tool_count / error_count / success_ratio, so the every-minute heartbeat
+        # can't drown the ratio of the ticks that actually worked.
+        hook, exporter = _memory_hook()
+        for _ in range(3):
+            await hook.execute(
+                _make_input(
+                    "PostToolUse", session_id="scheduler",
+                    tool_name="restart_coordinator",
+                    tool_response=self.IDLE_RESPONSE,
+                )
+            )
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler",
+                tool_name="restart_coordinator",
+                tool_response={
+                    "status": "ok",
+                    "data": {"executed": [{"request_id": "r1"}]},
+                    "success": True,
+                },
+            )
         )
+        await hook.execute(
+            _make_input("AgentTerminate", session_id="scheduler")
+        )
+        summary = _by_name(exporter.get_finished_spans())["session summary"]
+        assert summary.attributes[KESTREL_IDLE_COUNT] == 3
+        assert summary.attributes["kestrel.tool_count"] == 1
+        assert summary.attributes["kestrel.error_count"] == 0
+        assert summary.attributes["kestrel.success_ratio"] == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -969,20 +1030,11 @@ class TestTurnSpans:
         assert KESTREL_TURN_ID not in tool.attributes
 
     @pytest.mark.asyncio
-    async def test_scheduler_pre_tool_use_emits_no_start_marker(self):
-        # The scheduler pseudo-session must not emit a start marker for every
-        # (idle) tick — that would re-introduce the #42 noise, and since it never
-        # sees a Stop the pending entry would linger instead of reconciling.
+    async def test_scheduler_pre_tool_use_emits_a_start_marker(self):
+        # The scheduler pseudo-session is no longer special-cased (#87): a tick
+        # gets the same start marker as any other tool call, so the Timeline can
+        # pair it with the tick's terminal (idle or completed) span.
         hook, exporter = _memory_hook()
-        await hook.execute(
-            _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
-        )
-        assert exporter.get_finished_spans() == ()
-
-    @pytest.mark.asyncio
-    async def test_scheduler_start_marker_opt_in(self):
-        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
-            hook, exporter = _memory_hook()
         await hook.execute(
             _make_input("PreToolUse", session_id="scheduler", tool_name="restart_coordinator")
         )
@@ -1212,28 +1264,85 @@ class TestToolOutcomes:
         assert session.current_turn.tool_count == 0
 
     @pytest.mark.asyncio
-    async def test_filtered_idle_scheduler_tick_leaves_nothing_pending(self):
-        # A successful idle tick is deliberately span-less (#42) — dropping its
-        # pending start too is what stops reconciliation from later mislabeling
-        # it as refused, and stops the entry leaking (scheduler sees no Stop).
-        with patch.dict("os.environ", {"KESTREL_OTEL_TRACE_SCHEDULER": "1"}):
-            hook, exporter = _memory_hook()
+    async def test_idle_scheduler_tick_terminalizes_and_leaves_nothing_pending(self):
+        # An idle tick now emits its OWN terminal `idle` span (#87), which claims
+        # the pending start — so the entry can't leak (the scheduler pseudo-session
+        # never sees a Stop to reconcile it) and reconciliation can never later
+        # mislabel a SUCCESSFUL heartbeat as refused.
+        hook, exporter = _memory_hook()
         await hook.execute(
             _make_input("PreToolUse", session_id="scheduler", tool_name="tick")
         )
-        # The tick did no work → _should_emit_tool_span is False (the opt-in only
-        # covers markers/ticks that reach the emit path).
-        with patch.dict("os.environ", {}, clear=False):
-            hook._trace_scheduler = False
+        await hook.execute(
+            _make_input(
+                "PostToolUse", session_id="scheduler", tool_name="tick",
+                tool_response={"status": "ok", "data": {"executed": False, "pending": 0}},
+            )
+        )
+        session = hook._sessions["scheduler"]
+        assert session.pending_tools == {}
+        terminals = _terminal_tools(exporter)
+        assert [s.attributes[KESTREL_TOOL_OUTCOME] for s in terminals] == [
+            TOOL_OUTCOME_IDLE
+        ]
+
+    @pytest.mark.asyncio
+    async def test_never_completing_scheduler_ticks_cannot_grow_unbounded(self):
+        # Every tick now records a pending start (#87 retired the #42
+        # suppression), and the `scheduler` pseudo-session is IMMORTAL — it never
+        # sees a Stop/AgentTerminate, so `_reconcile_pending` never runs for it.
+        # A cron tool that fires PreToolUse and never completes (a guard, an
+        # abort, an error before PostToolUse) would therefore grow the stack once
+        # a minute for the life of the process. The per-tool-name cap bounds it.
+        hook, exporter = _memory_hook()
+        for _ in range(_MAX_PENDING_PER_TOOL * 4):
+            await hook.execute(
+                _make_input("PreToolUse", session_id="scheduler", tool_name="tick")
+            )
+        session = hook._sessions["scheduler"]
+        assert len(session.pending_tools["tick"]) == _MAX_PENDING_PER_TOOL
+
+        # Eviction is NOT a silent drop: each evicted leftover gets the same
+        # terminal `incomplete` span reconciliation would have given it...
+        evicted = _MAX_PENDING_PER_TOOL * 3
+        terminals = _terminal_tools(exporter)
+        assert [s.attributes[KESTREL_TOOL_OUTCOME] for s in terminals] == [
+            TOOL_OUTCOME_INCOMPLETE
+        ] * evicted
+        assert session.incomplete_count == evicted
+        # ...anchored zero-duration at its OWN recorded start, so a late-exported
+        # leftover never claims runtime it did not have.
+        assert all(s.start_time == s.end_time for s in terminals)
+        # The oldest (LIFO-unreachable) entries are the ones evicted — the
+        # survivors are the newest, which a completion can still pair with.
+        assert [r.tool_name for r in session.pending_tools["tick"]] == [
+            "tick"
+        ] * _MAX_PENDING_PER_TOOL
+
+    @pytest.mark.asyncio
+    async def test_pending_cap_does_not_disturb_normal_tick_pairing(self):
+        # The cap must bound ONLY the never-completed leftovers: the Timeline
+        # pairs a tick's "(started)" marker with its terminal span (#87), so a
+        # normal Pre→Post tick must still record and claim its pending start.
+        hook, exporter = _memory_hook()
+        for _ in range(_MAX_PENDING_PER_TOOL * 3):
+            await hook.execute(
+                _make_input("PreToolUse", session_id="scheduler", tool_name="tick")
+            )
             await hook.execute(
                 _make_input(
                     "PostToolUse", session_id="scheduler", tool_name="tick",
-                    tool_response={"status": "ok", "data": {"executed": False, "pending": 0}},
+                    tool_response={
+                        "status": "ok", "data": {"executed": False, "pending": 0}
+                    },
                 )
             )
         session = hook._sessions["scheduler"]
+        # Each tick claimed its own start, so nothing ever reached the cap.
         assert session.pending_tools == {}
-        assert not _terminal_tools(exporter)
+        assert session.incomplete_count == 0
+        outcomes = {s.attributes[KESTREL_TOOL_OUTCOME] for s in _terminal_tools(exporter)}
+        assert outcomes == {TOOL_OUTCOME_IDLE}
 
 
 # ---------------------------------------------------------------------------
