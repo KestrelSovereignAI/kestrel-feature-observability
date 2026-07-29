@@ -848,6 +848,7 @@ export function mount(container, opts = {}) {
   const revealTarget = opts.revealTarget || null;
 
   let destroyed = false;
+  let booted = false; // boot() finished wiring the poll timer + live loop
 
   // ── Time-window state ──
   let windowMs = DEFAULT_WINDOW_MS;
@@ -2531,9 +2532,13 @@ export function mount(container, opts = {}) {
     if (retry) {
       retry.addEventListener("click", () => {
         if (destroyed) return;
+        const carried = getState();
         teardown();
         const replacement = mount(container, opts);
+        replacement.setState(carried); // a retry is a remount — keep the view
         handleProxy.destroy = replacement.destroy;
+        handleProxy.getState = replacement.getState;
+        handleProxy.setState = replacement.setState;
       });
     }
   }
@@ -2565,7 +2570,70 @@ export function mount(container, opts = {}) {
     buildLayout();
     if (revealTarget) finishReveal();
     pollTimer = setInterval(() => pollTick(false), POLL_MS);
-    setLive(!revealTarget); // exact reveals stay paused; normal entry follows live
+    booted = true;
+    // `live` is `!revealTarget` unless setState() restored a paused window
+    // first (#86): an exact reveal stays paused, a restored history window
+    // stays paused, and a normal (or restored-live) entry follows the clock.
+    setLive(live);
+  }
+
+  // ── Persisted view state (#86) ──
+  //
+  // The serializable slice of this mount that the console's panel view-state
+  // provider (kestrel-sovereign #2802) round-trips across a sub-tab remount and
+  // a full page reload: zoom (`windowMs`), the pan anchor (`viewEnd`),
+  // live-follow, lane scroll, the collapsed projects, and the drilled/highlighted
+  // span.
+  //
+  // Restoring must not fight live-follow: a state captured while live resumes
+  // live and re-anchors on the wall clock (its stored `viewEnd` is stale by
+  // definition), while one captured panned back into history restores that exact
+  // window PAUSED. A cross-view reveal (`opts.revealTarget`) is an explicit
+  // navigation and outranks any stored window, so it keeps its own window,
+  // highlight and scroll — only the collapse set is restored alongside it.
+  function getState() {
+    return {
+      windowMs,
+      viewEnd,
+      live,
+      laneScrollY,
+      collapsed: [...collapsed],
+      highlightedSpanId,
+    };
+  }
+
+  function setState(state) {
+    if (!state || typeof state !== "object") return false;
+    if (Array.isArray(state.collapsed)) {
+      collapsed.clear();
+      for (const name of state.collapsed) {
+        if (typeof name === "string") collapsed.add(name);
+      }
+    }
+    if (!revealTarget) {
+      const w = Number(state.windowMs);
+      if (Number.isFinite(w)) windowMs = Math.min(MAX_WINDOW_MS, Math.max(MIN_WINDOW_MS, w));
+      // A missing/garbage flag falls back to the default: live-follow on.
+      live = state.live !== false;
+      const end = Number(state.viewEnd);
+      // Only a paused state restores its right edge — and never one past "now",
+      // so a stale snapshot can't park the view in the future.
+      if (!live && Number.isFinite(end)) viewEnd = Math.min(end, Date.now());
+      const scroll = Number(state.laneScrollY);
+      if (Number.isFinite(scroll)) laneScrollY = Math.max(0, scroll);
+      highlightedSpanId =
+        state.highlightedSpanId != null ? String(state.highlightedSpanId) : null;
+    }
+    // Restored before boot (the normal path — the panel restores us right after
+    // mount), the values simply ARE the boot-time view, so the initial poll
+    // fills the restored window. Restored after boot, reapply them live.
+    if (booted) {
+      buildLayout();
+      setLive(live);
+      requestDraw();
+      if (!live) loadHistory();
+    }
+    return true;
   }
 
   function teardown() {
@@ -2579,7 +2647,7 @@ export function mount(container, opts = {}) {
 
   boot();
 
-  const handleProxy = { destroy: teardown };
+  const handleProxy = { destroy: teardown, getState, setState };
   return handleProxy;
 }
 
