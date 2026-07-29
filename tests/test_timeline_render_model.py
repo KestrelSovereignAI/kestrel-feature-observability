@@ -652,3 +652,156 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     assert sh["model"]["idleCount"] == 1
     assert sh["model"]["workCount"] == 0
     assert sh["model"]["label"] == "scheduler · 1 heartbeat"
+
+
+# ── #88: what a container span COVERS ────────────────────────────────────────
+#
+# A turn/session root is a zero-duration point and the scheduler pseudo-root is
+# an immortal envelope, so neither one's own geometry answers "what is this?".
+# `spanMemberRollup` walks the subtree the layout already indexed and reports the
+# membership the hover/popover renders as "covers N spans over Xh".
+_ROLLUP_HARNESS = r"""
+import { annotateRenderModel, spanMemberRollup } from "./timeline.js";
+
+let idc = 0;
+function span(o) {
+  idc += 1;
+  return {
+    id: o.id || `n${idc}`,
+    name: o.name,
+    start: o.start,
+    end: o.end != null ? o.end : o.start,
+    instant: o.end != null && o.end <= o.start,
+    openEnded: o.openEnded === true,
+    marker: o.marker || null,
+    kind: o.kind || "TOOL",
+    status: "ok",
+    spanId: o.spanId,
+    parentId: o.parentId || null,
+    traceId: o.traceId || null,
+    sessionId: o.sessionId != null ? o.sessionId : null,
+    projectId: o.projectId != null ? o.projectId : null,
+    attrs: o.attrs || {},
+  };
+}
+// The two indexes `mount` maintains: Phoenix node id → span, and parent OTel
+// spanId → Set<node id>.
+function index(list) {
+  const spans = new Map();
+  const kids = new Map();
+  for (const s of list) {
+    spans.set(s.id, s);
+    if (!s.parentId) continue;
+    let set = kids.get(s.parentId);
+    if (!set) {
+      set = new Set();
+      kids.set(s.parentId, set);
+    }
+    set.add(s.id);
+  }
+  return [spans, kids];
+}
+const NOW = 10000;
+const out = {};
+
+// A turn with 2 tool calls: 2 "(started)" markers pair away and the summary
+// folds, so the operator SEES 2 bars — the count must say 2, not 5.
+{
+  const turn = span({ name: "claude-code turn 1", start: 50, marker: "start", kind: "AGENT", spanId: "rt", sessionId: "R1", attrs: { kestrel: { turn_index: 1 } } });
+  const members = [turn];
+  for (const [i, tool] of ["Bash", "Read"].entries()) {
+    const t = 60 + i * 10;
+    members.push(span({ name: `${tool} (started)`, start: t, marker: "start", spanId: `rm${i}`, parentId: "rt", sessionId: "R1" }));
+    members.push(span({ name: tool, start: t, end: t + 5, spanId: `rr${i}`, parentId: "rt", sessionId: "R1" }));
+  }
+  const summary = span({ name: "turn 1 summary", start: 50, end: 95, kind: "CHAIN", spanId: "rs", parentId: "rt", sessionId: "R1", attrs: { kestrel: { tool_count: 2, success_ratio: 1, turn_duration_ms: 45 } } });
+  members.push(summary);
+  const [spans, kids] = index(members);
+  out.beforeAnnotate = spanMemberRollup(turn, spans, kids).count;
+  annotateRenderModel(members, NOW);
+  out.turn = {
+    rollup: spanMemberRollup(turn, spans, kids),
+    hidden: members.filter((s) => s.rHide).length,
+    visible: members.filter((s) => s !== turn && !s.rHide).length,
+  };
+}
+
+// The virtual scheduler pseudo-root (#87): heartbeats, work ticks, the features
+// ticking under it and when each last ran.
+{
+  const root = span({ name: "kestrel-agent", start: 1000, kind: "AGENT", spanId: "mr", sessionId: "scheduler" });
+  const members = [root];
+  for (let i = 0; i < 3; i++) {
+    const t = 2000 + i * 500;
+    members.push(span({ name: "restart_coordinator (started)", start: t, marker: "start", spanId: `mim${i}`, parentId: "mr", sessionId: "scheduler" }));
+    members.push(span({ name: "restart_coordinator", start: t, end: t, spanId: `mir${i}`, parentId: "mr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "idle", feature_name: "ReflectionFeature" } } }));
+  }
+  const wt = 6000;
+  members.push(span({ name: "training_cycle (started)", start: wt, marker: "start", spanId: "mwm", parentId: "mr", sessionId: "scheduler" }));
+  members.push(span({ name: "training_cycle", start: wt, end: wt, spanId: "mwr", parentId: "mr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "completed", feature_name: "StrategicMemoryFeature" } } }));
+  annotateRenderModel(members, NOW);
+  const [spans, kids] = index(members);
+  out.scheduler = spanMemberRollup(root, spans, kids);
+}
+
+// A NESTED subtree still rolls up through its grandchildren, and a leaf with no
+// children has nothing to report.
+{
+  const root = span({ name: "kestrel-agent", start: 10, kind: "AGENT", spanId: "gr", sessionId: "R2" });
+  const turn = span({ name: "kestrel-agent turn 1", start: 20, marker: "start", kind: "AGENT", spanId: "gt", parentId: "gr", sessionId: "R2", attrs: { kestrel: { turn_index: 1 } } });
+  const tool = span({ name: "Bash", start: 30, end: 900, spanId: "gb", parentId: "gt", sessionId: "R2" });
+  annotateRenderModel([root, turn, tool], NOW);
+  const [spans, kids] = index([root, turn, tool]);
+  out.nested = spanMemberRollup(root, spans, kids);
+  out.leaf = spanMemberRollup(tool, spans, kids);
+}
+
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_member_rollup_counts_what_the_operator_can_see(tmp_path):
+    """#88: "covers N spans" counts rendered members, not render chrome."""
+    pkg = _module_dir(tmp_path)
+    (pkg / "rollup.mjs").write_text(_ROLLUP_HARNESS, encoding="utf-8")
+    proc = subprocess.run(
+        [NODE, str(pkg / "rollup.mjs")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+        cwd=str(pkg),
+    )
+    r = json.loads(proc.stdout)
+
+    # Un-annotated, everything in the subtree counts — the gate for the fix.
+    assert r["beforeAnnotate"] == 5
+    turn = r["turn"]
+    assert turn["hidden"] == 3  # 2 paired markers + the folded summary
+    assert turn["visible"] == 2  # the 2 tool bars actually painted
+    # A 2-tool turn covers 2 spans. Counting the render chrome reported 5.
+    assert turn["rollup"]["count"] == 2
+    # The time extent still spans the WHOLE subtree: the folded summary never
+    # paints a bar but carries the turn's honest end (50 → 95).
+    assert turn["rollup"]["startMs"] == 50
+    assert turn["rollup"]["endMs"] == 95
+    # Heartbeat/tick counts are scheduler identity — noise on an ordinary turn.
+    assert turn["rollup"]["virtual"] is False
+    assert turn["rollup"]["heartbeatCount"] is None
+    assert turn["rollup"]["workCount"] is None
+
+    # The virtual scheduler session names itself and splits idle from work.
+    sched = r["scheduler"]
+    assert sched["virtual"] is True
+    assert sched["count"] == 4  # 3 heartbeats + 1 work tick (markers paired away)
+    assert sched["heartbeatCount"] == 3
+    assert sched["workCount"] == 1
+    assert sorted(sched["features"]) == ["ReflectionFeature", "StrategicMemoryFeature"]
+    assert sched["lastIdleMs"] == 3000  # the newest heartbeat
+    assert sched["lastWorkMs"] == 6000
+
+    # Grandchildren roll up; a childless leaf reports nothing rather than "0".
+    assert r["nested"]["count"] == 2
+    assert r["nested"]["endMs"] == 900
+    assert r["leaf"] is None

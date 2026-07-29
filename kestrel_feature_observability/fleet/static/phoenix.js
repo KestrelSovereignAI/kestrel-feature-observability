@@ -48,6 +48,24 @@ export const ATTR_DURATION_MS = "kestrel.duration_ms";
 export const ATTR_TURN_DURATION_MS = "kestrel.turn_duration_ms";
 export const ATTR_SESSION_DURATION_MS = "kestrel.session_duration_ms";
 
+// The signals a hover/click has to answer FIRST (#88): what this span IS
+// (marker role), how its tool call ENDED, and who it belongs to. Both emitters
+// stamp all of these; before #88 they were buried in "Raw attributes".
+export const ATTR_MARKER = "kestrel.marker"; // instant turn-root / tool-start point spans
+export const MARKER_START = "start";
+export const ATTR_TOOL_OUTCOME = "kestrel.tool_outcome";
+export const OUTCOME_COMPLETED = "completed";
+export const OUTCOME_IDLE = "idle";
+export const ATTR_FEATURE_NAME = "kestrel.feature_name"; // ReflectionFeature, …
+export const ATTR_ORCHESTRATOR = "kestrel.orchestrator"; // talon attribution
+export const ATTR_TURN_ID = "kestrel.turn_id"; // "<session_id>#<n>"
+export const ATTR_TURN_INDEX = "kestrel.turn_index";
+export const ATTR_DENIED_COUNT = "kestrel.denied_count";
+export const ATTR_INCOMPLETE_COUNT = "kestrel.incomplete_count";
+export const ATTR_IDLE_COUNT = "kestrel.idle_count";
+export const ATTR_REPO = "kestrel.repo";
+export const ATTR_AGENT_DID = "kestrel.agent_did";
+
 // Spans missing kestrel.agent_name bucket here (should be none post-#2602).
 export const UNKNOWN_AGENT = "unknown";
 
@@ -336,6 +354,104 @@ export function spanKindOf(span) {
   return String(k || "span").toUpperCase();
 }
 
+// ── Derived span role (#88) ──────────────────────────────────
+//
+// `kestrel.marker` plus the producers' span names say WHAT a span is — something
+// kind+duration alone can never express: a zero-duration AGENT span is a session
+// or turn ROOT (a point event), not a span that "completed" in no time, and a
+// zero-duration TOOL span is either a tool-start marker or a refused tool. Both
+// views name a span through this one function so hover, popover and inspector
+// never disagree.
+export const ROLE_SESSION_ROOT = "session root";
+export const ROLE_TURN_ROOT = "turn root";
+export const ROLE_TOOL_START = "tool-start marker";
+export const ROLE_TOOL_SPAN = "tool span";
+export const ROLE_TURN_SUMMARY = "turn summary";
+export const ROLE_SESSION_SUMMARY = "session summary";
+
+// Roles that are point events BY CONSTRUCTION — the producers emit them
+// start==end — so a 0ms duration is their normal shape, not a completion.
+const POINT_ROLES = new Set([ROLE_SESSION_ROOT, ROLE_TURN_ROOT, ROLE_TOOL_START]);
+
+// A refused tool is the OTHER point event: "denied"/"incomplete" spans are
+// anchored zero-duration at the recorded start because the tool never ran
+// (#84). Saying `state: completed` next to `outcome: denied` is precisely the
+// contradiction #88 exists to kill. An "idle" heartbeat is NOT one — it ran, it
+// just did nothing.
+function isRefusedOutcome(outcome) {
+  return (
+    present(outcome) &&
+    String(outcome) !== OUTCOME_COMPLETED &&
+    String(outcome) !== OUTCOME_IDLE
+  );
+}
+
+const TURN_SUMMARY_NAME_RE = /^turn\s+\d+\s+summary$/i;
+const SESSION_SUMMARY_NAME_RE = /^session\s+summary$/i;
+const STARTED_NAME_RE = /\(started\)\s*$/i;
+
+export function spanRoleOf(span, context = {}) {
+  const source = span || {};
+  const attrs = context.attrs || parseAttributes(source.attributes ?? source.attrs);
+  const name = String(source.name ?? "");
+  if (SESSION_SUMMARY_NAME_RE.test(name)) return ROLE_SESSION_SUMMARY;
+  if (TURN_SUMMARY_NAME_RE.test(name)) return ROLE_TURN_SUMMARY;
+  const marker = firstPresent(source.marker, getAttr(attrs, ATTR_MARKER));
+  if (present(marker) && String(marker) === MARKER_START) {
+    // A "(started)" marker twins a real tool span; any other start marker IS the
+    // turn's start (the Timeline's own turn-root rule).
+    return STARTED_NAME_RE.test(name) ? ROLE_TOOL_START : ROLE_TURN_ROOT;
+  }
+  const kind = spanKindOf(source);
+  if (present(getAttr(attrs, ATTR_TOOL_OUTCOME)) || kind === "TOOL") return ROLE_TOOL_SPAN;
+  const parentSpanId = firstPresent(
+    context.parentSpanId,
+    source.parentSpanId,
+    source.parentId,
+  );
+  if (!present(parentSpanId) && kind === "AGENT") return ROLE_SESSION_ROOT;
+  return null;
+}
+
+// ── Member rollup for a root / session band (#88) ────────────
+//
+// A session root, a turn root and a session band are all containers whose own
+// geometry says nothing about what they hold — the immortal `scheduler`
+// pseudo-root is the extreme case (#87). Callers supply the raw counts they
+// already have (Timeline: the parent index; Navigator: the loaded children) and
+// this normalizes them into the "covers N spans over Xh" row, plus the virtual
+// scheduler session's identity (heartbeat/tick split, ticking features,
+// last-idle / last-work).
+export function normalizeMembers(members) {
+  if (!members || typeof members !== "object") return null;
+  const count = numberValue(firstPresent(members.count, members.spanCount));
+  const startMs = timestampValue(firstPresent(members.startMs, members.start));
+  const endMs = timestampValue(firstPresent(members.endMs, members.end));
+  const durationMs = numberValue(
+    firstPresent(
+      members.durationMs,
+      startMs != null && endMs != null ? endMs - startMs : null,
+    ),
+  );
+  const heartbeatCount = numberValue(firstPresent(members.heartbeatCount, members.idleCount));
+  const workCount = numberValue(members.workCount);
+  const features = Array.isArray(members.features)
+    ? members.features.filter(present).map(String)
+    : [];
+  const virtual = members.virtual === true;
+  if (count == null && heartbeatCount == null && workCount == null && !virtual) return null;
+  return {
+    count,
+    durationMs,
+    heartbeatCount,
+    workCount,
+    features,
+    virtual,
+    lastIdleMs: timestampValue(members.lastIdleMs),
+    lastWorkMs: timestampValue(members.lastWorkMs),
+  };
+}
+
 // ── Aggregated Navigator read-model ──────────────────────────
 
 // {count, first, last, errored} rollup entries for the Navigator's aggregated
@@ -417,6 +533,18 @@ export function spanSummaryOf(span) {
     successRatio: numberValue(
       firstPresent(existing.successRatio, getAttr(attrs, ATTR_SUCCESS_RATIO)),
     ),
+    // The refusal / heartbeat dimensions the producers keep OUT of
+    // tool/error/success on purpose (#84/#87): a denied tool is not an agent
+    // error and an idle heartbeat is not a success — so they ride here.
+    deniedCount: numberValue(
+      firstPresent(existing.deniedCount, getAttr(attrs, ATTR_DENIED_COUNT)),
+    ),
+    incompleteCount: numberValue(
+      firstPresent(existing.incompleteCount, getAttr(attrs, ATTR_INCOMPLETE_COUNT)),
+    ),
+    idleCount: numberValue(
+      firstPresent(existing.idleCount, getAttr(attrs, ATTR_IDLE_COUNT)),
+    ),
     durationMs: numberValue(
       firstPresent(
         existing.durationMs,
@@ -464,11 +592,25 @@ export function normalizeSpanDetail(span, context = {}) {
   const sess = sessionKeyOf(attrs);
   const statusRaw = firstPresent(source.status, source.statusCode);
   const status = present(statusRaw) ? String(statusRaw).toLowerCase() : null;
+  const parentSpanIdRaw = firstPresent(
+    context.parentSpanId,
+    source.parentSpanId,
+    source.parentId,
+  );
+  const role = spanRoleOf(source, { attrs, parentSpanId: parentSpanIdRaw });
+  const outcome = firstPresent(source.rOutcome, getAttr(attrs, ATTR_TOOL_OUTCOME));
+  // A marker/root — and a refused tool — is emitted start==end: "completed"
+  // reads as a tool that ran in no time, when in truth nothing ran at all. It is
+  // a point in time (#88).
+  const pointEvent =
+    durationMs === 0 && (POINT_ROLES.has(role) || isRefusedOutcome(outcome));
   const state = source.rAbandoned
     ? "abandoned — no completion recorded"
     : running
       ? "running"
-      : "completed";
+      : pointEvent
+        ? "point event"
+        : "completed";
   const input = firstPresent(source.input, getAttr(attrs, ATTR_INPUT_VALUE));
   const output = firstPresent(source.output, getAttr(attrs, ATTR_OUTPUT_VALUE));
   const model = firstPresent(source.model, getAttr(attrs, ATTR_MODEL_NAME));
@@ -500,22 +642,36 @@ export function normalizeSpanDetail(span, context = {}) {
     source.spanId,
     source.context && source.context.spanId,
   );
-  const parentSpanId = firstPresent(
-    context.parentSpanId,
-    source.parentSpanId,
-    source.parentId,
-  );
+  const parentSpanId = parentSpanIdRaw;
+  // Already-stamped signals promoted out of "Raw attributes" (#88); `outcome` is
+  // resolved above because `state` depends on it.
+  const feature = firstPresent(context.feature, getAttr(attrs, ATTR_FEATURE_NAME));
+  const orchestrator = firstPresent(context.orchestrator, getAttr(attrs, ATTR_ORCHESTRATOR));
+  const runId = firstPresent(context.runId, getAttr(attrs, ATTR_RUN_ID));
+  const turnId = firstPresent(context.turnId, getAttr(attrs, ATTR_TURN_ID));
+  const turnIndex = numberValue(getAttr(attrs, ATTR_TURN_INDEX));
+  const repo = getAttr(attrs, ATTR_REPO);
+  const agentDid = getAttr(attrs, ATTR_AGENT_DID);
 
   return {
     name: String(firstPresent(source.name, "(span)")),
     displayName: String(firstPresent(source.rLabel, source.name, "(span)")),
     kind: spanKindOf(source),
+    role,
+    outcome: present(outcome) ? String(outcome) : null,
     status,
     state,
     startMs,
     endMs,
     durationMs,
     agent: present(agent) ? String(agent) : null,
+    feature: present(feature) ? String(feature) : null,
+    orchestrator: present(orchestrator) ? String(orchestrator) : null,
+    runId: present(runId) ? String(runId) : null,
+    turnId: present(turnId) ? String(turnId) : null,
+    turnIndex,
+    repo: present(repo) ? String(repo) : null,
+    agentDid: present(agentDid) ? String(agentDid) : null,
     worker: present(worker) ? String(worker) : null,
     model: present(model) ? String(model) : null,
     projectName: present(projectName) ? String(projectName) : null,
@@ -532,7 +688,15 @@ export function normalizeSpanDetail(span, context = {}) {
       toolCount: numberValue(firstPresent(summary.toolCount, ownSummary.toolCount)),
       errorCount: numberValue(firstPresent(summary.errorCount, ownSummary.errorCount)),
       successRatio: numberValue(firstPresent(summary.successRatio, ownSummary.successRatio)),
+      deniedCount: numberValue(firstPresent(summary.deniedCount, ownSummary.deniedCount)),
+      incompleteCount: numberValue(
+        firstPresent(summary.incompleteCount, ownSummary.incompleteCount),
+      ),
+      idleCount: numberValue(firstPresent(summary.idleCount, ownSummary.idleCount)),
     },
+    // What this root/band actually covers — supplied by the caller, which owns
+    // the child index (Timeline) or the loaded subtree (Navigator).
+    members: normalizeMembers(context.members),
     input: present(input) ? String(input) : null,
     output: present(output) ? String(output) : null,
     attributes: attrs,
@@ -547,27 +711,124 @@ export function spanDetailFields(detail) {
   };
   add("name", d.name);
   add("kind", d.kind);
+  add("role", d.role);
+  add("outcome", d.outcome);
   add("status", d.status);
   add("state", d.state);
   if (Number.isFinite(d.startMs)) add("started", new Date(d.startMs).toISOString());
   if (Number.isFinite(d.endMs)) add("ended", new Date(d.endMs).toISOString());
   if (Number.isFinite(d.durationMs)) add("duration", fmtDuration(d.durationMs));
   add("agent", d.agent);
+  add("feature", d.feature);
   add("worker", d.worker);
+  add("orchestrator", d.orchestrator);
   add("model", d.model);
   add("project", d.projectName);
+  add("repo", d.repo);
   add("session", d.sessionId);
+  add("run", d.runId);
+  if (Number.isFinite(d.turnIndex)) add("turn", d.turnIndex);
+  add("turn ID", d.turnId);
   add("trace ID", d.traceId);
   add("span ID", d.spanId);
   add("parent span ID", d.parentSpanId);
+  add("agent DID", d.agentDid);
+  const members = d.members;
+  if (members) {
+    if (members.virtual) add("session type", "virtual scheduler session");
+    if (Number.isFinite(members.count)) add("covers", membersCoverText(members));
+    if (Number.isFinite(members.heartbeatCount)) add("heartbeats", members.heartbeatCount);
+    if (Number.isFinite(members.workCount)) add("work ticks", members.workCount);
+    if (members.features && members.features.length) {
+      add("scheduled features", members.features.join(", "));
+    }
+    if (Number.isFinite(members.lastIdleMs)) add("last idle", relTime(members.lastIdleMs));
+    if (Number.isFinite(members.lastWorkMs)) add("last work", relTime(members.lastWorkMs));
+  }
   const stats = d.stats || {};
   if (Number.isFinite(stats.turnCount)) add("turns", stats.turnCount);
   if (Number.isFinite(stats.toolCount)) add("tools", stats.toolCount);
   if (Number.isFinite(stats.errorCount)) add("errors", stats.errorCount);
+  if (Number.isFinite(stats.deniedCount)) add("denied", stats.deniedCount);
+  if (Number.isFinite(stats.incompleteCount)) add("incomplete", stats.incompleteCount);
+  if (Number.isFinite(stats.idleCount)) add("idle", stats.idleCount);
   if (Number.isFinite(stats.successRatio)) {
     add("success", `${Math.round(stats.successRatio * 100)}%`);
   }
   return fields;
+}
+
+// "42 spans over 3h" — what a container actually holds, and across how long.
+function membersCoverText(members) {
+  const over =
+    Number.isFinite(members.durationMs) && members.durationMs > 0
+      ? ` over ${fmtDuration(members.durationMs)}`
+      : "";
+  return `${plural(members.count, "span")}${over}`;
+}
+
+// ── Shared hover-tooltip contract (#88) ──────────────────────
+//
+// The Timeline hover used to read "<name> / AGENT / instant / ok" — four words,
+// none of them the answer to "what is this?". These lines come off the SAME
+// normalized detail the popover/inspector render, so hover and click can never
+// disagree. Returns `{text, tone}` rows ("dim" | "warn"); the caller owns the
+// markup.
+export function spanTooltipLines(detail) {
+  const d = detail || {};
+  const lines = [];
+  const abandoned = present(d.state) && String(d.state).startsWith("abandoned");
+  const head = [];
+  if (present(d.kind)) head.push(String(d.kind));
+  if (present(d.role)) head.push(String(d.role));
+  // "completed" adds nothing next to the state; a refusal / heartbeat is the
+  // headline signal (#84/#87).
+  if (present(d.outcome) && String(d.outcome) !== OUTCOME_COMPLETED) {
+    head.push(String(d.outcome));
+  }
+  if (present(d.state) && d.state !== "completed" && !abandoned) head.push(String(d.state));
+  if (Number.isFinite(d.durationMs) && d.durationMs > 0) head.push(fmtDuration(d.durationMs));
+  if (present(d.status)) head.push(String(d.status));
+  if (head.length) lines.push({ text: head.join(" · "), tone: "dim" });
+  if (abandoned) lines.push({ text: `⚠ ${d.state}`, tone: "warn" });
+  if (present(d.feature)) lines.push({ text: `feature: ${d.feature}`, tone: "dim" });
+  if (present(d.orchestrator)) {
+    lines.push({ text: `orchestrator: ${d.orchestrator}`, tone: "dim" });
+  }
+  const ids = [];
+  if (present(d.runId)) ids.push(`run ${d.runId}`);
+  if (Number.isFinite(d.turnIndex)) ids.push(`turn ${d.turnIndex}`);
+  else if (present(d.turnId)) ids.push(`turn ${d.turnId}`);
+  if (ids.length) lines.push({ text: ids.join(" · "), tone: "dim" });
+  const stats = d.stats || {};
+  const statParts = [];
+  if (Number.isFinite(stats.turnCount)) statParts.push(plural(stats.turnCount, "turn"));
+  if (Number.isFinite(stats.toolCount)) statParts.push(plural(stats.toolCount, "tool"));
+  if (Number.isFinite(stats.successRatio)) {
+    statParts.push(`${Math.round(stats.successRatio * 100)}% ok`);
+  }
+  if (Number.isFinite(stats.deniedCount) && stats.deniedCount > 0) {
+    statParts.push(`${stats.deniedCount} denied`);
+  }
+  if (Number.isFinite(stats.incompleteCount) && stats.incompleteCount > 0) {
+    statParts.push(`${stats.incompleteCount} incomplete`);
+  }
+  if (statParts.length) lines.push({ text: statParts.join(" · "), tone: "dim" });
+  const members = d.members;
+  if (members) {
+    if (members.virtual) lines.push({ text: "virtual scheduler session", tone: "dim" });
+    const memberParts = [];
+    if (Number.isFinite(members.count)) memberParts.push(`covers ${membersCoverText(members)}`);
+    if (Number.isFinite(members.heartbeatCount)) {
+      memberParts.push(plural(members.heartbeatCount, "heartbeat"));
+    }
+    if (Number.isFinite(members.workCount) && members.workCount > 0) {
+      memberParts.push(plural(members.workCount, "tick"));
+    }
+    if (memberParts.length) lines.push({ text: memberParts.join(" · "), tone: "dim" });
+  }
+  if (present(d.model)) lines.push({ text: `model: ${d.model}`, tone: "dim" });
+  return lines;
 }
 
 function attributesJson(attributes) {
