@@ -340,7 +340,7 @@ export function annotateRenderModel(spanIter, nowMs) {
   for (const s of list) if (s.spanId) bySpanId.set(s.spanId, s);
   const childrenOf = new Map(); // parent OTel spanId → [child records]
   for (const s of list) {
-    if (!s.parentId || !bySpanId.has(s.parentId)) continue;
+    if (!s.parentId) continue;
     let arr = childrenOf.get(s.parentId);
     if (!arr) {
       arr = [];
