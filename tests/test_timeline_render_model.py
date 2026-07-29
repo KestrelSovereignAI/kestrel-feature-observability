@@ -61,7 +61,7 @@ def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
 
 
 _HARNESS = r"""
-import { annotateRenderModel, openStartFloors } from "./timeline.js";
+import { annotateRenderModel, openStartFloors, schedulerBandModel } from "./timeline.js";
 
 // A normalized span record shaped like timeline.js's normalize() output.
 let idc = 0;
@@ -323,6 +323,75 @@ const out = {};
   out.abandonedBeyondReconcile = { abandoned: run.rAbandoned, floorEmpty: floors.get("R2") == null };
 }
 
+// #87 — the VIRTUAL `session=scheduler` band: K idle heartbeats + M work ticks.
+// Two failures this must pin down at once:
+//  (a) the emitter used to DROP idle ticks (#42), which made an idle-but-alive
+//      scheduler indistinguishable from a dead one. They now emit, so the
+//      renderer owns their legibility — every tick stays represented (nothing is
+//      silently collapsed) and idle is visually its OWN category, not work.
+//  (b) every tick parents into ONE immortal per-process pseudo-root, so the raw
+//      band geometry paints a continuous envelope — observed live as a 5-HOUR bar
+//      spanning two instant ticks 5h apart. The band must report `envelope:false`.
+// Tick spans are INSTANT (the scheduler never stamps execution_time_ms, so the
+// emitter makes them zero-duration point spans) and each pairs with its own
+// "(started)" marker — the real producer shape from hook.py.
+{
+  const K = 3, M = 2;
+  const root = span({ name: "kestrel-agent", start: 1000, kind: "AGENT", spanId: "scr", sessionId: "scheduler" });
+  const members = [root];
+  const idles = [], idleMarkers = [], works = [];
+  for (let i = 0; i < K; i++) {
+    const t = 2000 + i * 500;
+    const m = span({ name: "restart_coordinator (started)", start: t, marker: "start", spanId: `sim${i}`, parentId: "scr", sessionId: "scheduler" });
+    const r = span({ name: "restart_coordinator", start: t, end: t, spanId: `sir${i}`, parentId: "scr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "idle" } } });
+    idleMarkers.push(m); idles.push(r); members.push(m, r);
+  }
+  for (let i = 0; i < M; i++) {
+    const t = 6000 + i * 500;
+    const m = span({ name: "training_cycle (started)", start: t, marker: "start", spanId: `swm${i}`, parentId: "scr", sessionId: "scheduler" });
+    const r = span({ name: "training_cycle", start: t, end: t, spanId: `swr${i}`, parentId: "scr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "completed" } } });
+    works.push(r); members.push(m, r);
+  }
+  annotateRenderModel(members, NOW);
+  out.schedulerBand = {
+    model: schedulerBandModel(members),
+    // Idle ticks are their own render category; work ticks are NOT.
+    idleFlags: idles.map((s) => s.rIdle),
+    idleLabels: idles.map((s) => s.rLabel),
+    workIdleFlags: works.map((s) => s.rIdle),
+    // An idle tick is NOT a refusal — it ran, it just did nothing — so it must
+    // never take the wide `denied`/`incomplete` stub treatment.
+    idleOutcomes: idles.map((s) => s.rOutcome),
+    // Every member is flagged as scheduler-session (band self-identification).
+    allScheduler: members.every((s) => s.rScheduler === true),
+    // Nothing is dropped: the only hidden spans are the paired "(started)"
+    // markers, exactly as for any other twin — no tick is hidden.
+    markersPaired: idleMarkers.every((s) => s.rHide === true),
+    hiddenTicks: [...idles, ...works].filter((s) => s.rHide).length,
+  };
+}
+// #87 contrast — a normal agent band is NOT a scheduler band: no aggregate model,
+// so it keeps its ordinary continuous session envelope.
+{
+  const turn = span({ name: "claude-code turn 1", start: 100, marker: "start", kind: "AGENT", spanId: "nsb", sessionId: "S9", attrs: { kestrel: { turn_index: 1 } } });
+  const tool = span({ name: "Bash", start: 120, end: 150, spanId: "nsb2", parentId: "nsb", sessionId: "S9" });
+  annotateRenderModel([turn, tool], NOW);
+  out.nonSchedulerBand = {
+    model: schedulerBandModel([turn, tool]),
+    scheduler: turn.rScheduler,
+    idle: tool.rIdle,
+  };
+}
+// #87 — a scheduler band with ONLY heartbeats (the common idle case) still
+// reports its count, and the label singularizes correctly at K=1.
+{
+  const root = span({ name: "kestrel-agent", start: 1000, kind: "AGENT", spanId: "onr", sessionId: "scheduler" });
+  const m = span({ name: "restart_coordinator (started)", start: 2000, marker: "start", spanId: "onm", parentId: "onr", sessionId: "scheduler" });
+  const r = span({ name: "restart_coordinator", start: 2000, end: 2000, spanId: "ont", parentId: "onr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "idle" } } });
+  annotateRenderModel([root, m, r], NOW);
+  out.singleHeartbeat = { model: schedulerBandModel([root, m, r]), idle: r.rIdle };
+}
+
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -512,3 +581,52 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     abr = r["abandonedBeyondReconcile"]
     assert abr["abandoned"] is True
     assert abr["floorEmpty"] is True
+
+    # #87 — the virtual `session=scheduler` band. K=3 idle heartbeats + M=2 work
+    # ticks: the band shows a heartbeat COUNT and represents BOTH kinds, and
+    # nothing is dropped (the acceptance criterion for the renderer half).
+    sb = r["schedulerBand"]["model"]
+    assert sb is not None
+    assert sb["idleCount"] == 3
+    assert sb["workCount"] == 2
+    assert sb["tickCount"] == 5
+    # The band names itself as the virtual scheduler session and carries the
+    # visible aggregate — heartbeats are AGGREGATED, never collapsed to nothing.
+    assert sb["sessionId"] == "scheduler"
+    assert sb["virtual"] is True
+    assert sb["label"] == "scheduler · 3 heartbeats · 2 ticks"
+    # The 5-hour-bar fix: this band must NOT paint a continuous envelope.
+    assert sb["envelope"] is False
+    # Every member still renders — the aggregate is additive, not a filter.
+    assert sb["spanCount"] == r["schedulerBand"]["model"]["spanCount"]
+    assert sb["spanCount"] == 11  # root + (marker+tick) × 5
+
+    # Idle ticks are their own visual category (teal beat + "· idle" label); work
+    # ticks are not. An idle tick is NOT a refusal, so it never takes the wide
+    # denied/incomplete stub — it ran, it just did nothing.
+    sbb = r["schedulerBand"]
+    assert sbb["idleFlags"] == [True, True, True]
+    assert sbb["idleLabels"] == ["restart_coordinator · idle"] * 3
+    assert sbb["workIdleFlags"] == [False, False]
+    assert sbb["idleOutcomes"] == [None, None, None]
+    # The band self-identifies on every span (feeds the band tooltip).
+    assert sbb["allScheduler"] is True
+    # Nothing dropped: the paired "(started)" markers hide exactly like any other
+    # twin, and NO tick is hidden.
+    assert sbb["markersPaired"] is True
+    assert sbb["hiddenTicks"] == 0
+
+    # A normal agent band is not a scheduler band — no aggregate model, so it
+    # keeps the ordinary continuous session envelope.
+    nsb = r["nonSchedulerBand"]
+    assert nsb["model"] is None
+    assert nsb["scheduler"] is False
+    assert nsb["idle"] is False
+
+    # The all-idle band (the common every-minute case) still reports its count,
+    # and the label singularizes at K=1 with no work-tick clause.
+    sh = r["singleHeartbeat"]
+    assert sh["idle"] is True
+    assert sh["model"]["idleCount"] == 1
+    assert sh["model"]["workCount"] == 0
+    assert sh["model"]["label"] == "scheduler · 1 heartbeat"
