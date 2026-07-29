@@ -11,8 +11,12 @@
 //   Phoenix — the curated same-origin Phoenix embed (unchanged from #41),
 //     used for exhaustive trace forensics.
 //
-// Selection persists (URL hash `#observability/<id>` wins so links are
-// shareable; localStorage is the fallback; else Timeline).
+// View state persists through the console's panel view-state provider
+// (kestrel-sovereign #2802): the active sub-tab AND the Timeline's
+// zoom/pan/live/drill survive a sub-tab remount and a full page reload. A URL
+// hash (`#observability/<id>`) still wins for the sub-tab so links stay
+// shareable; else the persisted tab; else Timeline. There is no bespoke
+// localStorage path here — see "Panel view state" below.
 //
 // ── Phoenix embed subtab ──
 // On mount we probe availability by minting an embed session:
@@ -56,6 +60,7 @@
 // nav tab always renders.
 
 import { registerPanel } from "/js/ui-ext/panels.js";
+import { storeGet } from "/js/ui_state.mjs";
 import API from "/js/api.js";
 import { mount as mountNavigator } from "./navigator.js";
 import { mount as mountTimeline } from "./timeline.js";
@@ -70,9 +75,10 @@ const PHOENIX_GRAPHQL_URL = "/phoenix/graphql";
 // per mount via a `data-project` attribute on the panel container.
 const DEFAULT_PROJECT = "kestrel-fleet";
 
-// localStorage switch — `kestrel.observability.curated = 0` disables curation
-// and deep-linking (debug: see the full uncurated Phoenix surface). Any other
-// value (or unset) keeps curation on.
+// Debug switch — `kestrel.observability.curated = 0` disables curation and
+// deep-linking (see the full uncurated Phoenix surface). Any other value (or
+// unset) keeps curation on. Read through the console's shared ui-state helper,
+// never raw localStorage.
 const CURATED_FLAG = "kestrel.observability.curated";
 
 // Non-observability nav modules to hide. Matched by href substring (survives
@@ -92,11 +98,9 @@ const HIDE_TEXTS = new Set([
 // ── Curation helpers ──────────────────────────────────────────
 
 function curationEnabled() {
-  try {
-    return window.localStorage.getItem(CURATED_FLAG) !== "0";
-  } catch (_e) {
-    return true; // storage blocked → default to curated
-  }
+  // `storeGet` is ui_state.mjs's guarded raw-string read: blocked/absent storage
+  // returns null → curated, exactly the pre-hook default.
+  return storeGet(CURATED_FLAG) !== "0";
 }
 
 function projectName(container) {
@@ -502,8 +506,6 @@ const VIEWS = [
   { id: "phoenix", label: "Phoenix", mount: mountPhoenix },
 ];
 
-const STORAGE_KEY = "kestrel.observability.subtab";
-
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -512,10 +514,48 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-// Persisted selection survives reloads. URL hash (#observability/<id>) wins so a
-// link is shareable; localStorage is the fallback; else the first view
-// (Timeline).
-function readPersistedViewId() {
+// ── Panel view state (#86) ────────────────────────────────────
+//
+// The panel's own view — active sub-tab plus the Timeline's zoom/pan/live/drill
+// — persists through the console's panel view-state provider (sovereign #2802)
+// declared on `registerPanel` below. The FRAMEWORK owns the storage (namespaced
+// `kestrel:ui:panel:observability:view`, written through `ui_state.mjs`) and the
+// snapshot moments (deactivating this panel, a re-gate, re-registration, page
+// unload); it restores by calling `setState` once, right after `render`. The
+// bespoke per-sub-tab localStorage key this replaces is gone.
+//
+// The provider is declared at registration time, before any mount exists, so it
+// delegates to whichever panel instance is live and falls back to the last state
+// it saw when none is (the provider outlives a mount; a mount does not).
+
+/** State port of the live `mount()`, or null when the panel is unmounted. */
+let activeInstance = null;
+/** Last state seen from/for the framework — seeds the next mount. */
+let panelState = null;
+
+function panelGetState() {
+  if (activeInstance) {
+    try {
+      const snapshot = activeInstance.getState();
+      if (snapshot) panelState = snapshot;
+    } catch (_e) {
+      /* a broken snapshot must never clobber a good stored value */
+    }
+  }
+  // `undefined` tells the framework there is nothing to persist yet.
+  return panelState || undefined;
+}
+
+function panelSetState(state) {
+  if (!state || typeof state !== "object") return;
+  panelState = state;
+  if (activeInstance) activeInstance.setState(state);
+}
+
+// A shareable URL hash (#observability/<id>) pins the sub-tab and outranks the
+// persisted state, so a link always lands where it points. Returns null when the
+// hash names no known view.
+function hashViewId() {
   try {
     const hash = (typeof location !== "undefined" && location.hash) || "";
     const m = /#observability\/([\w-]+)/.exec(hash);
@@ -523,21 +563,20 @@ function readPersistedViewId() {
   } catch (_e) {
     /* ignore */
   }
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored && VIEWS.some((v) => v.id === stored)) return stored;
-  } catch (_e) {
-    /* ignore */
-  }
-  return VIEWS[0].id;
+  return null;
 }
 
-function persistViewId(id) {
-  try {
-    localStorage.setItem(STORAGE_KEY, id);
-  } catch (_e) {
-    /* ignore */
-  }
+// The sub-tab out of a persisted state, or null when absent/stale (a state
+// written by an older build, or naming a view that no longer exists) — the
+// caller then falls back to today's default.
+function storedViewId(state) {
+  const id = state && state.tab;
+  return typeof id === "string" && VIEWS.some((v) => v.id === id) ? id : null;
+}
+
+// Keep the shareable hash in sync with the active sub-tab. Persistence itself
+// is the provider's job, not this function's.
+function updateHash(id) {
   try {
     if (typeof location !== "undefined") {
       location.hash = `observability/${id}`;
@@ -553,12 +592,19 @@ export function mount(container) {
   ensureStyles();
 
   const project = projectName(container);
-  let activeId = readPersistedViewId();
+  // Sub-tab precedence: shareable hash → persisted state → Timeline. A hash hit
+  // is PINNED: the framework's `setState` must not steer a shared link away.
+  const pinnedId = hashViewId();
+  let activeId = pinnedId || storedViewId(panelState) || VIEWS[0].id;
+  // Latest Timeline view state, carried across sub-tab switches so bouncing
+  // through Phoenix and back remounts the SAME window instead of a fresh one.
+  let timelineState = (panelState && panelState.timeline) || null;
   let handle = null; // handle returned by the active view's mount()
   let destroyed = false;
   let pendingTraceUrl = null; // set by the navigator's "open in Phoenix" (#46)
   let pendingRevealTarget = null; // Timeline → Navigator exact span
   let pendingTimelineTarget = null; // Navigator → Timeline exact span
+  let mountedId = null; // id of the sub-view currently in contentEl
 
   container.innerHTML = `
     <div class="obs-panel">
@@ -575,13 +621,29 @@ export function mount(container) {
 
   const contentEl = container.querySelector("[data-obs-content]");
 
+  // Capture the live Timeline's view state before it stops being the source of
+  // truth (a sub-tab switch, a panel teardown, or a provider snapshot). Keyed on
+  // `mountedId`, NOT `activeId` — `mountView` retargets `activeId` before it
+  // unmounts, so the outgoing handle is the only reliable subject here.
+  function snapshotTimeline() {
+    if (mountedId !== "timeline" || typeof handle?.getState !== "function") return;
+    try {
+      const snapshot = handle.getState();
+      if (snapshot) timelineState = snapshot;
+    } catch (_e) {
+      /* a broken snapshot must never clobber the last good one */
+    }
+  }
+
   function unmountActive() {
+    snapshotTimeline();
     try {
       handle?.destroy?.();
     } catch (_e) {
       /* ignore */
     }
     handle = null;
+    mountedId = null;
     if (contentEl) contentEl.innerHTML = "";
   }
 
@@ -614,11 +676,18 @@ export function mount(container) {
       pendingTimelineTarget = null;
     }
     handle = view.mount(contentEl, opts);
+    mountedId = view.id;
+    if (view.id === "timeline" && timelineState && typeof handle?.setState === "function") {
+      // Restore zoom/pan/live/drill into the freshly mounted Timeline. Applied
+      // synchronously after mount — before its async boot settles — so the
+      // initial poll fills the restored window, not the default one (#86).
+      handle.setState(timelineState);
+    }
   }
 
   function switchTo(id) {
     if (destroyed || id === activeId) return;
-    persistViewId(id);
+    updateHash(id);
     mountView(id);
   }
 
@@ -665,10 +734,53 @@ export function mount(container) {
     btn.addEventListener("click", () => switchTo(btn.dataset.view));
   });
 
-  mountView(activeId);
+  // The framework restores our persisted state by calling `setState`
+  // synchronously right after this `render` returns (panels.js `activate`), so
+  // defer the first view mount by a microtask: the restored sub-tab then mounts
+  // directly instead of Timeline mounting (and hitting Phoenix) only to be torn
+  // down a tick later. Every other mount path runs synchronously as before.
+  let pendingFirstMount = true;
+
+  // This mount's port onto the panel-level view-state provider.
+  const statePort = {
+    getState() {
+      snapshotTimeline();
+      return { tab: activeId, timeline: timelineState };
+    },
+    setState(state) {
+      if (destroyed || !state || typeof state !== "object") return;
+      if (state.timeline && typeof state.timeline === "object") {
+        timelineState = state.timeline;
+      }
+      const next = (!pinnedId && storedViewId(state)) || activeId;
+      if (pendingFirstMount) {
+        activeId = next; // the deferred first mount lands straight on it
+        return;
+      }
+      if (next !== activeId) {
+        switchTo(next);
+      } else if (activeId === "timeline" && typeof handle?.setState === "function") {
+        handle.setState(timelineState);
+      }
+    },
+  };
+
+  const firstMount = () => {
+    if (destroyed || !pendingFirstMount) return;
+    pendingFirstMount = false;
+    mountView(activeId);
+  };
+  if (typeof queueMicrotask === "function") queueMicrotask(firstMount);
+  else Promise.resolve().then(firstMount);
+
+  activeInstance = statePort;
 
   return {
     destroy() {
+      // Snapshot before teardown so a host that drops the mount by another route
+      // (agent switch, re-registration) still leaves the provider a live value.
+      panelState = statePort.getState();
+      if (activeInstance === statePort) activeInstance = null;
       destroyed = true;
       unmountActive();
     },
@@ -737,4 +849,10 @@ registerPanel({
   panelId: "observability",
   label: "Observability",
   render: mount,
+  // Persist/restore this panel's own view — active sub-tab plus the Timeline's
+  // zoom/pan/live/drill — through the console's view-state provider (#2802).
+  // The framework owns the key (`kestrel:ui:panel:observability:view`) and the
+  // storage (`ui_state.mjs`); a console too old to know the hook just ignores
+  // the extra field and the panel behaves as it did before.
+  viewState: { key: "view", getState: panelGetState, setState: panelSetState },
 });
