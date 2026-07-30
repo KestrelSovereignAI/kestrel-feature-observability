@@ -61,7 +61,7 @@ def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
 
 
 _HARNESS = r"""
-import { annotateRenderModel, openStartFloors, schedulerBandModel } from "./timeline.js";
+import { annotateRenderModel, heartbeatRuns, openStartFloors, schedulerBandModel } from "./timeline.js";
 
 // A normalized span record shaped like timeline.js's normalize() output.
 let idc = 0;
@@ -340,9 +340,10 @@ const out = {};
 //      scheduler indistinguishable from a dead one. They now emit, so the
 //      renderer owns their legibility — every tick stays represented (nothing is
 //      silently collapsed) and idle is visually its OWN category, not work.
-//  (b) every tick parents into ONE immortal per-process pseudo-root, so the raw
-//      band geometry paints a continuous envelope — observed live as a 5-HOUR bar
-//      spanning two instant ticks 5h apart. The band must report `envelope:false`.
+//  (b) every tick parents into ONE immortal per-process pseudo-root, so the band
+//      must not read as a solid running task — but its extent is REAL and must be
+//      drawn (#92): the model reports min→max plus `envelope:true`, and the paint
+//      layer styles it as virtual (translucent/dashed) rather than suppressing it.
 // Tick spans are INSTANT (the scheduler never stamps execution_time_ms, so the
 // emitter makes them zero-duration point spans) and each pairs with its own
 // "(started)" marker — the real producer shape from hook.py.
@@ -401,6 +402,46 @@ const out = {};
   const r = span({ name: "restart_coordinator", start: 2000, end: 2000, spanId: "ont", parentId: "onr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "idle" } } });
   annotateRenderModel([root, m, r], NOW);
   out.singleHeartbeat = { model: schedulerBandModel([root, m, r]), idle: r.rIdle };
+}
+
+// #92 — the live shape: a virtual scheduler band of K heartbeats ~1/min spanning
+// ~29 minutes, which painted as a short 0ms-looking stub. Two things must hold:
+// the band reports its REAL extent (so the envelope is drawn across 14:07→14:41,
+// not collapsed to a point), and the beats coalesce ONLY at a scale where they'd
+// actually overdraw — a paint-time decision against the current px/ms, so zooming
+// in separates them again.
+{
+  const HB_BASE = 1_000_000;
+  const MIN = 60_000;
+  const K = 30; // ticks 1/min → a 29-minute extent, the observed live band
+  const root = span({ name: "kestrel-agent", start: HB_BASE, kind: "AGENT", spanId: "hbr", sessionId: "scheduler" });
+  const members = [root];
+  const idles = [];
+  for (let i = 0; i < K; i++) {
+    const t = HB_BASE + i * MIN;
+    members.push(span({ name: "restart_coordinator (started)", start: t, marker: "start", spanId: `hbm${i}`, parentId: "hbr", sessionId: "scheduler" }));
+    const r = span({ name: "restart_coordinator", start: t, end: t, spanId: `hbt${i}`, parentId: "hbr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "idle" } } });
+    idles.push(r);
+    members.push(r);
+  }
+  const CLOCK = HB_BASE + 40 * MIN;
+  annotateRenderModel(members, CLOCK);
+  // The two real zoom levels of the Timeline window over the same plot width.
+  const PLOT_PX = 1200;
+  const ZOOM_IN = PLOT_PX / (30 * MIN); // the default 30-minute window
+  const ZOOM_OUT = PLOT_PX / (24 * 60 * MIN); // the widest 24-hour window
+  const runOut = (runs) => runs.map((r) => ({ startMs: r.startMs, endMs: r.endMs, count: r.count, coalesced: r.coalesced }));
+  // Same band with an extra beat 100ms behind the second one: at the SAME zoom
+  // that keeps the 1/min beats apart, only that colliding pair merges.
+  const near = [idles[0], idles[1], span({ name: "restart_coordinator", start: HB_BASE + MIN + 100, end: HB_BASE + MIN + 100, spanId: "hbn", parentId: "hbr", sessionId: "scheduler", attrs: { kestrel: { tool_outcome: "idle" } } })];
+  out.heartbeatBand = {
+    model: schedulerBandModel(members, CLOCK),
+    firstTickMs: idles[0].start,
+    lastTickMs: idles[K - 1].start,
+    zoomedIn: runOut(heartbeatRuns(idles, ZOOM_IN)),
+    zoomedOut: runOut(heartbeatRuns(idles, ZOOM_OUT)),
+    mixed: runOut(heartbeatRuns(near, ZOOM_IN)),
+  };
 }
 
 process.stdout.write(JSON.stringify(out));
@@ -616,9 +657,15 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     # visible aggregate — heartbeats are AGGREGATED, never collapsed to nothing.
     assert sb["sessionId"] == "scheduler"
     assert sb["virtual"] is True
-    assert sb["label"] == "scheduler · 3 heartbeats · 2 ticks"
-    # The 5-hour-bar fix: this band must NOT paint a continuous envelope.
-    assert sb["envelope"] is False
+    # …including its real duration, so the label says what the band covers.
+    assert sb["label"] == "scheduler · 3 heartbeats · 2 ticks · 5.5s"
+    # #92: the band's envelope IS drawn — across its real min→max extent (the
+    # root at 1000 through the last work tick at 6500) — because the fix for the
+    # 5-hour bar is the virtual STYLE, not hiding how long the session ran.
+    assert sb["envelope"] is True
+    assert sb["startMs"] == 1000
+    assert sb["endMs"] == 6500
+    assert sb["durationMs"] == 5500
     # Every member still renders — the aggregate is additive, not a filter.
     assert sb["spanCount"] == r["schedulerBand"]["model"]["spanCount"]
     assert sb["spanCount"] == 11  # root + (marker+tick) × 5
@@ -651,7 +698,54 @@ def test_annotate_render_model_resolves_producer_shapes(tmp_path):
     assert sh["idle"] is True
     assert sh["model"]["idleCount"] == 1
     assert sh["model"]["workCount"] == 0
-    assert sh["model"]["label"] == "scheduler · 1 heartbeat"
+    assert sh["model"]["label"] == "scheduler · 1 heartbeat · 1.0s"
+
+    # #92 — the live band: 30 heartbeats ~1/min over 29 minutes, which painted as
+    # a short 0ms-looking stub hiding both its extent and its ticks.
+    hb = r["heartbeatBand"]
+    K, MIN = 30, 60_000
+
+    # (1) The envelope spans the REAL extent (~29m), not a zero-duration point,
+    # and stays flagged virtual so the paint layer styles it translucent/dashed
+    # instead of as a solid task bar.
+    hbm = hb["model"]
+    assert hbm["envelope"] is True
+    assert hbm["virtual"] is True
+    assert hbm["startMs"] == hb["firstTickMs"]
+    assert hbm["endMs"] == hb["lastTickMs"]
+    assert hbm["durationMs"] == 29 * MIN
+    # The count label is ALWAYS present, coalescing or not — with the duration
+    # the operator went looking for.
+    assert hbm["label"] == "scheduler · 30 heartbeats · 29m 0s"
+    assert hbm["idleCount"] == K
+
+    # (2) Zoomed in (the default 30-minute window over a 1200px plot), 1/min beats
+    # are ~40px apart, so every tick is represented at its OWN real time.
+    zin = hb["zoomedIn"]
+    assert len(zin) == K
+    assert all(run["count"] == 1 and run["coalesced"] is False for run in zin)
+    assert [run["startMs"] for run in zin] == [hb["firstTickMs"] + i * MIN for i in range(K)]
+
+    # (3) Zoomed out (a 24-hour window over the same plot), the same beats are
+    # <1px apart, so they coalesce into ONE run — carrying the full count.
+    zout = hb["zoomedOut"]
+    assert len(zout) == 1
+    assert zout[0]["count"] == K
+    assert zout[0]["coalesced"] is True
+    # The run still covers the real extent, so the count sits on a bar wide
+    # enough to read rather than a smear at a point.
+    assert zout[0]["startMs"] == hb["firstTickMs"]
+    assert zout[0]["endMs"] == hb["lastTickMs"]
+
+    # (4) Coalescing is a per-pair PIXEL decision, not a mode: at the very zoom
+    # that keeps the 1/min beats apart, only a pair 100ms apart merges.
+    mixed = hb["mixed"]
+    assert [run["count"] for run in mixed] == [1, 2]
+    assert [run["coalesced"] for run in mixed] == [False, True]
+
+    # Nothing is dropped at any scale — every beat is accounted for in some run.
+    assert sum(run["count"] for run in zin) == K
+    assert sum(run["count"] for run in zout) == K
 
 
 # ── #88: what a container span COVERS ────────────────────────────────────────
