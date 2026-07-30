@@ -115,12 +115,23 @@ const OUTCOME_STUB_PX = 72;
 // An IDLE scheduler heartbeat (#87): a tick that ran successfully and did
 // nothing. Painted as a distinct narrow beat rather than the wide refusal stub —
 // heartbeats arrive every minute, so stubs would overdraw into an unreadable
-// smear — and coalesced into a COUNTED "N heartbeats" run when dense. Distinct
-// color so idle reads as "alive, nothing to do" at a glance, never mistaken for
-// work (kind color) or a refusal (the outcome stub).
+// smear — and coalesced into a COUNTED "N heartbeats" run only when the beats
+// would actually overlap at the current zoom (#92). Distinct color so idle reads
+// as "alive, nothing to do" at a glance, never mistaken for work (kind color) or
+// a refusal (the outcome stub).
 const IDLE_COLOR = "#2dd4bf"; // teal — alive but idle
 const HEARTBEAT_PX = 3; // one heartbeat beat's paint width
 const HEARTBEAT_LABEL_PX = 56; // a coalesced run at least this wide is labeled
+
+// The virtual scheduler session's own envelope (#92). It IS drawn across the
+// band's real min→max extent — hiding the extent hid the session's duration and
+// made a 29-minute band read as a 0ms stub — but never as a solid task bar: a
+// faint translucent wash under a dashed outline says "virtual/heartbeat session,
+// not a running task", which is what the original 5-hour-Claw-bar complaint was
+// actually about.
+const VIRTUAL_BAND_ALPHA = 0.07;
+const VIRTUAL_BAND_EDGE_ALPHA = 0.55;
+const VIRTUAL_BAND_DASH = [5, 4];
 
 // The marker / tool-outcome contract lives in phoenix.js (imported above), so the
 // Timeline's pairing rules and the shared detail model read the SAME keys:
@@ -134,8 +145,9 @@ const HEARTBEAT_LABEL_PX = 56; // a coalesced run at least this wide is labeled
 // any other twin, so a refusal renders as one visible stub instead of an orphan.
 
 // The emitter's per-process scheduler pseudo-session (`kestrel.session_id`), the
-// VIRTUAL session every cron tick parents into. Its band is rendered as discrete
-// ticks + an aggregate count rather than one continuous envelope (#87).
+// VIRTUAL session every cron tick parents into. Its band renders as a distinctly
+// virtual envelope across its real extent plus its discrete ticks and an
+// aggregate count (#87/#92).
 const SCHEDULER_SESSION_ID = "scheduler";
 
 // A non-sensitive per-call correlation id (the Claude hook's `tool_use_id`)
@@ -689,34 +701,49 @@ export function openStartFloors(spanIter) {
   return floors;
 }
 
-// ── Virtual scheduler-session band (#87) ──
+// ── Virtual scheduler-session band (#87/#92) ──
 //
 // Every scheduler tick parents into ONE immortal `session=scheduler` pseudo-root
-// (minted once per emitter process and reused for its whole lifetime), so the
-// raw band geometry paints one continuous envelope from the first tick to the
-// last — observed live as a 5-HOUR bar for two 0-duration ticks 5h apart.
-// Showing a virtual session is fine; showing it as a mystery 5h block is not.
+// (minted once per emitter process and reused for its whole lifetime), so the raw
+// band geometry paints one continuous envelope from the first tick to the last —
+// observed live as a 5-HOUR bar for two 0-duration ticks 5h apart. The problem
+// with that bar was never that it EXISTED: it was that a plain session envelope
+// reads as a solid running task. Suppressing the envelope outright (#87) traded
+// that for the opposite lie — a 29-minute band of 71 heartbeats painting as a
+// short 0ms-looking stub, hiding both its real extent and its ticks.
 //
-// So a scheduler band renders as its DISCRETE ticks plus a visible aggregate
-// count, never a continuous envelope, and it names itself as the virtual
-// scheduler session. Aggregation is strictly render-time: the emitter suppresses
-// nothing, and the count is always shown, so heartbeats are never silently
-// collapsed to nothing.
+// So the band reports its REAL extent (min start → max end over its members) and
+// asks for an envelope, which the paint layer draws in the distinctly VIRTUAL
+// style (translucent wash + dashed outline, never a solid bar) under a label that
+// names the session, its heartbeat count and its duration. Aggregation stays
+// strictly render-time: the emitter suppresses nothing, and the count is always
+// shown, so heartbeats are never silently collapsed to nothing.
 //
 // Pure + exported for the render-model tests: takes a band's members (as
-// annotated by `annotateRenderModel`) and returns the band's scheduler model, or
-// null when this isn't a scheduler band.
-export function schedulerBandModel(members) {
+// annotated by `annotateRenderModel`) and the live clock (optional — only open
+// members need it) and returns the band's scheduler model, or null when this
+// isn't a scheduler band.
+export function schedulerBandModel(members, nowMs) {
   let scheduler = false;
   let idleCount = 0;
   let workCount = 0;
   let spanCount = 0;
   let sessionId = null;
+  let startMs = Infinity;
+  let endMs = -Infinity;
+  let open = false;
   for (const s of members) {
     spanCount += 1;
     if (!isSchedulerSpan(s)) continue;
     scheduler = true;
     if (sessionId == null) sessionId = s.sessionId;
+    // The band's real time extent (#92) — the same min→max the layout gives any
+    // other band, so the envelope the paint layer draws covers exactly the
+    // 14:07→14:41 the operator is looking for.
+    if (s.start < startMs) startMs = s.start;
+    const e = nowMs != null ? effEnd(s, nowMs) : s.rEnd != null ? s.rEnd : s.end;
+    if (Number.isFinite(e) && e > endMs) endMs = e;
+    if (isOpen(s)) open = true;
     if (isIdleBeat(s)) {
       idleCount += 1;
       continue;
@@ -729,19 +756,62 @@ export function schedulerBandModel(members) {
     if (s.kind === "TOOL") workCount += 1;
   }
   if (!scheduler) return null;
+  if (!Number.isFinite(startMs)) startMs = null;
+  if (!Number.isFinite(endMs) || (startMs != null && endMs < startMs)) endMs = startMs;
+  const durationMs = startMs != null && endMs != null ? endMs - startMs : 0;
   const beats = `${idleCount} heartbeat${idleCount === 1 ? "" : "s"}`;
   const ticks = workCount ? ` · ${workCount} tick${workCount === 1 ? "" : "s"}` : "";
+  const span = durationMs > 0 ? ` · ${fmtDuration(durationMs)}` : "";
   return {
     sessionId,
     virtual: true,
-    // The whole point: no continuous session envelope for this band.
-    envelope: false,
+    // Draw the extent — but in the virtual style, which is what keeps it from
+    // reading as a task (#92).
+    envelope: true,
+    startMs,
+    endMs,
+    durationMs,
+    open,
     idleCount,
     workCount,
     tickCount: idleCount + workCount,
     spanCount, // every member still renders — nothing is dropped
-    label: `scheduler · ${beats}${ticks}`,
+    label: `scheduler · ${beats}${ticks}${span}`,
   };
+}
+
+// ── Zoom-adaptive heartbeat coalescing (#92) ──
+//
+// Heartbeats are zero-duration point spans arriving about once a minute, so at a
+// wide zoom their beats would overdraw into an unreadable smear — but at a tight
+// zoom each one is individually meaningful, and collapsing them unconditionally
+// is what made a 29-minute band of 71 ticks look like one stub. Coalescing is
+// therefore a PAINT decision taken against the CURRENT px/ms scale, never a fixed
+// model-level collapse: two beats merge only when the pixels they paint would
+// actually collide. Zoom in → every tick stands at its real time; zoom out → the
+// run carries its COUNT, so nothing is ever silently dropped.
+//
+// Pure + exported for the render-model tests: `ticks` are the idle spans sharing
+// one track and `pxPerMs` is the current scale. Returns the runs to paint, in
+// time order, each with the beats it stands for.
+export function heartbeatRuns(ticks, pxPerMs, beatPx = HEARTBEAT_PX) {
+  const sorted = [...ticks].sort((a, b) => a.start - b.start);
+  const runs = [];
+  let cur = null;
+  for (const s of sorted) {
+    // The previous beat paints [x, x + beatPx]; this one collides only when it
+    // lands inside that width at the current scale.
+    if (cur && (s.start - cur.endMs) * pxPerMs <= beatPx) {
+      cur.endMs = s.start;
+      cur.count += 1;
+      cur.coalesced = true;
+      cur.spans.push(s);
+      continue;
+    }
+    cur = { startMs: s.start, endMs: s.start, count: 1, coalesced: false, spans: [s] };
+    runs.push(cur);
+  }
+  return runs;
 }
 
 // ── Member rollup: what a container span actually holds (#88) ──
@@ -1456,9 +1526,9 @@ export function mount(container, opts = {}) {
       traceId: rep ? rep.traceId : null,
       count: members.length,
       // Non-null only for the virtual `session=scheduler` band: its aggregate
-      // heartbeat/tick counts, and the instruction to skip the continuous
-      // envelope the immortal pseudo-root would otherwise imply (#87).
-      scheduler: schedulerBandModel(members),
+      // heartbeat/tick counts plus the real extent its envelope is drawn across,
+      // in the distinctly virtual style (#87/#92).
+      scheduler: schedulerBandModel(members, nowMs),
     };
   }
 
@@ -1814,12 +1884,24 @@ export function mount(container, opts = {}) {
       if (!onScreen(b.start, b.end, b.open)) continue;
       const r = rectFor(b.start, b.end, b.open, b.trackTop, b.trackCount);
       if (b.scheduler) {
-        // The virtual scheduler session (#87): its immortal pseudo-root would
-        // otherwise paint hours of "activity" between two instant ticks. Draw NO
-        // envelope — just the aggregate count, so the band names itself and its
-        // heartbeats stay counted, while the ticks below are the only geometry.
-        // The (unpainted) rect is still pushed for hit-testing, so hovering the
-        // band region identifies it as the virtual scheduler session.
+        // The virtual scheduler session (#87/#92). Its extent is REAL — 71
+        // heartbeats really do span 29 minutes — so the envelope is drawn across
+        // it; what must never happen is it reading as a solid running task, and
+        // that is the STYLE's job: a faint wash under a dashed outline, labeled
+        // with the session's heartbeat count and duration. The ticks below stay
+        // the per-beat geometry.
+        if (b.scheduler.envelope) {
+          ctx.fillStyle = IDLE_COLOR;
+          ctx.globalAlpha = VIRTUAL_BAND_ALPHA;
+          ctx.fillRect(r.cx, r.ry, r.w, r.rh);
+          ctx.globalAlpha = VIRTUAL_BAND_EDGE_ALPHA;
+          ctx.strokeStyle = IDLE_COLOR;
+          ctx.lineWidth = 1;
+          ctx.setLineDash(VIRTUAL_BAND_DASH);
+          ctx.strokeRect(r.cx + 0.5, r.ry + 0.5, Math.max(1, r.w - 1), Math.max(1, r.rh - 1));
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+        }
         ctx.fillStyle = theme.muted;
         ctx.font = "10px system-ui, sans-serif";
         ctx.fillText(
@@ -1841,9 +1923,10 @@ export function mount(container, opts = {}) {
     //    the exposed part of each envelope hovers/clicks as that parent span.
     const envs = (row.envelopes || []).slice().sort((a, b) => a.depth - b.depth);
     for (const e of envs) {
-      // The scheduler pseudo-root's subtree envelope is the OTHER half of the
-      // 5-hour bar (every tick is its child), so it's suppressed for the same
-      // reason as the band fill: the ticks are the geometry (#87).
+      // The scheduler pseudo-root's subtree envelope covers exactly the band the
+      // virtual envelope just painted (every tick is its child), so drawing it
+      // too would restore the solid kind-tinted task bar the virtual style exists
+      // to avoid — the band envelope is that geometry now (#87/#92).
       if (e.span.rScheduler) continue;
       if (!onScreen(e.start, e.end, e.open)) continue;
       const r = rectFor(e.start, e.end, e.open, e.trackTop, e.trackCount);
@@ -1880,37 +1963,59 @@ export function mount(container, opts = {}) {
       const ry = y + LANE_VPAD + track * TRACK_H;
       const bh = TRACK_H - 2;
       list.sort((a, b) => a.start - b.start);
-      let run = null; // pending density run {x0,x1,count,errored,heartbeat,span}
+      // Heartbeat coalescing is resolved against the CURRENT px/ms scale (#92),
+      // so beats merge only where they would genuinely overdraw — zoomed in they
+      // each stand at their real time. A highlighted beat is held out so a
+      // cross-view reveal can always land on the exact span.
+      const beats = list.filter((s) => s.rIdle && !isHighlighted(s));
+      const beatRunOf = new Map();
+      for (const hr of beats.length ? heartbeatRuns(beats, pxPerMs()) : []) {
+        for (const b of hr.spans) beatRunOf.set(b, hr);
+      }
+      let run = null; // pending sub-pixel density run {x0,x1,count,errored}
       const flush = () => {
         if (!run) return;
         const rw = Math.max(2, run.x1 - run.x0);
-        ctx.fillStyle = run.heartbeat ? IDLE_COLOR : DENSITY_COLOR;
+        ctx.fillStyle = DENSITY_COLOR;
         ctx.fillRect(run.x0, ry, rw, bh);
         if (run.errored) {
           ctx.fillStyle = ERROR_COLOR;
           ctx.fillRect(run.x0, ry, rw, 2);
         }
-        if (run.heartbeat && run.count > 1 && rw > HEARTBEAT_LABEL_PX) {
-          // A dense run of heartbeats carries its COUNT on the bar — aggregated,
-          // never silently collapsed (#87). Individual beats stay reachable by
-          // zooming in, exactly like the generic density strip.
+        drawn.push({ x: run.x0, y: ry, w: rw, h: bh, density: run.count });
+        run = null;
+      };
+      // One heartbeat run: the beats it stands for, painted across their real
+      // time extent and carrying the COUNT whenever the bar can hold it.
+      const drawBeatRun = (hr) => {
+        const cx = Math.max(GUTTER_W, timeToX(hr.startMs));
+        const w = Math.max(HEARTBEAT_PX, timeToX(hr.endMs) + HEARTBEAT_PX - cx);
+        ctx.fillStyle = IDLE_COLOR;
+        ctx.fillRect(cx, ry, w, bh);
+        if (hr.spans.some((s) => s.status === "error")) {
+          ctx.fillStyle = ERROR_COLOR;
+          ctx.fillRect(cx, ry, w, 2);
+        }
+        if (hr.count === 1) {
+          // A lone beat keeps its own span identity (hover/click reaches the
+          // tick), with a padded hit box so a 3px beat stays clickable.
+          drawHighlightRect(cx - 2, ry, w + 4, bh, hr.spans[0]);
+          drawn.push({ x: cx - 2, y: ry, w: w + 4, h: bh, span: hr.spans[0] });
+          return;
+        }
+        if (w > HEARTBEAT_LABEL_PX) {
+          // A coalesced run carries its COUNT on the bar — aggregated, never
+          // silently collapsed (#87). The beats separate again on zoom in.
           ctx.fillStyle = "#0b1120";
           ctx.font = "10px system-ui, sans-serif";
           ctx.save();
           ctx.beginPath();
-          ctx.rect(run.x0, ry, rw, bh);
+          ctx.rect(cx, ry, w, bh);
           ctx.clip();
-          ctx.fillText(`${run.count} heartbeats`, run.x0 + 3, ry + bh / 2);
+          ctx.fillText(`${hr.count} heartbeats`, cx + 3, ry + bh / 2);
           ctx.restore();
         }
-        // A lone beat keeps its own span identity (hover/click reaches the tick);
-        // a coalesced run reports how many it stands for.
-        drawn.push(
-          run.count === 1 && run.span
-            ? { x: run.x0, y: ry, w: rw, h: bh, span: run.span }
-            : { x: run.x0, y: ry, w: rw, h: bh, density: run.count, heartbeat: run.heartbeat },
-        );
-        run = null;
+        drawn.push({ x: cx, y: ry, w, h: bh, density: hr.count, heartbeat: true });
       };
       for (const s of list) {
         if (s.rAbandoned) {
@@ -1942,30 +2047,20 @@ export function mount(container, opts = {}) {
         if (s.rIdle) {
           // An idle scheduler heartbeat (#87): zero-duration by construction (it
           // ran and did nothing), so it paints as a narrow teal beat — distinct
-          // from work and from the wide refusal stub. Consecutive beats coalesce
-          // into ONE counted run ("N heartbeats") instead of an unreadable smear
-          // of every-minute ticks; a highlighted beat is drawn on its own so a
-          // cross-view reveal can always land on the exact span.
-          const bx = Math.max(GUTTER_W, timeToX(s.start));
-          if (!isHighlighted(s)) {
-            if (run && run.heartbeat && bx <= run.x1 + 1) {
-              run.x1 = Math.max(run.x1, bx + HEARTBEAT_PX);
-              run.count += 1;
-              if (s.status === "error") run.errored = true;
-            } else {
-              flush();
-              run = {
-                x0: bx,
-                x1: bx + HEARTBEAT_PX,
-                count: 1,
-                errored: s.status === "error",
-                heartbeat: true,
-                span: s,
-              };
-            }
+          // from work and from the wide refusal stub — at its real time. Beats
+          // that would overdraw each other at this zoom share one counted run
+          // (#92), painted once when its first member comes round.
+          const hr = beatRunOf.get(s);
+          if (hr) {
+            if (hr.spans[0] !== s) continue; // already painted with its run
+            flush();
+            drawBeatRun(hr);
             continue;
           }
+          // A highlighted beat is drawn on its own so a cross-view reveal can
+          // always land on the exact span.
           flush();
+          const bx = Math.max(GUTTER_W, timeToX(s.start));
           ctx.fillStyle = IDLE_COLOR;
           ctx.fillRect(bx, ry, HEARTBEAT_PX, bh);
           drawHighlightRect(bx - 2, ry, HEARTBEAT_PX + 4, bh, s);
@@ -1990,11 +2085,10 @@ export function mount(container, opts = {}) {
         const cx = Math.max(GUTTER_W, x);
         const w = Math.max(1, x + rawW - cx);
         if (!tick && !stub && w < MIN_BLOCK_PX && !isHighlighted(s)) {
-          // Coalesce sub-pixel blocks into a density strip. A heartbeat run is
-          // NOT a candidate: joining it would paint this work span teal and add
-          // it to the "N heartbeats" count (#87). Start a fresh run instead —
-          // symmetric to the idle branch, which likewise only joins `heartbeat`.
-          if (run && !run.heartbeat && cx <= run.x1 + 1) {
+          // Coalesce sub-pixel blocks into a density strip. Heartbeats never
+          // enter this run — they carry their own teal, zoom-adaptive runs — so
+          // a work span can never be painted teal or counted as a beat (#87).
+          if (run && cx <= run.x1 + 1) {
             run.x1 = Math.max(run.x1, cx + w);
             run.count += 1;
             if (s.status === "error") run.errored = true;
@@ -2182,7 +2276,10 @@ export function mount(container, opts = {}) {
     }
     let html;
     if (d.density) {
-      html = `<b>${d.density} spans</b><div class="obs-tl__tipdim">coalesced · zoom in to expand</div>`;
+      html = d.heartbeat
+        ? `<b>${d.density} heartbeats</b>` +
+          `<div class="obs-tl__tipdim">idle · coalesced · zoom in to separate</div>`
+        : `<b>${d.density} spans</b><div class="obs-tl__tipdim">coalesced · zoom in to expand</div>`;
     } else if (d.band) {
       html = tipHtml(bandDetail(d.band));
     } else if (d.span) {
