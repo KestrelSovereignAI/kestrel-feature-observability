@@ -280,14 +280,28 @@ handles.push(live);
 await booted(first);
 out.bootState = live.getState();
 const canvas = first.querySelector("[data-canvas]");
-// Vertical wheel → zoom in around the cursor (one 1/1.15 step per event).
+// ctrl+wheel → zoom in around the cursor (one 1/1.15 step per event). Plain
+// scroll never zooms since #94, so the modifier is what reaches zoomAt().
 for (let i = 0; i < 5; i += 1) {
-  canvas.dispatch("wheel", { deltaY: -120, deltaX: 0, offsetX: 600 });
+  canvas.dispatch("wheel", { deltaY: -120, deltaX: 0, offsetX: 600, ctrlKey: true });
 }
 // Horizontal wheel → pan back into history, which pauses live-follow.
 canvas.dispatch("wheel", { deltaY: 0, deltaX: -300, offsetX: 600 });
 const pausedState = live.getState();
 out.pausedState = pausedState;
+
+// #94: a PLAIN vertical wheel scrolls lanes — it must not touch the window or
+// the pan anchor (it used to zoom, which is what a Magic Mouse tripped).
+canvas.dispatch("wheel", { deltaY: 240, deltaX: 0, offsetX: 600 });
+const afterPlainScroll = live.getState();
+out.plainScrollKeptWindow = afterPlainScroll.windowMs === pausedState.windowMs;
+out.plainScrollKeptViewEnd = afterPlainScroll.viewEnd === pausedState.viewEnd;
+out.plainScrollStayedPaused = afterPlainScroll.live === false;
+
+// #94: panning back to the present edge is magnetic — it snaps to `now` and
+// re-engages Live rather than clamping there paused.
+canvas.dispatch("wheel", { deltaY: 0, deltaX: 900_000, offsetX: 600 });
+out.magneticLive = live.getState().live;
 
 // ── 2. A fresh mount restores that exact paused window. ──
 const second = new FakeElement("div");
@@ -357,6 +371,14 @@ process.stdout.write(JSON.stringify(out));
     assert paused["live"] is False
     assert MIN_WINDOW_MS <= paused["windowMs"] < DEFAULT_WINDOW_MS
     assert paused["viewEnd"] < result["bootState"]["viewEnd"]
+
+    # #94: a plain vertical wheel is a LANE scroll — the persisted window/anchor
+    # (and the paused flag) are untouched, so scrolling can't rescale the view.
+    assert result["plainScrollKeptWindow"] is True
+    assert result["plainScrollKeptViewEnd"] is True
+    assert result["plainScrollStayedPaused"] is True
+    # ...while a time-pan that reaches the present edge re-engages Live.
+    assert result["magneticLive"] is True
 
     # ...and a fresh mount comes back to exactly that window/anchor/live flag.
     restored = result["restoredState"]
