@@ -899,3 +899,96 @@ def test_member_rollup_counts_what_the_operator_can_see(tmp_path):
     assert r["nested"]["count"] == 2
     assert r["nested"]["endMs"] == 900
     assert r["leaf"] is None
+
+
+# ── #94: scroll pans, only a modifier zooms; the present edge is magnetic ─────
+#
+# A Magic Mouse / trackpad emits `wheel` deltas for an ordinary one-finger drag,
+# so mapping vertical wheel → zoom made plain scrolling rescale the window. The
+# two pure functions below ARE the interaction contract: `wheelIntent` decides
+# pan-vs-zoom per event, `magneticViewEnd` decides whether a time-pan re-engages
+# Live at the present edge.
+_INPUT_HARNESS = r"""
+import { wheelIntent, magneticViewEnd } from "./timeline.js";
+
+const wheel = (o) => ({ deltaX: 0, deltaY: 0, ctrlKey: false, metaKey: false, ...o });
+const out = {};
+
+// Plain scroll: vertical → lanes, horizontal → time, diagonal → both. Never zoom.
+out.plainDown = wheelIntent(wheel({ deltaY: 40 }));
+out.plainUp = wheelIntent(wheel({ deltaY: -40 }));
+out.plainRight = wheelIntent(wheel({ deltaX: 30 }));
+out.diagonal = wheelIntent(wheel({ deltaX: 30, deltaY: 40 }));
+// A big vertical delta is still lanes, even though the old handler zoomed here.
+out.bigVertical = wheelIntent(wheel({ deltaX: 2, deltaY: 400 }));
+
+// Modifier scroll: ctrl (also how a trackpad pinch arrives) and ⌘ both zoom,
+// in both directions, around the cursor.
+out.ctrlDown = wheelIntent(wheel({ deltaY: 40, ctrlKey: true }));
+out.ctrlUp = wheelIntent(wheel({ deltaY: -40, ctrlKey: true }));
+out.metaDown = wheelIntent(wheel({ deltaY: 40, metaKey: true }));
+out.metaUp = wheelIntent(wheel({ deltaY: -40, metaKey: true }));
+// deltaY == 0 → the horizontal axis drives the factor rather than falling
+// through to a pan the modifier never asked for.
+out.ctrlHorizontal = wheelIntent(wheel({ deltaX: 30, ctrlKey: true }));
+// A zero-delta wheel does nothing at all.
+out.ctrlIdle = wheelIntent(wheel({ ctrlKey: true }));
+
+// Magnetic present edge: `snapMs` is the px threshold converted at the current
+// scale. Inside it (including an overshoot past `now`) → snap + Live on.
+const NOW = 1_000_000;
+out.inside = magneticViewEnd(NOW - 50, NOW, 100);
+out.overshoot = magneticViewEnd(NOW + 5000, NOW, 100);
+out.exactly = magneticViewEnd(NOW - 100, NOW, 100);
+out.outside = magneticViewEnd(NOW - 101, NOW, 100);
+out.deepHistory = magneticViewEnd(NOW - 3_600_000, NOW, 100);
+
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_wheel_intent_and_magnetic_edge(tmp_path):
+    """#94: plain scroll pans (2-axis); zoom needs ctrl/⌘; `now` re-engages Live."""
+    pkg = _module_dir(tmp_path)
+    (pkg / "input.mjs").write_text(_INPUT_HARNESS, encoding="utf-8")
+    proc = subprocess.run(
+        [NODE, str(pkg / "input.mjs")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+        cwd=str(pkg),
+    )
+    r = json.loads(proc.stdout)
+
+    # Plain vertical scroll moves through the LANES — it never zooms and never
+    # pans time. This is the whole point of #94.
+    assert r["plainDown"] == {"panTimeDx": 0, "scrollLanesDy": 40}
+    assert r["plainUp"] == {"panTimeDx": 0, "scrollLanesDy": -40}
+    assert "zoom" not in r["plainDown"]
+    # Plain horizontal scroll pans time only.
+    assert r["plainRight"] == {"panTimeDx": 30, "scrollLanesDy": 0}
+    # Diagonal applies both axes in the same event.
+    assert r["diagonal"] == {"panTimeDx": 30, "scrollLanesDy": 40}
+    # The old handler zoomed whenever |deltaY| >= |deltaX|; now it scrolls lanes.
+    assert r["bigVertical"] == {"panTimeDx": 2, "scrollLanesDy": 400}
+
+    # ctrl (= trackpad pinch) and ⌘ zoom, in both directions, and never pan.
+    for key in ("ctrlDown", "metaDown"):
+        assert r[key] == {"zoom": pytest.approx(1.15)}
+    for key in ("ctrlUp", "metaUp"):
+        assert r[key] == {"zoom": pytest.approx(1 / 1.15)}
+    assert r["ctrlHorizontal"] == {"zoom": pytest.approx(1.15)}
+    # No delta, no action — and still not a pan.
+    assert r["ctrlIdle"] == {"panTimeDx": 0, "scrollLanesDy": 0}
+
+    # Magnetic right edge: a pan landing within the threshold of `now` snaps
+    # there and turns Live back on — wheel and drag share this path, so both
+    # gestures now agree (drag used to clamp at `now` and stay paused).
+    assert r["inside"] == {"viewEnd": 1_000_000, "live": True}
+    assert r["overshoot"] == {"viewEnd": 1_000_000, "live": True}
+    assert r["exactly"] == {"viewEnd": 1_000_000, "live": True}
+    # Panning left beyond it keeps the exact edge asked for, paused.
+    assert r["outside"] == {"viewEnd": 999_899, "live": False}
+    assert r["deepHistory"] == {"viewEnd": 1_000_000 - 3_600_000, "live": False}

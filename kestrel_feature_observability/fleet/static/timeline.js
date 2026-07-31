@@ -8,8 +8,10 @@
 //   - X = time. A scrolling window (default 30 min) with a ruler. Live mode is
 //     ON by default: the window follows wall-clock (rAF-smooth) and new spans
 //     stream in on the right. Panning back through history pauses follow (the
-//     "Live" button resumes it). Wheel / +/- zoom the window (1 min … 24 h);
-//     panning left lazily loads older pages.
+//     "Live" button resumes it), and the present edge is MAGNETIC: any time-pan
+//     that lands within a few px of `now` snaps there and re-engages Live.
+//     +/- (and the density strip) zoom the window (1 min … 24 h); panning left
+//     lazily loads older pages.
 //   - Y = lanes. One lane per agent (`kestrel.agent_name`), grouped under
 //     collapsible project headers (`kestrel-fleet`, each `owner/repo`). Worker
 //     subagents (`talon/implement`, `talon/review`) render as sub-lanes.
@@ -19,10 +21,15 @@
 //     (TOOL/LLM/CHAIN/AGENT), error state = red accent, instant events = ticks.
 //     At wide zooms sub-second blocks coalesce into density strips so we never
 //     draw thousands of sub-pixel rects.
-//   - Interaction: hover → tooltip; click → a detail popover with the span's
-//     attributes (LLM spans reveal input.value / output.value inline) plus
-//     "open in Navigator" (reveal the tree at that session/turn) and "open in
-//     Phoenix" (deep-link the embed to the trace).
+//   - Interaction: scroll PANS, never zooms (#94) — a plain vertical scroll or
+//     vertical drag moves through the lanes, a plain horizontal scroll or
+//     horizontal drag pans time, and a diagonal scroll does both. Zoom is an
+//     explicit action: ctrl/⌘+scroll (which is also how trackpad pinch arrives)
+//     around the cursor, the +/- buttons, or a density-strip click. Hover →
+//     tooltip; click → a detail popover with the span's attributes (LLM spans
+//     reveal input.value / output.value inline) plus "open in Navigator"
+//     (reveal the tree at that session/turn) and "open in Phoenix" (deep-link
+//     the embed to the trace).
 //
 // Pure read-model over Phoenix GraphQL through the same-origin `/phoenix/graphql`
 // proxy — no store, no new host routes. Live mode polls every POLL_MS for spans
@@ -74,6 +81,8 @@ const MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 h (max zoom-out)
 const PAGE_SIZE = 500; // spans per GraphQL page
 const MAX_POLL_PAGES = 6; // per-project drain cap per tick (backlog catch-up)
 const SPAN_CAP = 60_000; // memory guard — prune oldest beyond this
+const WHEEL_ZOOM_STEP = 1.15; // one modifier-scroll notch (out; 1/step zooms in)
+const LIVE_SNAP_PX = 8; // pan within this many px of `now` → snap + re-engage Live
 
 // ── Layout ────────────────────────────────────────────────────
 const RULER_H = 26; // time-ruler strip height
@@ -906,6 +915,46 @@ const NICE_STEPS = [
 function niceStep(windowMs) {
   for (const step of NICE_STEPS) if (windowMs / step <= 10) return step;
   return NICE_STEPS[NICE_STEPS.length - 1];
+}
+
+// ── Wheel intent: scroll pans, only a modifier zooms (#94) ──
+//
+// A Magic Mouse (and any trackpad) is a touch surface with no detented wheel, so
+// an ordinary one-finger drag emits `wheel` deltas — mapping vertical wheel to
+// zoom made plain scrolling rescale the window unexpectedly. Scroll therefore
+// PANS on both axes (deltaY through the lanes, deltaX through time, diagonal
+// doing both in one event) and zoom becomes explicit: ctrl+wheel — which is also
+// how a trackpad pinch arrives — or ⌘+wheel, plus the +/- buttons and the
+// density-strip click that were always the primary path.
+//
+// Pure + exported so the interaction contract is unit-testable: takes the wheel
+// event's fields, returns either a zoom factor or the two pan deltas — never
+// both.
+export function wheelIntent({ deltaX = 0, deltaY = 0, ctrlKey = false, metaKey = false } = {}) {
+  if (ctrlKey || metaKey) {
+    // Vertical drives the factor; a purely horizontal modifier-scroll still
+    // zooms rather than falling through to a pan the modifier didn't ask for.
+    const d = deltaY !== 0 ? deltaY : deltaX;
+    if (d !== 0) return { zoom: d > 0 ? WHEEL_ZOOM_STEP : 1 / WHEEL_ZOOM_STEP };
+  }
+  return { panTimeDx: deltaX, scrollLanesDy: deltaY };
+}
+
+// ── Magnetic present edge (#94) ──
+//
+// Wheel-pan already snapped to `now` and resumed Live on overshoot while
+// drag-pan clamped at `now` and stayed paused — the same gesture, two answers.
+// Both now run their candidate right edge through this: land within `snapMs` of
+// the present and the view sticks to it with Live back on; stay left of that and
+// follow stays paused. Only an actual pan gesture calls it, so a static
+// paused-at-the-edge view (and the persisted-state restore path) never
+// self-resumes.
+//
+// Pure + exported for the interaction tests.
+export function magneticViewEnd(candidateViewEnd, nowMs, snapMs) {
+  const snap = Number.isFinite(snapMs) && snapMs > 0 ? snapMs : 0;
+  if (candidateViewEnd >= nowMs - snap) return { viewEnd: nowMs, live: true };
+  return { viewEnd: candidateViewEnd, live: false };
 }
 
 // ── View / mount ──────────────────────────────────────────────
@@ -2450,26 +2499,38 @@ export function mount(container, opts = {}) {
     requestDraw();
   }
 
+  // The one commit path for every time-pan gesture (wheel AND drag): run the
+  // candidate right edge past the magnetic present edge, then land it.
+  function panTimeTo(candidateViewEnd) {
+    const snapped = magneticViewEnd(candidateViewEnd, Date.now(), LIVE_SNAP_PX / pxPerMs());
+    viewEnd = snapped.viewEnd;
+    if (snapped.live) setLive(true);
+    else pauseLive();
+    loadHistory();
+    requestDraw();
+  }
+
+  function scrollLanes(dy) {
+    // `draw` projects rows at `row.y - laneScrollY`, so a positive offset lifts
+    // content: scrolling down (deltaY > 0) reveals the lower lanes.
+    laneScrollY += dy;
+    clampScroll();
+    requestDraw();
+  }
+
   canvas.addEventListener("wheel", (e) => {
-    if (e.deltaY !== 0 && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) {
-      // Vertical wheel → zoom around the cursor.
-      e.preventDefault();
-      zoomAt(e.deltaY > 0 ? 1.15 : 1 / 1.15, e.offsetX);
-    } else if (e.deltaX !== 0) {
-      // Horizontal wheel → pan time (history), pausing follow.
-      e.preventDefault();
-      pauseLive();
-      viewEnd += (e.deltaX / pxPerMs());
-      if (viewEnd > Date.now()) {
-        viewEnd = Date.now();
-        setLive(true);
-      }
-      loadHistory();
-      requestDraw();
+    const intent = wheelIntent(e);
+    e.preventDefault();
+    if (intent.zoom) {
+      zoomAt(intent.zoom, e.offsetX);
+      return;
     }
+    if (intent.panTimeDx) panTimeTo(viewEnd + intent.panTimeDx / pxPerMs());
+    if (intent.scrollLanesDy) scrollLanes(intent.scrollLanesDy);
   }, { passive: false });
 
-  // Drag: horizontal → pan time (pauses live); vertical → scroll lanes.
+  // Drag: horizontal → pan time (pauses live, or re-engages it at the magnetic
+  // present edge); vertical → scroll lanes.
   let drag = null;
   canvas.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
@@ -2485,14 +2546,9 @@ export function mount(container, opts = {}) {
         drag.x = e.clientX;
         drag.y = e.clientY;
         if (Math.abs(dx) >= Math.abs(dy)) {
-          pauseLive();
-          viewEnd -= dx / pxPerMs();
-          const now = Date.now();
-          if (viewEnd > now) viewEnd = now;
-          loadHistory();
+          panTimeTo(viewEnd - dx / pxPerMs());
         } else {
-          laneScrollY -= dy;
-          clampScroll();
+          scrollLanes(-dy);
         }
         hideTip();
         requestDraw();
