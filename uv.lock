@@ -194,7 +194,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-observability"
-version = "0.17.10"
+version = "0.17.11"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -230,10 +230,10 @@ dev = [
 requires-dist = [
     { name = "graphql-core", marker = "extra == 'test'", specifier = ">=3.2" },
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "kestrel-sovereign-sdk", specifier = ">=0.14.1,<1" },
-    { name = "kestrel-sovereign-sdk", marker = "extra == 'fleet'", specifier = ">=0.32.0,<0.33" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'metrics'", specifier = ">=0.14.1,<1" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'test'", specifier = ">=0.32.0,<0.33" },
+    { name = "kestrel-sovereign-sdk", specifier = ">=0.34,<0.35" },
+    { name = "kestrel-sovereign-sdk", marker = "extra == 'fleet'", specifier = ">=0.34,<0.35" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'metrics'", specifier = ">=0.34,<0.35" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'test'", specifier = ">=0.34,<0.35" },
     { name = "openinference-semantic-conventions", specifier = ">=0.1.9" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.20,<2" },
     { name = "opentelemetry-sdk", specifier = ">=1.20,<2" },
@@ -245,21 +245,21 @@ provides-extras = ["metrics", "fleet", "test"]
 [package.metadata.requires-dev]
 dev = [
     { name = "graphql-core", specifier = ">=3.2" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics"], specifier = ">=0.32.0,<0.33" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics"], specifier = ">=0.34,<0.35" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
 ]
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.32.0"
+version = "0.34.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/be/4e/0209a82261a8a1daf042035d1d565b7e2684040f5758e34cae40c803ede9/kestrel_sovereign_sdk-0.32.0.tar.gz", hash = "sha256:24b7fa79e66fa85f8d0fe4bb55c6ffb90a3c255ac81e4a052c83ca111c691cfc", size = 141727, upload-time = "2026-07-25T14:40:40.445Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8c/35/b3a75991a211f30eeac98a34068b9649583d3081cebe482e95871c39c77d/kestrel_sovereign_sdk-0.34.0.tar.gz", hash = "sha256:db2556b29d48a725dddc7ffe24c52c333e97d093b0886583eb22f951e5d5c117", size = 153567, upload-time = "2026-08-02T14:43:32.705Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/43/1c6db3b73a9313982a882309589b5599f6f683cf44e89b01d7fbe852140e/kestrel_sovereign_sdk-0.32.0-py3-none-any.whl", hash = "sha256:ca8ecef0b9e0760f4f0b771bd89964bf0f3defba48ae56f79d6a3016f7ef7312", size = 174115, upload-time = "2026-07-25T14:40:38.976Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/39/9987939f487d8892ccb11d0105c9e610ef0b09fdb20e86eeb7bc90a6770e/kestrel_sovereign_sdk-0.34.0-py3-none-any.whl", hash = "sha256:584150216b9344f35f2b00cfaa5fb5a4e8019960a20bf61d46b88181bac16df1", size = 185982, upload-time = "2026-08-02T14:43:31.31Z" },
 ]
 
 [package.optional-dependencies]

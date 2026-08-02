@@ -45,9 +45,12 @@ jobs:
           from kestrel_feature_observability import ObservabilityFeature, ObservabilityHook
           from kestrel_feature_observability.feature import ObservabilityFeature as F2
           from kestrel_feature_observability.hook import ObservabilityHook as H2
+          import importlib.metadata as md
           assert ObservabilityFeature is F2
           assert ObservabilityHook is H2
-          print('kestrel_feature_observability imports OK')
+          sdk_version = md.version('kestrel-sovereign-sdk')
+          assert sdk_version.split('.')[:2] == ['0', '34'], sdk_version
+          print(f'kestrel_feature_observability imports OK with SDK {sdk_version}')
           "
         timeout-minutes: 3
 
@@ -120,7 +123,9 @@ jobs:
           eps = md.entry_points(group='kestrel_sovereign.features')
           names = [e.name for e in eps]
           assert 'ObservabilityFeature' in names, f'Entry-point not registered: {names}'
-          print(f'kestrel-feature-observability installs + entry-point OK on Python ${{ matrix.python-version }}')
+          sdk_version = md.version('kestrel-sovereign-sdk')
+          assert sdk_version.split('.')[:2] == ['0', '34'], sdk_version
+          print(f'kestrel-feature-observability installs + entry-point OK on Python ${{ matrix.python-version }} with SDK {sdk_version}')
           "
 
   test:

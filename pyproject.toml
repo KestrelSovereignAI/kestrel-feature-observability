@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-observability"
-version = "0.17.10"
+version = "0.17.11"
 description = "Observability feature for Kestrel Sovereign — a per-agent emitter that emits OTel spans for hook-driven lifecycle events, with a shared Prometheus registry"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -31,7 +31,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.14.1,<1",
+    "kestrel-sovereign-sdk>=0.34,<0.35",
     # Lightweight HTTP client (used by tracing's OTLP/HTTP export transport). No
     # fleet dep.
     "httpx>=0.27.0",
@@ -48,24 +48,24 @@ dependencies = [
 # feature shares the framework's CollectorRegistry. Without this
 # extra installed, the Prometheus side becomes a no-op.
 metrics = [
-    "kestrel-sovereign-sdk[metrics]>=0.14.1,<1",
+    "kestrel-sovereign-sdk[metrics]>=0.34,<0.35",
 ]
 # Host role: pulls the HostFeature SDK contract so the guarded
 # `FleetObservabilityHostFeature` (the Phoenix-embed console panel) activates.
 # Absent (a base emitter install), the fleet subpackage degrades to a no-op.
 fleet = [
     # HostFeature / UIContributions contract. Tracks the host SDK range
-    # (kestrel-sovereign pins >=0.32.0,<0.33) so `[fleet]` installs into the host
+    # (kestrel-sovereign pins >=0.34,<0.35) so `[fleet]` installs into the host
     # env without an unsatisfiable resolve.
-    "kestrel-sovereign-sdk>=0.32.0,<0.33",
+    "kestrel-sovereign-sdk>=0.34,<0.35",
 ]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
-    # The fleet HostFeature contract tracks the host SDK range (>=0.32.0,<0.33);
+    # The fleet HostFeature contract tracks the host SDK range (>=0.34,<0.35);
     # the test env exercises both the emitter and the fleet role, so intersect
     # on it.
-    "kestrel-sovereign-sdk[metrics]>=0.32.0,<0.33",
+    "kestrel-sovereign-sdk[metrics]>=0.34,<0.35",
     # Validates the navigator's GraphQL documents against the vendored Phoenix
     # 17.7.0 schema (tests/fixtures/phoenix_schema_17.7.0.graphql).
     "graphql-core>=3.2",
@@ -79,7 +79,7 @@ test = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
-    "kestrel-sovereign-sdk[metrics]>=0.32.0,<0.33",
+    "kestrel-sovereign-sdk[metrics]>=0.34,<0.35",
     "graphql-core>=3.2",
 ]
 

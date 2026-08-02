@@ -60,8 +60,9 @@ uv run pytest
   `[fleet]` extra: `fleet/feature.py` imports only `HostFeature`/`UIContributions` from `kestrel_sdk`, so on a
   modern SDK the class binds for real; only a too-old SDK (below the HostFeature contract) trips the guard,
   which logs a warning and resolves the `host_features` entry point to `None` so the host skips the panel.
-- The tightened HostFeature SDK pin (`>=0.32.0,<0.33`) lives in the `[fleet]` extra **only**; the base install
-  keeps the wider SDK floor (`>=0.14.1,<1`).
+- Every install role tracks the host's released SDK line (`>=0.34,<0.35`), including the base,
+  `[metrics]`, `[fleet]`, test extra, and dev group. This prevents the published fleet from making
+  the host environment unsatisfiable during SDK upgrades.
 - Fleet UI panels are always-on: `UIContributions.capability=None` (host gate bug fixed separately in
   kestrel-sovereign#2459).
 - User-message content is never recorded on any span; keep the hook observational, non-blocking, and
