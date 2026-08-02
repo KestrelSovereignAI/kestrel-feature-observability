@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 # The fleet HostFeature imports the host SDK's HostFeature/UIContributions
-# contract (``kestrel-sovereign-sdk >=0.32.0,<0.33``, the ``[fleet]`` extra). The
+# contract (``kestrel-sovereign-sdk >=0.34,<0.35``, the ``[fleet]`` extra). The
 # verification gate runs a bare ``pytest -q`` from whatever environment is on
 # PATH (see ``pythonpath = ["."]`` in pyproject.toml); that environment may be a
 # base emitter install where the host SDK contract is absent. Mirror the guarded
