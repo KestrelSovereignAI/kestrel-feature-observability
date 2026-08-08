@@ -31,7 +31,16 @@ TEST_SDK_REQUIREMENT = METRICS_SDK_REQUIREMENT
 
 #: An upper bound anywhere below 1.0 re-creates the lockstep this policy exists
 #: to remove. `<1` is the intended and only acceptable ceiling.
-_FORBIDDEN_CEILING = re.compile(r"kestrel-sovereign-sdk[^\"',\n]*<\s*0\.\d+")
+#:
+#: Matched per line rather than as one expression: the specifier's own comma
+#: (``>=0.34,<0.35``) terminates any character-class-based scan, which silently
+#: made an earlier version of this guard match nothing at all.
+#: Triggered by any mention of the SDK, not just the literal package name: the
+#: prose that regenerates the wrong policy tends to say "the SDK (>=0.34,<0.35)"
+#: without naming the distribution, and the docs are what a future maintainer
+#: copies from.
+_SDK_MENTION = re.compile(r"sdk", re.IGNORECASE)
+_CEILING_BELOW_ONE = re.compile(r"<\s*=?\s*0\.\d+")
 
 
 def _pyproject() -> dict:
@@ -77,13 +86,16 @@ def test_no_install_surface_declares_an_sdk_ceiling_below_one():
     ]
     offenders = []
     for relative_path in sources:
-        text = (ROOT / relative_path).read_text(encoding="utf-8")
-        for line in text.splitlines():
+        lines = (ROOT / relative_path).read_text(encoding="utf-8").splitlines()
+        # Scan a two-line window: the fleet guard's warning wraps the mention
+        # and its specifier onto separate lines, which a per-line scan misses.
+        for index, line in enumerate(lines):
+            window = " ".join(lines[index:index + 2])
             # AGENTS.md documents the retired policy on purpose, as history.
-            if "previous" in line or "retired" in line:
+            if "previous" in window or "retired" in window:
                 continue
-            if _FORBIDDEN_CEILING.search(line):
-                offenders.append(f"{relative_path}: {line.strip()}")
+            if _SDK_MENTION.search(window) and _CEILING_BELOW_ONE.search(window):
+                offenders.append(f"{relative_path}:{index + 1}: {line.strip()}")
     assert not offenders, "SDK ceiling below 1 reintroduced:\n" + "\n".join(offenders)
 
 
