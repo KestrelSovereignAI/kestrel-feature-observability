@@ -9,8 +9,9 @@ Phoenix UI. The per-agent *producer* (the emitter hook) lives in the parent
 Since the custom store/entities were retired (issue #39), ``fleet/feature.py``
 imports only ``HostFeature``/``UIContributions`` from ``kestrel_sdk`` — so the
 host role is gated by the **SDK version**, not by an extra-only importable
-module. Every install role tracks the host SDK pin (``>=0.34,<0.35``). The
-import below is therefore **guarded**: an environment with the current SDK
+module. Every install role declares the SDK floor-only (``>=0.34,<1``); the
+host pins the SDK minor, so this package must not add a second ceiling (#99).
+The import below is therefore **guarded**: an environment with the current SDK
 contract binds the real class, but if the resolved SDK is too old to export the
 HostFeature contract (or the symbols are moved/renamed) importing this
 subpackage degrades to
@@ -35,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - host SDK contract too old/absen
         "(kestrel_sdk.HostFeature/UIContributions) could not be imported (%s). "
         "The Observability console panel will be skipped; install/upgrade to an "
         "SDK that exports the HostFeature contract (kestrel-sovereign-sdk "
-        ">=0.34,<0.35).",
+        ">=0.34).",
         exc,
     )
     FleetObservabilityHostFeature = None

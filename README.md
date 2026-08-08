@@ -31,8 +31,8 @@ process boundaries):
   store/entities were retired, `fleet/feature.py` imports only the
   `HostFeature`/`UIContributions` contract from `kestrel_sdk`, so the host role
   is gated by the **SDK version**, not by an extra-only importable module: the
-  package tracks the host SDK pin (`>=0.34,<0.35`) across every install role, so
-  supported environments always export that contract. The import/entry point
+  package declares the SDK floor-only (`>=0.34`) across every install role — the
+  host pins the SDK minor, so this package must not add a second ceiling (#99). The import/entry point
   stays **guarded** — if the
   resolved SDK is too old to export the contract, it degrades to `None` (with a
   warning logged) and the host skips the panel instead of crashing the feature
@@ -298,12 +298,12 @@ Prompt capture is strictly opt-in: setting `KESTREL_OTEL_CAPTURE_PROMPTS=1` (off
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.34,<0.35` — base `Feature`, `Hook`, and shared `metrics` module
+- `kestrel-sovereign-sdk>=0.34,<1` — base `Feature`, `Hook`, and shared `metrics` module
 - `httpx>=0.27.0` — lightweight HTTP client (OTLP/HTTP export transport)
 - `opentelemetry-sdk` + `opentelemetry-exporter-otlp-proto-http` +
   `openinference-semantic-conventions` — the OTel span builders + OTLP export
 - Optional `[metrics]` extra → `kestrel-sovereign-sdk[metrics]` → `prometheus-client`
-- Optional `[fleet]` extra → `kestrel-sovereign-sdk>=0.34,<0.35` (the HostFeature
+- Optional `[fleet]` extra → `kestrel-sovereign-sdk>=0.34,<1` (the HostFeature
   contract for the Phoenix-embed console panel). No DB.
 
 The base emitter has **no** runtime dependency on `kestrel-sovereign` (or any

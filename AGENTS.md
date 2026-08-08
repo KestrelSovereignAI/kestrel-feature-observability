@@ -60,9 +60,15 @@ uv run pytest
   `[fleet]` extra: `fleet/feature.py` imports only `HostFeature`/`UIContributions` from `kestrel_sdk`, so on a
   modern SDK the class binds for real; only a too-old SDK (below the HostFeature contract) trips the guard,
   which logs a warning and resolves the `host_features` entry point to `None` so the host skips the panel.
-- Every install role tracks the host's released SDK line (`>=0.34,<0.35`), including the base,
-  `[metrics]`, `[fleet]`, test extra, and dev group. This prevents the published fleet from making
-  the host environment unsatisfiable during SDK upgrades.
+- Every install role declares the SDK as **floor-only** (`>=0.34,<1`) — base, `[metrics]`,
+  `[fleet]`, test extra, and dev group. **Do not add an upper bound.** The host
+  (`kestrel-sovereign`) pins the SDK to a single minor and so decides which SDK the environment
+  gets; a second ceiling here has to be walked forward by hand, in a separate repo, on every host
+  bump, and any lag makes the graph unsatisfiable. The previous `<0.35` policy — added to *prevent*
+  unsatisfiable resolves — was what caused them: the host moved to `>=0.35.0,<0.36` and every host
+  with this package installed resolved to a broken pair (issue #99, kestrel-sovereign#2865).
+  Compatibility with newer SDKs is proven by the `test-latest-sdk` CI leg, not asserted by a pin.
+  If that leg goes red, fix the code or raise the floor; do not reintroduce a ceiling.
 - Fleet UI panels are always-on: `UIContributions.capability=None` (host gate bug fixed separately in
   kestrel-sovereign#2459).
 - User-message content is never recorded on any span; keep the hook observational, non-blocking, and

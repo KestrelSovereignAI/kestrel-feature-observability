@@ -194,7 +194,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-observability"
-version = "0.17.11"
+version = "0.17.12"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -230,10 +230,10 @@ dev = [
 requires-dist = [
     { name = "graphql-core", marker = "extra == 'test'", specifier = ">=3.2" },
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "kestrel-sovereign-sdk", specifier = ">=0.34,<0.35" },
-    { name = "kestrel-sovereign-sdk", marker = "extra == 'fleet'", specifier = ">=0.34,<0.35" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'metrics'", specifier = ">=0.34,<0.35" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'test'", specifier = ">=0.34,<0.35" },
+    { name = "kestrel-sovereign-sdk", specifier = ">=0.34,<1" },
+    { name = "kestrel-sovereign-sdk", marker = "extra == 'fleet'", specifier = ">=0.34,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'metrics'", specifier = ">=0.34,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'test'", specifier = ">=0.34,<1" },
     { name = "openinference-semantic-conventions", specifier = ">=0.1.9" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.20,<2" },
     { name = "opentelemetry-sdk", specifier = ">=1.20,<2" },
@@ -245,7 +245,7 @@ provides-extras = ["metrics", "fleet", "test"]
 [package.metadata.requires-dev]
 dev = [
     { name = "graphql-core", specifier = ">=3.2" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics"], specifier = ">=0.34,<0.35" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics"], specifier = ">=0.34,<1" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
 ]
