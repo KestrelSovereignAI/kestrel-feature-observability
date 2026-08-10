@@ -992,3 +992,392 @@ def test_wheel_intent_and_magnetic_edge(tmp_path):
     # Panning left beyond it keeps the exact edge asked for, paused.
     assert r["outside"] == {"viewEnd": 999_899, "live": False}
     assert r["deepHistory"] == {"viewEnd": 1_000_000 - 3_600_000, "live": False}
+
+
+# ── #101: orchestrated lanes nest under their orchestrator ───────────────────
+#
+# A talon run launched BY an agent carries `kestrel.orchestrator` = that agent on
+# every span, but the layout bucketed project → agent → worker and sorted agents
+# alphabetically, so Emma's talon run rendered as a sibling top-level `talon`
+# lane BELOW Emma. `laneGroups` is the pure grouping the layout now consumes: it
+# keys lanes by the (agent, orchestrator) PAIR and nests them, so the same agent
+# driven by two orchestrators is two lanes in two places.
+_LANE_HARNESS = r"""
+import { annotateRenderModel, laneGroups } from "./timeline.js";
+
+let idc = 0;
+// A normalized span record shaped like timeline.js's normalize() output — with
+// the lane-relevant fields (projectName / agent / worker / orchestrator) the
+// grouping reads.
+function span(o) {
+  idc += 1;
+  return {
+    id: o.id || `n${idc}`,
+    name: o.name || "work",
+    start: o.start != null ? o.start : 1000,
+    end: o.end != null ? o.end : (o.start != null ? o.start : 1000) + 10,
+    instant: false,
+    openEnded: false,
+    marker: null,
+    kind: o.kind || "TOOL",
+    status: "ok",
+    spanId: o.spanId || `s${idc}`,
+    parentId: o.parentId || null,
+    traceId: null,
+    sessionId: o.sessionId != null ? o.sessionId : `sess${idc}`,
+    projectId: o.projectId != null ? o.projectId : "P",
+    projectName: o.projectName || "kestrel-fleet",
+    agent: o.agent,
+    worker: o.worker || null,
+    orchestrator: o.orchestrator != null ? o.orchestrator : null,
+    rHide: o.rHide === true,
+    attrs: o.attrs || {},
+  };
+}
+// The lane shape the layout turns into rows, JSON-friendly.
+const shape = (lanes) =>
+  lanes.map((l) => ({
+    label: l.label,
+    level: l.level,
+    agent: l.agent,
+    orchestrator: l.orchestrator,
+    worker: l.worker,
+    count: l.items.length,
+  }));
+const groups = (list) =>
+  Object.fromEntries([...laneGroups(list)].map(([name, lanes]) => [name, shape(lanes)]));
+const out = {};
+
+// The live `kestrel-fleet` shape from the issue: four plain agents, Emma's talon
+// run (with its two worker stages), talon runs orchestrated by agents that have
+// NO lane here (claude-code / codex — top-level, but each still its own lane), a
+// `Direct` talon run, and Claw's own self-orchestrated spans.
+{
+  const list = [
+    span({ agent: "Claw" }),
+    span({ agent: "Claw", orchestrator: "Claw" }), // rule 3 — same lane, not nested
+    span({ agent: "Emma" }),
+    span({ agent: "Meridian" }),
+    span({ agent: "Nellie" }),
+    span({ agent: "talon", orchestrator: "Emma", name: "talon run" }),
+    span({ agent: "talon", orchestrator: "Emma", worker: "implement" }),
+    span({ agent: "talon", orchestrator: "Emma", worker: "review" }),
+    span({ agent: "talon", orchestrator: "claude-code" }), // rule 2 — no lane here
+    span({ agent: "talon", orchestrator: "codex" }), // rule 2
+    span({ agent: "talon", orchestrator: "Direct" }), // rule 4
+  ];
+  out.fleet = groups(list)["kestrel-fleet"];
+  // The reveal key: the orchestrator each span's lane RESOLVED to (null = the
+  // agent's top-level lane), not the raw attribute.
+  out.fleetLaneOrchestrators = list.map((s) => s.rLaneOrchestrator);
+}
+
+// Rule 2 in isolation: the orchestrator names an agent with no lane in THIS
+// project, so the run stays top-level — but it KEEPS its own identity (rule 2 is
+// placement, not erasure), so the lane is still labeled by its launcher.
+{
+  out.noParentLane = groups([
+    span({ agent: "talon", orchestrator: "claude-code" }),
+    span({ agent: "talon", orchestrator: "claude-code", worker: "implement" }),
+  ])["kestrel-fleet"];
+}
+
+// …and two such orchestrators stay two DISTINCT top-level lanes: neither
+// `claude-code` nor `codex` has a lane here, but pooling their runs into one
+// anonymous `talon` band would merge unrelated launchers into a single row.
+// Only the true "nobody launched this" spans (`Direct`, no attribute) share the
+// plain lane.
+{
+  out.unresolvedSplit = groups([
+    span({ agent: "talon", orchestrator: "claude-code" }),
+    span({ agent: "talon", orchestrator: "claude-code" }),
+    span({ agent: "talon", orchestrator: "codex" }),
+    span({ agent: "talon", orchestrator: "Direct" }),
+    span({ agent: "talon" }),
+  ])["kestrel-fleet"];
+}
+
+// Rule 2 is PER PROJECT: Emma has a lane in kestrel-fleet but not in owner/repo,
+// so the identical orchestrator attribution nests in one project and not in the
+// other.
+{
+  out.perProject = groups([
+    span({ agent: "Emma", projectName: "kestrel-fleet" }),
+    span({ agent: "talon", orchestrator: "Emma", projectName: "kestrel-fleet" }),
+    span({ agent: "talon", orchestrator: "Emma", projectName: "owner/repo" }),
+  ]);
+}
+
+// Rule 3 in isolation: `Claw` spans stamped `orchestrator=Claw` are ONE plain
+// top-level lane — an agent never parents itself.
+{
+  out.selfOrchestrated = groups([
+    span({ agent: "Claw", orchestrator: "Claw" }),
+    span({ agent: "Claw", orchestrator: "Claw" }),
+    span({ agent: "Claw" }),
+  ])["kestrel-fleet"];
+}
+
+// Rule 4 in isolation, at its sharpest: an agent literally named `Direct` HAS a
+// lane here (so rule 2 would pass), and the sentinel must still not nest.
+{
+  out.directSentinel = groups([
+    span({ agent: "Direct" }),
+    span({ agent: "talon", orchestrator: "Direct" }),
+  ])["kestrel-fleet"];
+}
+
+// One agent, three orchestrators → three lanes: nested under each launcher that
+// has a lane here, and top-level (but still its own lane) for the one that
+// doesn't.
+{
+  const emma1 = span({ agent: "talon", orchestrator: "Emma", name: "for Emma" });
+  const claw1 = span({ agent: "talon", orchestrator: "Claw", name: "for Claw" });
+  const loose = span({ agent: "talon", orchestrator: "claude-code", name: "loose" });
+  const list = [span({ agent: "Emma" }), span({ agent: "Claw" }), emma1, claw1, loose];
+  out.split = groups(list)["kestrel-fleet"];
+  out.splitLaneOrchestrators = {
+    emma: emma1.rLaneOrchestrator,
+    claw: claw1.rLaneOrchestrator,
+    loose: loose.rLaneOrchestrator,
+  };
+}
+
+// Worker sub-lanes follow their OWN lane: the same worker name under two
+// orchestrators is two sub-lanes, each with its parent's level + 1.
+{
+  out.splitWorkers = groups([
+    span({ agent: "Emma" }),
+    span({ agent: "talon", orchestrator: "Emma", worker: "implement" }),
+    span({ agent: "talon", orchestrator: "claude-code", worker: "implement" }),
+  ])["kestrel-fleet"];
+}
+
+// Render chrome never invents a lane: an `rHide` span (a paired "(started)"
+// marker / folded summary) is dropped exactly as the layout drops it, so a
+// hidden-only agent gets no lane and can't satisfy rule 2 for anyone.
+{
+  out.hidden = groups([
+    span({ agent: "Emma" }),
+    span({ agent: "ghost", rHide: true }),
+    span({ agent: "talon", orchestrator: "ghost" }),
+  ])["kestrel-fleet"];
+}
+
+// A mutual orchestration cycle (A↔B, neither top-level) still renders both lanes
+// — never dropped on the floor.
+{
+  out.cycle = groups([
+    span({ agent: "A", orchestrator: "B" }),
+    span({ agent: "B", orchestrator: "A" }),
+  ])["kestrel-fleet"];
+}
+
+// End to end with the render model: a real talon run whose "(started)" marker
+// pairs away still lands in the nested lane, with only the visible bar in it.
+{
+  const list = [
+    span({ agent: "Emma", name: "Emma turn 1" }),
+    span({ agent: "talon", orchestrator: "Emma", name: "implement (started)", start: 100, spanId: "m1", sessionId: "run#1" }),
+    span({ agent: "talon", orchestrator: "Emma", name: "implement", start: 100, end: 500, spanId: "r1", sessionId: "run#1" }),
+  ];
+  list[1].marker = "start";
+  list[1].end = 100;
+  list[1].parentId = "r1";
+  annotateRenderModel(list, 10_000);
+  out.annotated = { lanes: groups(list)["kestrel-fleet"], markerHidden: list[1].rHide };
+}
+
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_lane_groups_nest_orchestrated_lanes(tmp_path):
+    """#101: a run nests under the agent that launched it, keyed by the pair."""
+    pkg = _module_dir(tmp_path)
+    (pkg / "lanes.mjs").write_text(_LANE_HARNESS, encoding="utf-8")
+    proc = subprocess.run(
+        [NODE, str(pkg / "lanes.mjs")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+        cwd=str(pkg),
+    )
+    r = json.loads(proc.stdout)
+
+    # The whole point: Emma's talon run renders UNDER Emma (labeled by its
+    # orchestrator) with its worker stages below it, while the talon runs nobody
+    # here launched keep their own top-level lane at the bottom.
+    fleet = r["fleet"]
+    assert [(lane["label"], lane["level"]) for lane in fleet] == [
+        ("Claw", 1),
+        ("Emma", 1),
+        ("Emma/talon", 2),
+        ("talon/implement", 3),
+        ("talon/review", 3),
+        ("Meridian", 1),
+        ("Nellie", 1),
+        ("talon", 1),
+        ("claude-code/talon", 1),
+        ("codex/talon", 1),
+    ]
+    # Levels, spelled out: an orchestrator-nested agent lane is 2 and its worker
+    # sub-lanes are 3 (a top-level agent stays 1 and its workers 2).
+    nested = next(lane for lane in fleet if lane["label"] == "Emma/talon")
+    assert nested["level"] == 2
+    assert nested["agent"] == "talon"
+    assert nested["orchestrator"] == "Emma"
+    assert nested["worker"] is None
+    assert [lane["level"] for lane in fleet if lane["worker"] == "implement"] == [3]
+
+    # Rule 3: Claw's self-orchestrated spans stayed in the ONE plain Claw lane
+    # (2 spans) — an agent never parents itself — and rule 4 put the `Direct`
+    # talon run in the plain `talon` lane. Rule 2 is placement only: the
+    # claude-code and codex runs stay top-level but keep their own identities
+    # rather than pooling into that plain lane.
+    claw = next(lane for lane in fleet if lane["label"] == "Claw")
+    assert (claw["level"], claw["orchestrator"], claw["count"]) == (1, None, 2)
+    loose = next(lane for lane in fleet if lane["label"] == "talon")
+    assert (loose["level"], loose["orchestrator"], loose["count"]) == (1, None, 1)
+    for launcher in ("claude-code", "codex"):
+        lane = next(x for x in fleet if x["label"] == f"{launcher}/talon")
+        assert (lane["level"], lane["agent"], lane["orchestrator"], lane["count"]) == (
+            1,
+            "talon",
+            launcher,
+            1,
+        )
+
+    # The lane's orchestrator identity is stamped per span — the key
+    # scroll-to-lane matches on, now that (project, agent, worker) no longer
+    # identifies one row. Only `Direct` and self-orchestration normalize to null.
+    assert r["fleetLaneOrchestrators"] == [
+        None,  # Claw
+        None,  # Claw orchestrated by Claw (rule 3)
+        None,  # Emma
+        None,  # Meridian
+        None,  # Nellie
+        "Emma",  # talon run launched by Emma
+        "Emma",  # …and its worker stages
+        "Emma",
+        "claude-code",  # talon by claude-code — top-level (rule 2), own lane
+        "codex",  # talon by codex — likewise
+        None,  # talon by the `Direct` sentinel (rule 4)
+    ]
+
+    # Rule 2: an orchestrator with no lane in this project leaves the run
+    # top-level — at level 1, with an ordinary worker sub-lane — while the lane
+    # still names its launcher.
+    assert r["noParentLane"] == [
+        {
+            "label": "claude-code/talon",
+            "level": 1,
+            "agent": "talon",
+            "orchestrator": "claude-code",
+            "worker": None,
+            "count": 1,
+        },
+        {
+            "label": "talon/implement",
+            "level": 2,
+            "agent": "talon",
+            "orchestrator": "claude-code",
+            "worker": "implement",
+            "count": 1,
+        },
+    ]
+
+    # Two unresolvable orchestrators are two lanes, not one pooled band; only the
+    # `Direct` and unattributed spans share the plain `talon` lane.
+    assert [
+        (lane["label"], lane["level"], lane["orchestrator"], lane["count"])
+        for lane in r["unresolvedSplit"]
+    ] == [
+        ("talon", 1, None, 2),
+        ("claude-code/talon", 1, "claude-code", 2),
+        ("codex/talon", 1, "codex", 1),
+    ]
+
+    # …and rule 2 is evaluated PER PROJECT: the identical attribution nests where
+    # Emma has a lane and stays top-level where she does not — same identity in
+    # both, different placement.
+    per_project = r["perProject"]
+    assert [(lane["label"], lane["level"]) for lane in per_project["kestrel-fleet"]] == [
+        ("Emma", 1),
+        ("Emma/talon", 2),
+    ]
+    assert [
+        (lane["label"], lane["level"], lane["orchestrator"])
+        for lane in per_project["owner/repo"]
+    ] == [
+        ("Emma/talon", 1, "Emma"),
+    ]
+
+    # Rule 3: no self-nesting — one top-level lane holding all three spans.
+    assert r["selfOrchestrated"] == [
+        {
+            "label": "Claw",
+            "level": 1,
+            "agent": "Claw",
+            "orchestrator": None,
+            "worker": None,
+            "count": 3,
+        },
+    ]
+
+    # Rule 4: `Direct` means "no orchestrator" — even when an agent by that name
+    # really does have a lane here, it never becomes a parent.
+    assert [(lane["label"], lane["level"]) for lane in r["directSentinel"]] == [
+        ("Direct", 1),
+        ("talon", 1),
+    ]
+
+    # One agent under three orchestrators → three lanes: one under each launcher
+    # that has a lane here, and the third top-level but still its own. This is the
+    # (agent, orchestrator) pair key.
+    assert [(lane["label"], lane["level"]) for lane in r["split"]] == [
+        ("Claw", 1),
+        ("Claw/talon", 2),
+        ("Emma", 1),
+        ("Emma/talon", 2),
+        ("claude-code/talon", 1),
+    ]
+    # Each run landed in its own lane — the spans are partitioned, not duplicated.
+    assert [lane["count"] for lane in r["split"]] == [1, 1, 1, 1, 1]
+    assert r["splitLaneOrchestrators"] == {
+        "emma": "Emma",
+        "claw": "Claw",
+        "loose": "claude-code",
+    }
+
+    # Worker sub-lanes follow their own lane, each at its parent's level + 1.
+    assert [(lane["label"], lane["level"]) for lane in r["splitWorkers"]] == [
+        ("Emma", 1),
+        ("Emma/talon", 2),
+        ("talon/implement", 3),
+        ("claude-code/talon", 1),
+        ("talon/implement", 2),
+    ]
+
+    # Render chrome never invents a lane: the hidden `ghost` span gets no lane, so
+    # it can't satisfy rule 2 either — its talon run stays top-level (keeping the
+    # attribution the span really carries).
+    assert [(lane["label"], lane["level"]) for lane in r["hidden"]] == [
+        ("Emma", 1),
+        ("ghost/talon", 1),
+    ]
+
+    # A mutual orchestration cycle still renders both lanes rather than losing one.
+    assert sorted(lane["label"] for lane in r["cycle"]) == ["A/B", "B/A"]
+    assert all(lane["count"] == 1 for lane in r["cycle"])
+
+    # With the render model resolved, the paired "(started)" marker is dropped and
+    # the nested lane holds exactly the one visible bar.
+    ann = r["annotated"]
+    assert ann["markerHidden"] is True
+    assert [(lane["label"], lane["count"]) for lane in ann["lanes"]] == [
+        ("Emma", 1),
+        ("Emma/talon", 1),
+    ]

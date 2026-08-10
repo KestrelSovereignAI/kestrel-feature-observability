@@ -12,9 +12,14 @@
 //     that lands within a few px of `now` snaps there and re-engages Live.
 //     +/- (and the density strip) zoom the window (1 min … 24 h); panning left
 //     lazily loads older pages.
-//   - Y = lanes. One lane per agent (`kestrel.agent_name`), grouped under
-//     collapsible project headers (`kestrel-fleet`, each `owner/repo`). Worker
-//     subagents (`talon/implement`, `talon/review`) render as sub-lanes.
+//   - Y = lanes. One lane per (agent, orchestrator) pair (`kestrel.agent_name`
+//     × `kestrel.orchestrator`), grouped under collapsible project headers
+//     (`kestrel-fleet`, each `owner/repo`). A run launched BY another agent
+//     nests under that agent's lane — Emma's talon run is `Emma/talon` UNDER
+//     Emma — while a launcher with no lane in that project (`claude-code`) keeps
+//     its own labeled lane at the top level, and unattributed runs keep the
+//     plain `talon` lane (#101). Worker subagents (`talon/implement`,
+//     `talon/review`) render as sub-lanes of their agent's lane.
 //   - Blocks = hierarchical spans. A session/turn root paints as an outer band;
 //     its children (tool/LLM/gate/hook) pack into tracks below it — the
 //     "hierarchical blocks" idiom — colored by `openinference.span.kind`
@@ -51,6 +56,7 @@ import {
   MARKER_START,
   ATTR_TOOL_OUTCOME,
   ATTR_FEATURE_NAME,
+  ATTR_ORCHESTRATOR,
   OUTCOME_COMPLETED,
   OUTCOME_IDLE,
   mintPhoenixSession,
@@ -164,6 +170,11 @@ const SCHEDULER_SESSION_ID = "scheduler";
 // concurrent same-name tools (parallel `Bash`) pair one-to-one instead of the
 // first close hiding every same-name marker (#62 P2).
 const ATTR_TOOL_CALL_ID = "tool.call_id";
+
+// The producers stamp `kestrel.orchestrator` with the literal "Direct" when a
+// session has NO orchestrator (a human-driven Claude Code run). It is a sentinel,
+// not an agent, so it never nests a lane under anything (#101).
+const DIRECT_ORCHESTRATOR = "Direct";
 
 // SIGKILL / power-loss / hard-reboot guard: the producers close their spans on
 // CATCHABLE exits, but a hard kill leaves work OPEN forever — an unpaired
@@ -898,6 +909,186 @@ export function spanMemberRollup(s, spans, childrenByParent) {
   };
 }
 
+// ── Lane grouping: agent lanes, worker sub-lanes, orchestrator nesting (#101) ──
+//
+// A talon run launched BY an agent is fully attributed — `kestrel.orchestrator`
+// carries the launching agent's name on every span of the run — but the layout
+// bucketed project → agent → worker and sorted agents alphabetically, so Emma's
+// talon run rendered as a sibling top-level `talon` lane BELOW Emma. Lanes are
+// therefore keyed by the (agent, orchestrator) PAIR — the same deliberate key the
+// retired fleet swimlane used — so one agent driven by two orchestrators is two
+// lanes: `Emma/talon` nested under Emma, `claude-code/talon` top-level.
+//
+// Lane A nests under agent B iff ALL of:
+//   1. `A.orchestrator === B` — the attribution names it.
+//   2. B has its own lane in the SAME project. An orchestrator with no lane here
+//      (`claude-code` in `kestrel-fleet`) leaves A top-level.
+//   3. `A.agent !== B` — no self-nesting. `Claw` spans stamped
+//      `orchestrator=Claw` stay one plain top-level `Claw` lane.
+//   4. `A.orchestrator` is not the `Direct` sentinel — that means "no
+//      orchestrator", never a parent.
+//
+// IDENTITY vs PLACEMENT are separate. The lane key is the (agent, orchestrator)
+// pair after normalizing only the cases that genuinely mean "nobody launched
+// this": no attribute, the `Direct` sentinel (rule 4), and self-orchestration
+// (rule 3) all collapse to the agent's plain lane. Rule 2 decides PLACEMENT
+// ONLY — an orchestrator with no lane in this project can't be nested under, so
+// its lane stays top-level, but it keeps its own identity: `claude-code/talon`
+// and `codex/talon` are two distinct top-level lanes, not one pooled `talon`.
+// Erasing the orchestrator there would merge runs from unrelated launchers into
+// a single band and make the lane a lie about what it holds.
+//
+// Levels: a top-level agent lane is 1 and its workers 2; an orchestrator-nested
+// agent lane is 2 and its workers 3 (a deeper chain keeps counting — the label
+// indent and muted style generalize).
+//
+// Pure + exported for the render-model tests. Run `annotateRenderModel` first:
+// `rHide` chrome (paired markers, folded summaries) is dropped here exactly as
+// the layout drops it, so it never invents a lane. Each bucketed span is stamped
+// with its lane's orchestrator identity (`rLaneOrchestrator`) — with several
+// `talon` lanes, (project, agent, worker) no longer identifies one row, so
+// scroll-to-lane matches on the normalized value rather than the raw attribute.
+export function laneGroups(spanIter) {
+  // Pass 1: which agents actually have a lane in each project (rule 2).
+  const byProject = new Map();
+  for (const s of spanIter) {
+    if (s.rHide) continue;
+    let p = byProject.get(s.projectName);
+    if (!p) {
+      p = { agents: new Set(), spans: [] };
+      byProject.set(s.projectName, p);
+    }
+    p.agents.add(s.agent);
+    p.spans.push(s);
+  }
+  const out = new Map();
+  for (const [name, p] of byProject) out.set(name, projectLanes(name, p.spans, p.agents));
+  return out;
+}
+
+// The orchestrator half of a span's lane IDENTITY: the raw attribution, with
+// only the "nobody launched this" cases normalized away to null (the agent's
+// plain lane). Placement — whether that lane actually nests — is rule 2, decided
+// per project in `projectLanes`; it never rewrites the identity.
+function laneOrchestratorOf(s) {
+  const orch = s.orchestrator;
+  if (orch == null || orch === "") return null;
+  if (orch === DIRECT_ORCHESTRATOR) return null; // rule 4 — "no orchestrator"
+  if (orch === s.agent) return null; // rule 3 — no self-nesting
+  return String(orch); // rule 1
+}
+
+function cmpGroups(a, b) {
+  return (
+    String(a.agent).localeCompare(String(b.agent)) ||
+    String(a.orchestrator || "").localeCompare(String(b.orchestrator || ""))
+  );
+}
+
+// One project's ordered lanes: each agent lane followed by its worker sub-lanes,
+// then the agent lanes orchestrated BY it (each with their own workers).
+function projectLanes(projectName, projectSpans, agents) {
+  const groups = new Map(); // `<agent>\0<laneOrchestrator>` → agent lane + workers
+  const groupFor = (agent, orch) => {
+    const key = `${agent}\u0000${orch || ""}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { key, agent, orchestrator: orch, items: [], workers: new Map() };
+      groups.set(key, g);
+    }
+    return g;
+  };
+  for (const s of projectSpans) {
+    const orch = laneOrchestratorOf(s);
+    s.rLaneOrchestrator = orch;
+    // Touch the agent's own band even for a worker-only span, so the agent keeps
+    // its (possibly empty) row exactly as the pre-nesting layout gave it.
+    const g = groupFor(s.agent, orch);
+    const wk = s.worker || null;
+    if (wk == null) {
+      g.items.push({ span: s });
+    } else {
+      let list = g.workers.get(wk);
+      if (!list) {
+        list = [];
+        g.workers.set(wk, list);
+      }
+      list.push({ span: s });
+    }
+  }
+
+  // An agent can hold several lanes (one per orchestrator); a child nests under
+  // that agent's plain lane when there is one, else its first lane.
+  const byAgent = new Map();
+  for (const g of groups.values()) {
+    let arr = byAgent.get(g.agent);
+    if (!arr) {
+      arr = [];
+      byAgent.set(g.agent, arr);
+    }
+    arr.push(g);
+  }
+  const parentOfAgent = new Map();
+  for (const [agent, arr] of byAgent) {
+    const sorted = arr.slice().sort(cmpGroups);
+    parentOfAgent.set(agent, sorted.find((g) => g.orchestrator == null) || sorted[0]);
+  }
+  // Placement (rule 2): a lane nests only under an orchestrator that HAS a lane
+  // in this project. One that doesn't keeps its identity and stays top-level.
+  const children = new Map(); // parent group key → nested agent groups
+  const nested = new Set(); // group keys that are somebody's child
+  for (const g of groups.values()) {
+    if (g.orchestrator == null) continue;
+    if (!agents.has(g.orchestrator)) continue; // rule 2 — no lane here to nest under
+    const parent = parentOfAgent.get(g.orchestrator);
+    if (!parent || parent === g) continue;
+    let arr = children.get(parent.key);
+    if (!arr) {
+      arr = [];
+      children.set(parent.key, arr);
+    }
+    arr.push(g);
+    nested.add(g.key);
+  }
+
+  const lanes = [];
+  const emitted = new Set();
+  const emit = (g, level) => {
+    if (emitted.has(g.key)) return; // also the cycle guard (A→B→A)
+    emitted.add(g.key);
+    lanes.push({
+      projectName,
+      agent: g.agent,
+      orchestrator: g.orchestrator,
+      worker: null,
+      label: g.orchestrator ? `${g.orchestrator}/${g.agent}` : g.agent,
+      level,
+      items: g.items,
+    });
+    for (const wk of [...g.workers.keys()].sort()) {
+      lanes.push({
+        projectName,
+        agent: g.agent,
+        orchestrator: g.orchestrator,
+        worker: wk,
+        label: `${g.agent}/${wk}`,
+        level: level + 1,
+        items: g.workers.get(wk),
+      });
+    }
+    for (const child of (children.get(g.key) || []).slice().sort(cmpGroups)) {
+      emit(child, level + 1);
+    }
+  };
+  for (const g of [...groups.values()].filter((g) => !nested.has(g.key)).sort(cmpGroups)) {
+    emit(g, 1);
+  }
+  // A nested group no top-level lane ever reached (mutual orchestration) must
+  // still render — never drop a lane on the floor.
+  for (const g of [...groups.values()].sort(cmpGroups)) emit(g, 1);
+  return lanes;
+}
+
 // Local wall-clock HH:MM:SS for the ruler ticks and tooltips.
 function fmtClock(ms, withSeconds) {
   const d = new Date(ms);
@@ -1088,6 +1279,7 @@ export function mount(container, opts = {}) {
     const input = getAttr(attrs, ATTR_INPUT_VALUE);
     const output = getAttr(attrs, ATTR_OUTPUT_VALUE);
     const marker = getAttr(attrs, ATTR_MARKER);
+    const orch = getAttr(attrs, ATTR_ORCHESTRATOR);
     return {
       id: raw.id,
       name: raw.name || "(span)",
@@ -1100,6 +1292,8 @@ export function mount(container, opts = {}) {
       status: raw.statusCode === "ERROR" ? "error" : "ok",
       agent,
       worker: workerOf(attrs),
+      // Who LAUNCHED this run (talon attribution). Drives lane nesting (#101).
+      orchestrator: orch != null && orch !== "" ? String(orch) : null,
       sessionId: sess ? sess.id : null,
       // Phoenix's `parentId` is the OTel parent SPAN id (not the GraphQL node
       // id); it links to another span's `context.spanId`. Keep both so the
@@ -1291,11 +1485,17 @@ export function mount(container, opts = {}) {
     highlightedSpanId = hit.spanId;
     viewEnd = hit.start + windowMs / 2;
     collapsed.delete(hit.projectName);
+    // (project, agent, worker) stopped identifying ONE row once an agent can hold
+    // a lane per orchestrator (#101) — an orchestrated `talon` lane and the
+    // plain one share that triple. Match the lane identity `laneGroups` stamped
+    // on this very span, not its raw attribute (`Direct`/self-orchestration
+    // normalize to null, i.e. the agent's plain lane).
     const lane = layout.rows.find(
       (row) =>
         row.type === "lane" &&
         row.projectName === hit.projectName &&
         row.agent === hit.agent &&
+        (row.orchestrator || null) === (hit.rLaneOrchestrator || null) &&
         (row.worker || null) === (hit.worker || null),
     );
     if (lane) {
@@ -1674,28 +1874,9 @@ export function mount(container, opts = {}) {
     // next poll pulls backdated closes for still-open work (#62 P1).
     openFloors.clear();
     for (const [k, v] of openStartFloors(spans.values())) openFloors.set(k, v);
-    // Bucket by project → agent → worker(null = the agent's own band).
-    const byProject = new Map();
-    for (const s of spans.values()) {
-      if (s.rHide) continue;
-      let pm = byProject.get(s.projectName);
-      if (!pm) {
-        pm = new Map();
-        byProject.set(s.projectName, pm);
-      }
-      let am = pm.get(s.agent);
-      if (!am) {
-        am = new Map();
-        pm.set(s.agent, am);
-      }
-      const wk = s.worker || "";
-      let list = am.get(wk);
-      if (!list) {
-        list = [];
-        am.set(wk, list);
-      }
-      list.push({ span: s });
-    }
+    // Bucket by project → agent (nested under its orchestrator) → worker, in
+    // render order with each lane's level already assigned (#101).
+    const byProject = laneGroups(spans.values());
 
     // Order projects: known projects first (DEFAULT_PROJECT, then repos), then
     // any leftover names present in spans but not in the projects list.
@@ -1712,52 +1893,26 @@ export function mount(container, opts = {}) {
       y += PROJECT_H;
       if (isCollapsed) continue;
 
-      const agents = [...byProject.get(name).entries()].sort((a, b) =>
-        String(a[0]).localeCompare(String(b[0])),
-      );
-      for (const [agent, workerMap] of agents) {
-        // The agent's own band (worker-less spans: emitter roots, talon run roots).
-        const mainLane = laneBands(workerMap.get("") || [], nowMs);
-        const mainH = mainLane.tracks * TRACK_H + 2 * LANE_VPAD;
+      for (const lane of byProject.get(name)) {
+        const band = laneBands(lane.items, nowMs);
+        const h = band.tracks * TRACK_H + 2 * LANE_VPAD;
         rows.push({
           type: "lane",
           projectName: name,
           projectId: projId,
-          agent,
-          worker: null,
-          label: agent,
-          level: 1,
-          items: mainLane.items,
-          sessionBands: mainLane.sessionBands,
-          envelopes: mainLane.envelopes,
-          tracks: mainLane.tracks,
+          agent: lane.agent,
+          orchestrator: lane.orchestrator,
+          worker: lane.worker,
+          label: lane.label,
+          level: lane.level,
+          items: band.items,
+          sessionBands: band.sessionBands,
+          envelopes: band.envelopes,
+          tracks: band.tracks,
           y,
-          h: mainH,
+          h,
         });
-        y += mainH;
-
-        // Worker sub-lanes (talon/implement, talon/review, gate, …).
-        const workers = [...workerMap.keys()].filter((w) => w !== "").sort();
-        for (const wk of workers) {
-          const lane = laneBands(workerMap.get(wk), nowMs);
-          const h = lane.tracks * TRACK_H + 2 * LANE_VPAD;
-          rows.push({
-            type: "lane",
-            projectName: name,
-            projectId: projId,
-            agent,
-            worker: wk,
-            label: `${agent}/${wk}`,
-            level: 2,
-            items: lane.items,
-            sessionBands: lane.sessionBands,
-            envelopes: lane.envelopes,
-            tracks: lane.tracks,
-            y,
-            h,
-          });
-          y += h;
-        }
+        y += h;
       }
     }
     layout = { rows, contentH: y };
@@ -1895,8 +2050,10 @@ export function mount(container, opts = {}) {
 
   function drawLane(row, y) {
     // Lane label (left gutter).
-    ctx.fillStyle = row.level === 2 ? theme.muted : theme.text;
-    ctx.font = row.level === 2 ? "11px system-ui, sans-serif" : "12px system-ui, sans-serif";
+    // Anything below the top level (a worker sub-lane, an orchestrator-nested
+    // agent lane and its workers) is muted/smaller; the indent keeps counting.
+    ctx.fillStyle = row.level >= 2 ? theme.muted : theme.text;
+    ctx.font = row.level >= 2 ? "11px system-ui, sans-serif" : "12px system-ui, sans-serif";
     ctx.textBaseline = "middle";
     const labelX = 10 + (row.level - 1) * SUBLANE_INDENT;
     ctx.fillText(truncLabel(row.label, GUTTER_W - labelX - 6), labelX, y + row.h / 2);
