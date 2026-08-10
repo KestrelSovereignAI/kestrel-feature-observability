@@ -18,7 +18,12 @@ process boundaries):
   **`FleetObservabilityHostFeature`** (the `kestrel_sovereign.host_features`
   entry point), which ships the single "Observability" console panel with a
   three-view sub-nav: **Timeline** (default) answers when activity happened with
-  a temporal overview and compact span detail; **Navigator** answers where it
+  a temporal overview and compact span detail — its lanes are keyed by the
+  (`kestrel.agent_name`, `kestrel.orchestrator`) pair, so a run launched by an
+  agent nests under that agent's lane (`Emma/talon` under Emma), a run whose
+  launcher has no lane in that project stays top-level under its own label
+  (`claude-code/talon`), and unattributed runs keep the plain lane;
+  **Navigator** answers where it
   fits with the hierarchical Tenant → Fleet → Agent → Subagent → Session → Turn
   → Events tree and a persistent inspector for the selected Turn/Event span;
   and **Phoenix** provides exhaustive trace forensics in the curated thin embed.
