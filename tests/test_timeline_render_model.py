@@ -1215,8 +1215,10 @@ def test_lane_groups_nest_orchestrated_lanes(tmp_path):
         ("Claw", 1),
         ("Emma", 1),
         ("Emma/talon", 2),
-        ("talon/implement", 3),
-        ("talon/review", 3),
+        # Worker segments render as prose (#104); the lane's `worker` key below
+        # stays the raw stage value.
+        ("talon/Implement", 3),
+        ("talon/Review", 3),
         ("Meridian", 1),
         ("Nellie", 1),
         ("talon", 1),
@@ -1280,7 +1282,7 @@ def test_lane_groups_nest_orchestrated_lanes(tmp_path):
             "count": 1,
         },
         {
-            "label": "talon/implement",
+            "label": "talon/Implement",
             "level": 2,
             "agent": "talon",
             "orchestrator": "claude-code",
@@ -1356,9 +1358,9 @@ def test_lane_groups_nest_orchestrated_lanes(tmp_path):
     assert [(lane["label"], lane["level"]) for lane in r["splitWorkers"]] == [
         ("Emma", 1),
         ("Emma/talon", 2),
-        ("talon/implement", 3),
+        ("talon/Implement", 3),
         ("claude-code/talon", 1),
-        ("talon/implement", 2),
+        ("talon/Implement", 2),
     ]
 
     # Render chrome never invents a lane: the hidden `ghost` span gets no lane, so
@@ -1380,4 +1382,368 @@ def test_lane_groups_nest_orchestrated_lanes(tmp_path):
     assert [(lane["label"], lane["count"]) for lane in ann["lanes"]] == [
         ("Emma", 1),
         ("Emma/talon", 1),
+    ]
+
+
+# ── #104: talon stage labels read as prose ──────────────────────────────────
+#
+# Talon names a stage span by the stage token it belongs to and pairs it with a
+# `(started)` marker named for the bar, so both the lane gutter and the bars
+# rendered as raw identifiers. It writes that name three ways — bare (`gate`),
+# agent-prefixed (`talon/implement`, `talon/review`, what the real fixture
+# holds), and either plus the marker suffix — and all three must land on the
+# same prose or one run paints two spellings of one stage. So a stage span is a
+# CHAIN whose name is its normalized stage token (`workerOf`: `kestrel.stage`,
+# else the prefixed agent-name suffix — `talon/review` carries no
+# `kestrel.stage` at all, so an attribute-only rule cannot see it), optionally
+# with the "(started)" suffix. Everything else — the tool spans nested under a
+# stage, which carry the SAME stage token, a stage-looking name with no
+# identity — is left exactly as the producer emitted it, as is the
+# `kestrel.stage` value itself (a producer contract `workerOf` keys lanes off).
+_STAGE_LABEL_HARNESS = r"""
+import { annotateRenderModel, laneGroups } from "./timeline.js";
+
+let idc = 0;
+function span(o) {
+  idc += 1;
+  return {
+    id: o.id || `n${idc}`,
+    name: o.name,
+    start: o.start != null ? o.start : 100,
+    end: o.end != null ? o.end : (o.start != null ? o.start : 100) + 50,
+    instant: false,
+    openEnded: false,
+    marker: o.marker || null,
+    kind: o.kind || "CHAIN",
+    status: "ok",
+    spanId: o.spanId || `s${idc}`,
+    parentId: o.parentId || null,
+    traceId: "trace-1",
+    sessionId: "run#7",
+    projectId: "P",
+    projectName: "kestrel-fleet",
+    agent: o.agent || "talon",
+    worker: o.worker !== undefined ? o.worker : null,
+    orchestrator: o.orchestrator != null ? o.orchestrator : null,
+    attrs: o.attrs || {},
+  };
+}
+// A talon stage span exactly as tracing.py emits it: the bar is NAMED by the
+// stage, and carries it as `kestrel.stage` plus the prefixed agent-name variant.
+const stageAttrs = (stage) => ({ kestrel: { stage, agent_name: `talon/${stage}` } });
+const stage = (name, value, o = {}) =>
+  span({ name, worker: value, attrs: stageAttrs(value), ...o });
+// What the draw layer actually paints for a bar (timeline.js: `s.rLabel || s.name`).
+const painted = (s) => s.rLabel || s.name;
+const out = {};
+
+{
+  const impl = stage("implement", "implement", { spanId: "impl", start: 100, end: 500 });
+  // Its twin marker, parented UNDER the bar (talon's shape) — paired away.
+  const implMarker = stage("implement (started)", "implement", {
+    spanId: "im2", parentId: "impl", start: 100, end: 100, marker: "start",
+  });
+  // …and an UNPAIRED one, the only case a "(started)" marker paints its own
+  // band: the stage is still in flight, so its label is on screen.
+  const liveMarker = stage("review (started)", "review", {
+    spanId: "rv2", parentId: "not-loaded", start: 500, end: 500, marker: "start",
+  });
+  const review = stage("review", "review", { spanId: "rev", start: 500, end: 800 });
+  const check = stage("completion-check", "completion-check", { spanId: "cc", start: 800, end: 900 });
+  const coordinate = stage("coordinate", "coordinate", { spanId: "co", start: 900, end: 950 });
+  const gate = stage("gate", "gate", { spanId: "ga", start: 950, end: 980 });
+  // A refused stage composes its outcome onto the SAME prose base.
+  const denied = stage("implement", "implement", {
+    spanId: "dn", start: 990, end: 990,
+    attrs: { kestrel: { stage: "implement", tool_outcome: "denied" } },
+  });
+  // The agent-prefixed spelling of the SAME stage bar (what the real Talon
+  // fixture holds) — and its marker: the AGENT segment keeps its own casing.
+  const prefixed = stage("talon/implement", "implement", { spanId: "px", start: 170, end: 190 });
+  const prefixedMarker = stage("talon/implement (started)", "implement", {
+    spanId: "px2", parentId: "px", start: 170, end: 170, marker: "start",
+  });
+  // Untouched: tool spans nested under a stage carry the same stage token…
+  const bash = stage("Bash", "implement", { spanId: "bs", kind: "TOOL", start: 110, end: 130 });
+  const command = stage("command_execution", "implement", { spanId: "ce", kind: "TOOL", start: 140, end: 160 });
+  // …and a stage-LOOKING name with no identity at all is just a span name.
+  const bare = span({ name: "review", spanId: "br", start: 200, end: 220 });
+
+  const list = [impl, implMarker, liveMarker, review, check, coordinate, gate,
+                denied, prefixed, prefixedMarker, bash, command, bare];
+  annotateRenderModel(list, 10_000);
+  out.bars = Object.fromEntries(list.map((s) => [s.spanId, painted(s)]));
+  out.hidden = { implMarker: implMarker.rHide, liveMarker: liveMarker.rHide };
+  out.liveMarkerOpen = liveMarker.rOpen;
+  // The producer contract must survive the display pass untouched.
+  out.contract = list.map((s) => ({
+    spanId: s.spanId,
+    name: s.name,
+    stage: s.attrs.kestrel ? s.attrs.kestrel.stage || null : null,
+    worker: s.worker,
+  }));
+}
+
+// A TOOL that happens to be named for the stage it runs under is NOT the stage
+// bar. A marker mirrors the kind of what it marks, so the kind gate moves the
+// bar and its marker together — a pair can never split into two spellings.
+{
+  const tool = stage("implement", "implement", { spanId: "tl", kind: "TOOL", start: 100, end: 200 });
+  const toolMarker = stage("implement (started)", "implement", {
+    spanId: "tl2", kind: "TOOL", parentId: "not-loaded", start: 100, end: 100, marker: "start",
+  });
+  const list = [tool, toolMarker];
+  annotateRenderModel(list, 10_000);
+  out.toolNamedLikeStage = Object.fromEntries(list.map((s) => [s.spanId, painted(s)]));
+}
+
+// The gutter: a worker sub-lane label title-cases the WORKER segment only.
+{
+  const lanes = laneGroups([
+    span({ agent: "talon", name: "run" }),
+    stage("implement", "implement"),
+    stage("completion-check", "completion-check"),
+    span({ agent: "Emma", name: "Emma turn 1" }),
+    stage("review", "review", { orchestrator: "Emma" }),
+  ]);
+  out.gutter = [...lanes.get("kestrel-fleet")].map((l) => ({
+    label: l.label,
+    level: l.level,
+    agent: l.agent,
+    worker: l.worker,
+  }));
+}
+
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_stage_labels_render_as_prose(tmp_path):
+    """#104: talon stage bars, their markers and sub-lanes read as prose."""
+    pkg = _module_dir(tmp_path)
+    (pkg / "stages.mjs").write_text(_STAGE_LABEL_HARNESS, encoding="utf-8")
+    proc = subprocess.run(
+        [NODE, str(pkg / "stages.mjs")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+        cwd=str(pkg),
+    )
+    r = json.loads(proc.stdout)
+
+    bars = r["bars"]
+    # The stage bars — and a hyphenated stage in SENTENCE case, not
+    # Title-Case-Every-Word.
+    assert bars["impl"] == "Implement"
+    assert bars["rev"] == "Review"
+    assert bars["cc"] == "Completion check"
+    assert bars["co"] == "Coordinate"
+    assert bars["ga"] == "Gate"
+
+    # The "(started)" marker is the half #103's equality rule missed: it never
+    # equals its own stage value, so the pair would have rendered inconsistently.
+    # The suffix survives the casing.
+    assert bars["im2"] == "Implement (started)"
+    assert bars["rv2"] == "Review (started)"
+    # …and the one that actually paints is the unpaired marker (its twin hasn't
+    # landed): the paired one is still dropped, not relabeled into a second bar.
+    assert r["hidden"] == {"implMarker": True, "liveMarker": False}
+    assert r["liveMarkerOpen"] is True
+
+    # A refused stage composes its outcome onto the same prose base (#84 label).
+    assert bars["dn"] == "Implement · denied"
+
+    # The agent-prefixed spelling of a stage bar (the shape the REAL fixture
+    # holds) is the same stage and reads the same, gutter and bar alike — only
+    # the worker segment moves, never the agent segment (`talon`, not `Talon`).
+    assert bars["px"] == "talon/Implement"
+    assert bars["px2"] == "talon/Implement (started)"
+
+    # Everything else is untouched — including the tool spans nested under a
+    # stage, which carry the SAME stage token, and a stage-looking name with no
+    # identity of its own.
+    assert bars["bs"] == "Bash"
+    assert bars["ce"] == "command_execution"
+    assert bars["br"] == "review"
+
+    # A TOOL named for its stage is not the stage bar — and its marker moves
+    # with it, so the pair keeps one spelling instead of splitting.
+    assert r["toolNamedLikeStage"] == {"tl": "implement", "tl2": "implement (started)"}
+
+    # Display only: neither the span name nor the `kestrel.stage` value moved —
+    # the attribute is a producer contract `workerOf` keys worker sub-lanes off.
+    assert r["contract"] == [
+        {"spanId": "impl", "name": "implement", "stage": "implement", "worker": "implement"},
+        {
+            "spanId": "im2",
+            "name": "implement (started)",
+            "stage": "implement",
+            "worker": "implement",
+        },
+        {"spanId": "rv2", "name": "review (started)", "stage": "review", "worker": "review"},
+        {"spanId": "rev", "name": "review", "stage": "review", "worker": "review"},
+        {
+            "spanId": "cc",
+            "name": "completion-check",
+            "stage": "completion-check",
+            "worker": "completion-check",
+        },
+        {"spanId": "co", "name": "coordinate", "stage": "coordinate", "worker": "coordinate"},
+        {"spanId": "ga", "name": "gate", "stage": "gate", "worker": "gate"},
+        {"spanId": "dn", "name": "implement", "stage": "implement", "worker": "implement"},
+        {"spanId": "px", "name": "talon/implement", "stage": "implement", "worker": "implement"},
+        {
+            "spanId": "px2",
+            "name": "talon/implement (started)",
+            "stage": "implement",
+            "worker": "implement",
+        },
+        {"spanId": "bs", "name": "Bash", "stage": "implement", "worker": "implement"},
+        {
+            "spanId": "ce",
+            "name": "command_execution",
+            "stage": "implement",
+            "worker": "implement",
+        },
+        {"spanId": "br", "name": "review", "stage": None, "worker": None},
+    ]
+
+    # The gutter: the WORKER segment reads as prose; the agent segment is a name
+    # and keeps its own casing (`talon`, never `Talon`).
+    assert [(lane["label"], lane["level"]) for lane in r["gutter"]] == [
+        ("Emma", 1),
+        ("Emma/talon", 2),
+        ("talon/Review", 3),
+        ("talon", 1),
+        ("talon/Completion check", 2),
+        ("talon/Implement", 2),
+    ]
+    # …and the lane's `worker` key — what scroll-to-lane matches on — is the raw
+    # stage value, not the displayed one.
+    assert sorted(lane["worker"] for lane in r["gutter"] if lane["worker"]) == [
+        "completion-check",
+        "implement",
+        "review",
+    ]
+
+
+# The same rule over the checked-in REAL Talon trace (`fixtures/talon_trace.json`
+# — Phoenix GraphQL nodes verbatim, `attributes` still the serialized JSON
+# string). It is the shape a synthetic record can drift from: its stage bars are
+# named `talon/implement` (stage attribute + prefixed agent name) and
+# `talon/review` (prefixed agent name ONLY — no `kestrel.stage` at all), with
+# `gate` bare. So the gutter and the bar must agree on all three, and the run
+# root (`UncleSaurus/widget#7` — a NAME with a slash, no worker) plus the `Bash`
+# / `chat` children (same stage token, leaf kinds) must not move at all.
+_STAGE_FIXTURE_HARNESS = r"""
+import { readFileSync } from "node:fs";
+import { annotateRenderModel, laneGroups } from "./timeline.js";
+import { parseAttributes, getAttr, baseAgentName, workerOf, sessionKeyOf, spanKindOf,
+         ts } from "./phoenix.js";
+
+// Mirrors timeline.js normalize() for the fields the label + lane paths read.
+function normalize(raw, projectName) {
+  const start = ts(raw.startTime);
+  const rawEnd = ts(raw.endTime);
+  const hasEnd = rawEnd != null && rawEnd >= start;
+  const attrs = parseAttributes(raw.attributes);
+  const agentRaw = getAttr(attrs, "kestrel.agent_name");
+  const sess = sessionKeyOf(attrs);
+  return {
+    id: raw.id,
+    name: raw.name || "(span)",
+    start,
+    end: hasEnd ? rawEnd : start,
+    instant: hasEnd && rawEnd <= start,
+    openEnded: !hasEnd,
+    marker: getAttr(attrs, "kestrel.marker") || null,
+    kind: spanKindOf(raw),
+    status: raw.statusCode === "ERROR" ? "error" : "ok",
+    agent: agentRaw ? baseAgentName(agentRaw) : "unknown",
+    worker: workerOf(attrs),
+    orchestrator: getAttr(attrs, "kestrel.orchestrator") || null,
+    sessionId: sess ? sess.id : null,
+    spanId: (raw.context && raw.context.spanId) || null,
+    parentId: raw.parentId || null,
+    traceId: (raw.context && raw.context.traceId) || null,
+    projectId: "P",
+    projectName,
+    attrs,
+  };
+}
+
+const fixture = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const spans = fixture.talon_trace.map((n) => normalize(n, "UncleSaurus/widget"));
+annotateRenderModel(spans, ts("2026-07-18T20:20:00+00:00"));
+
+const out = {
+  bars: Object.fromEntries(spans.map((s) => [s.name, s.rLabel || s.name])),
+  // The producer contract, read back off the fixture records after the pass.
+  contract: spans.map((s) => ({
+    name: s.name,
+    kind: s.kind,
+    stage: getAttr(s.attrs, "kestrel.stage") || null,
+    worker: s.worker,
+  })),
+  gutter: [...laneGroups(spans).get("UncleSaurus/widget")].map((l) => ({
+    label: l.label,
+    level: l.level,
+    worker: l.worker,
+  })),
+};
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_stage_labels_over_real_talon_fixture(tmp_path):
+    """#104: the REAL prefixed Talon stage bars read as prose, gutter and bar."""
+    pkg = _module_dir(tmp_path)
+    (pkg / "stage-fixture.mjs").write_text(_STAGE_FIXTURE_HARNESS, encoding="utf-8")
+    fixture = pathlib.Path(__file__).resolve().parent / "fixtures" / "talon_trace.json"
+    proc = subprocess.run(
+        [NODE, str(pkg / "stage-fixture.mjs"), str(fixture)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+        cwd=str(pkg),
+    )
+    r = json.loads(proc.stdout)
+
+    # The bars. `talon/review` has NO `kestrel.stage` — its token is the
+    # agent-name suffix — so an attribute-only rule left it lowercase while its
+    # gutter read `talon/Review`; the two must agree.
+    assert r["bars"]["talon/implement"] == "talon/Implement"
+    assert r["bars"]["talon/review"] == "talon/Review"
+    assert r["bars"]["gate"] == "Gate"
+    # Untouched: the leaf children carrying the same stage token, and the run
+    # root — whose NAME holds a slash but which has no worker at all.
+    assert r["bars"]["Bash"] == "Bash"
+    assert r["bars"]["chat"] == "chat"
+    assert r["bars"]["UncleSaurus/widget#7"] == "UncleSaurus/widget#7"
+
+    # Display only: names, kinds and `kestrel.stage` are exactly as exported.
+    assert r["contract"] == [
+        {"name": "UncleSaurus/widget#7", "kind": "AGENT", "stage": None, "worker": None},
+        {
+            "name": "talon/implement",
+            "kind": "CHAIN",
+            "stage": "implement",
+            "worker": "implement",
+        },
+        {"name": "talon/review", "kind": "CHAIN", "stage": None, "worker": "review"},
+        {"name": "gate", "kind": "CHAIN", "stage": "gate", "worker": "gate"},
+        {"name": "Bash", "kind": "TOOL", "stage": "implement", "worker": "implement"},
+        {"name": "chat", "kind": "LLM", "stage": "implement", "worker": "implement"},
+    ]
+
+    # The gutter agrees with the bars, and keys off the raw token.
+    assert r["gutter"] == [
+        {"label": "talon", "level": 1, "worker": None},
+        {"label": "talon/Gate", "level": 2, "worker": "gate"},
+        {"label": "talon/Implement", "level": 2, "worker": "implement"},
+        {"label": "talon/Review", "level": 2, "worker": "review"},
     ]

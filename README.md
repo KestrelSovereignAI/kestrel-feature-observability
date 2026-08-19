@@ -22,7 +22,12 @@ process boundaries):
   (`kestrel.agent_name`, `kestrel.orchestrator`) pair, so a run launched by an
   agent nests under that agent's lane (`Emma/talon` under Emma), a run whose
   launcher has no lane in that project stays top-level under its own label
-  (`claude-code/talon`), and unattributed runs keep the plain lane;
+  (`claude-code/talon`), and unattributed runs keep the plain lane. Talon stage
+  spans — the bar, its `(started)` marker and the worker sub-lane — render their
+  stage as prose (`Implement`, `Completion check`, and `talon/Implement` where
+  the producer prefixes the agent, whose own name is never re-cased): a
+  display-only casing that never rewrites the `kestrel.stage` /
+  `kestrel.agent_name` values the lanes are keyed off.
   **Navigator** answers where it
   fits with the hierarchical Tenant → Fleet → Agent → Subagent → Session → Turn
   → Events tree and a persistent inspector for the selected Turn/Event span;
