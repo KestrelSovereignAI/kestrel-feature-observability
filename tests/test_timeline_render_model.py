@@ -1387,19 +1387,23 @@ def test_lane_groups_nest_orchestrated_lanes(tmp_path):
 
 # ── #104: talon stage labels read as prose ──────────────────────────────────
 #
-# Talon names a stage span by the stage token it belongs to and pairs it with a
-# `(started)` marker named for the bar, so both the lane gutter and the bars
-# rendered as raw identifiers. It writes that name three ways — bare (`gate`),
-# agent-prefixed (`talon/implement`, `talon/review`, what the real fixture
-# holds), and either plus the marker suffix — and all three must land on the
-# same prose or one run paints two spellings of one stage. So a stage span is a
-# CHAIN whose name is its normalized stage token (`workerOf`: `kestrel.stage`,
-# else the prefixed agent-name suffix — `talon/review` carries no
-# `kestrel.stage` at all, so an attribute-only rule cannot see it), optionally
-# with the "(started)" suffix. Everything else — the tool spans nested under a
-# stage, which carry the SAME stage token, a stage-looking name with no
-# identity — is left exactly as the producer emitted it, as is the
-# `kestrel.stage` value itself (a producer contract `workerOf` keys lanes off).
+# Talon opens a stage scope as ``start_span(<stage>)``, so a stage span is NAMED
+# by the ``kestrel.stage`` it carries, and its live-visibility twin (#80) is that
+# same name plus ``" (started)"``. Both spellings must land on the same prose or
+# one stage paints two bars under two names — and the marker never equals its own
+# stage value, which is exactly what an equality-only rule misses (#103).
+#
+# The NAME test is the whole rule; nothing may gate on the span KIND. Talon picks
+# the kind PER STAGE (``_STAGE_SPAN_KINDS``: implement/review ``LLM``, coordinate
+# ``AGENT``, gate ``CHAIN``, else ``CHAIN``), so a kind gate stops recognizing the
+# very bars it was written for the moment that mapping moves — while the gutter,
+# which has no such gate, keeps reading as prose. The harness below therefore
+# never invents a kind: every stage span carries the one its producer emits.
+#
+# Everything else stays exactly as emitted. ``kestrel.stage`` is stamped on EVERY
+# span inside a stage — ``command_execution``, ``Bash``, ``ci``, ``ci (waiting)``
+# and ``self-review`` all carry it — and none of them is named for its stage, so
+# the name test excludes them precisely.
 _STAGE_LABEL_HARNESS = r"""
 import { annotateRenderModel, laneGroups } from "./timeline.js";
 
@@ -1414,7 +1418,7 @@ function span(o) {
     instant: false,
     openEnded: false,
     marker: o.marker || null,
-    kind: o.kind || "CHAIN",
+    kind: o.kind || "TOOL",
     status: "ok",
     spanId: o.spanId || `s${idc}`,
     parentId: o.parentId || null,
@@ -1428,11 +1432,27 @@ function span(o) {
     attrs: o.attrs || {},
   };
 }
-// A talon stage span exactly as tracing.py emits it: the bar is NAMED by the
-// stage, and carries it as `kestrel.stage` plus the prefixed agent-name variant.
-const stageAttrs = (stage) => ({ kestrel: { stage, agent_name: `talon/${stage}` } });
+
+// The producer's own per-stage tables (kestreltalon/observability.py). A stage
+// has no single kind and no single agent name, so a test that invents either
+// cannot catch a rule that keys off them.
+const STAGE_KINDS = { coordinate: "AGENT", implement: "LLM", review: "LLM", gate: "CHAIN" };
+const STAGE_AGENTS = { implement: "talon/implement", review: "talon/review" };
+
+// A talon stage span exactly as `stage_span_scope` emits it: NAMED for the
+// stage, carrying it as `kestrel.stage`, with that stage's kind and agent name.
 const stage = (name, value, o = {}) =>
-  span({ name, worker: value, attrs: stageAttrs(value), ...o });
+  span({
+    name,
+    worker: value,
+    kind: STAGE_KINDS[value] || "CHAIN",
+    attrs: { kestrel: { stage: value, agent_name: STAGE_AGENTS[value] || "talon" } },
+    ...o,
+  });
+// A span nested INSIDE a stage: it inherits `kestrel.stage`, with its own name
+// and its own kind.
+const inStage = (name, value, kind, o = {}) =>
+  span({ name, worker: value, kind, attrs: { kestrel: { stage: value } }, ...o });
 // What the draw layer actually paints for a bar (timeline.js: `s.rLabel || s.name`).
 const painted = (s) => s.rLabel || s.name;
 const out = {};
@@ -1457,44 +1477,32 @@ const out = {};
     spanId: "dn", start: 990, end: 990,
     attrs: { kestrel: { stage: "implement", tool_outcome: "denied" } },
   });
-  // The agent-prefixed spelling of the SAME stage bar (what the real Talon
-  // fixture holds) — and its marker: the AGENT segment keeps its own casing.
-  const prefixed = stage("talon/implement", "implement", { spanId: "px", start: 170, end: 190 });
-  const prefixedMarker = stage("talon/implement (started)", "implement", {
-    spanId: "px2", parentId: "px", start: 170, end: 170, marker: "start",
-  });
-  // Untouched: tool spans nested under a stage carry the same stage token…
-  const bash = stage("Bash", "implement", { spanId: "bs", kind: "TOOL", start: 110, end: 130 });
-  const command = stage("command_execution", "implement", { spanId: "ce", kind: "TOOL", start: 140, end: 160 });
-  // …and a stage-LOOKING name with no identity at all is just a span name.
+  // Untouched: every span nested under a stage inherits its `kestrel.stage` —
+  // the tool spans, the gate checks, and a gate's own "(waiting)" tick, whose
+  // name is not a marker of its stage.
+  const bash = inStage("Bash", "implement", "TOOL", { spanId: "bs", start: 110, end: 130 });
+  const command = inStage("command_execution", "implement", "TOOL", { spanId: "ce", start: 140, end: 160 });
+  const selfReview = inStage("self-review", "gate", "CHAIN", { spanId: "sr", start: 951, end: 960 });
+  const ci = inStage("ci", "gate", "CHAIN", { spanId: "ci", start: 961, end: 970 });
+  const ciWait = inStage("ci (waiting)", "gate", "TOOL", { spanId: "cw", start: 971, end: 975 });
+  // …and a stage-LOOKING name with no `kestrel.stage` at all is just a name.
   const bare = span({ name: "review", spanId: "br", start: 200, end: 220 });
 
-  const list = [impl, implMarker, liveMarker, review, check, coordinate, gate,
-                denied, prefixed, prefixedMarker, bash, command, bare];
+  const list = [impl, implMarker, liveMarker, review, check, coordinate, gate, denied,
+                bash, command, selfReview, ci, ciWait, bare];
   annotateRenderModel(list, 10_000);
   out.bars = Object.fromEntries(list.map((s) => [s.spanId, painted(s)]));
   out.hidden = { implMarker: implMarker.rHide, liveMarker: liveMarker.rHide };
   out.liveMarkerOpen = liveMarker.rOpen;
-  // The producer contract must survive the display pass untouched.
+  // The producer contract must survive the display pass untouched — including
+  // the KINDS, which differ across the stage bars that all read as prose.
   out.contract = list.map((s) => ({
     spanId: s.spanId,
     name: s.name,
+    kind: s.kind,
     stage: s.attrs.kestrel ? s.attrs.kestrel.stage || null : null,
     worker: s.worker,
   }));
-}
-
-// A TOOL that happens to be named for the stage it runs under is NOT the stage
-// bar. A marker mirrors the kind of what it marks, so the kind gate moves the
-// bar and its marker together — a pair can never split into two spellings.
-{
-  const tool = stage("implement", "implement", { spanId: "tl", kind: "TOOL", start: 100, end: 200 });
-  const toolMarker = stage("implement (started)", "implement", {
-    spanId: "tl2", kind: "TOOL", parentId: "not-loaded", start: 100, end: 100, marker: "start",
-  });
-  const list = [tool, toolMarker];
-  annotateRenderModel(list, 10_000);
-  out.toolNamedLikeStage = Object.fromEntries(list.map((s) => [s.spanId, painted(s)]));
 }
 
 // The gutter: a worker sub-lane label title-cases the WORKER segment only.
@@ -1555,59 +1563,77 @@ def test_stage_labels_render_as_prose(tmp_path):
     # A refused stage composes its outcome onto the same prose base (#84 label).
     assert bars["dn"] == "Implement · denied"
 
-    # The agent-prefixed spelling of a stage bar (the shape the REAL fixture
-    # holds) is the same stage and reads the same, gutter and bar alike — only
-    # the worker segment moves, never the agent segment (`talon`, not `Talon`).
-    assert bars["px"] == "talon/Implement"
-    assert bars["px2"] == "talon/Implement (started)"
-
-    # Everything else is untouched — including the tool spans nested under a
-    # stage, which carry the SAME stage token, and a stage-looking name with no
-    # identity of its own.
+    # Everything else is untouched — every span nested under a stage carries the
+    # SAME `kestrel.stage`, and a stage-looking name with no stage at all is a
+    # name like any other.
     assert bars["bs"] == "Bash"
     assert bars["ce"] == "command_execution"
+    assert bars["sr"] == "self-review"
+    assert bars["ci"] == "ci"
+    assert bars["cw"] == "ci (waiting)"
     assert bars["br"] == "review"
-
-    # A TOOL named for its stage is not the stage bar — and its marker moves
-    # with it, so the pair keeps one spelling instead of splitting.
-    assert r["toolNamedLikeStage"] == {"tl": "implement", "tl2": "implement (started)"}
 
     # Display only: neither the span name nor the `kestrel.stage` value moved —
     # the attribute is a producer contract `workerOf` keys worker sub-lanes off.
+    # And the KINDS: the stage bars that all read as prose are LLM, CHAIN and
+    # AGENT, so no rule that recognizes them may key on the kind.
     assert r["contract"] == [
-        {"spanId": "impl", "name": "implement", "stage": "implement", "worker": "implement"},
+        {
+            "spanId": "impl",
+            "name": "implement",
+            "kind": "LLM",
+            "stage": "implement",
+            "worker": "implement",
+        },
         {
             "spanId": "im2",
             "name": "implement (started)",
+            "kind": "LLM",
             "stage": "implement",
             "worker": "implement",
         },
-        {"spanId": "rv2", "name": "review (started)", "stage": "review", "worker": "review"},
-        {"spanId": "rev", "name": "review", "stage": "review", "worker": "review"},
+        {
+            "spanId": "rv2",
+            "name": "review (started)",
+            "kind": "LLM",
+            "stage": "review",
+            "worker": "review",
+        },
+        {"spanId": "rev", "name": "review", "kind": "LLM", "stage": "review", "worker": "review"},
         {
             "spanId": "cc",
             "name": "completion-check",
+            "kind": "CHAIN",
             "stage": "completion-check",
             "worker": "completion-check",
         },
-        {"spanId": "co", "name": "coordinate", "stage": "coordinate", "worker": "coordinate"},
-        {"spanId": "ga", "name": "gate", "stage": "gate", "worker": "gate"},
-        {"spanId": "dn", "name": "implement", "stage": "implement", "worker": "implement"},
-        {"spanId": "px", "name": "talon/implement", "stage": "implement", "worker": "implement"},
         {
-            "spanId": "px2",
-            "name": "talon/implement (started)",
+            "spanId": "co",
+            "name": "coordinate",
+            "kind": "AGENT",
+            "stage": "coordinate",
+            "worker": "coordinate",
+        },
+        {"spanId": "ga", "name": "gate", "kind": "CHAIN", "stage": "gate", "worker": "gate"},
+        {
+            "spanId": "dn",
+            "name": "implement",
+            "kind": "LLM",
             "stage": "implement",
             "worker": "implement",
         },
-        {"spanId": "bs", "name": "Bash", "stage": "implement", "worker": "implement"},
+        {"spanId": "bs", "name": "Bash", "kind": "TOOL", "stage": "implement", "worker": "implement"},
         {
             "spanId": "ce",
             "name": "command_execution",
+            "kind": "TOOL",
             "stage": "implement",
             "worker": "implement",
         },
-        {"spanId": "br", "name": "review", "stage": None, "worker": None},
+        {"spanId": "sr", "name": "self-review", "kind": "CHAIN", "stage": "gate", "worker": "gate"},
+        {"spanId": "ci", "name": "ci", "kind": "CHAIN", "stage": "gate", "worker": "gate"},
+        {"spanId": "cw", "name": "ci (waiting)", "kind": "TOOL", "stage": "gate", "worker": "gate"},
+        {"spanId": "br", "name": "review", "kind": "TOOL", "stage": None, "worker": None},
     ]
 
     # The gutter: the WORKER segment reads as prose; the agent segment is a name
@@ -1632,11 +1658,10 @@ def test_stage_labels_render_as_prose(tmp_path):
 # The same rule over the checked-in REAL Talon trace (`fixtures/talon_trace.json`
 # — Phoenix GraphQL nodes verbatim, `attributes` still the serialized JSON
 # string). It is the shape a synthetic record can drift from: its stage bars are
-# named `talon/implement` (stage attribute + prefixed agent name) and
-# `talon/review` (prefixed agent name ONLY — no `kestrel.stage` at all), with
-# `gate` bare. So the gutter and the bar must agree on all three, and the run
-# root (`UncleSaurus/widget#7` — a NAME with a slash, no worker) plus the `Bash`
-# / `chat` children (same stage token, leaf kinds) must not move at all.
+# `implement` (LLM) with its `implement (started)` twin, `review` (LLM) and
+# `gate` (CHAIN) — three kinds, one prose rule — while the children that inherit
+# their stage token (`Bash`, `command_execution`, `self-review`) and the run root
+# must not move at all.
 _STAGE_FIXTURE_HARNESS = r"""
 import { readFileSync } from "node:fs";
 import { annotateRenderModel, laneGroups } from "./timeline.js";
@@ -1699,7 +1724,7 @@ process.stdout.write(JSON.stringify(out));
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_stage_labels_over_real_talon_fixture(tmp_path):
-    """#104: the REAL prefixed Talon stage bars read as prose, gutter and bar."""
+    """#104: the REAL Talon stage bars read as prose, gutter and bar alike."""
     pkg = _module_dir(tmp_path)
     (pkg / "stage-fixture.mjs").write_text(_STAGE_FIXTURE_HARNESS, encoding="utf-8")
     fixture = pathlib.Path(__file__).resolve().parent / "fixtures" / "talon_trace.json"
@@ -1713,31 +1738,42 @@ def test_stage_labels_over_real_talon_fixture(tmp_path):
     )
     r = json.loads(proc.stdout)
 
-    # The bars. `talon/review` has NO `kestrel.stage` — its token is the
-    # agent-name suffix — so an attribute-only rule left it lowercase while its
-    # gutter read `talon/Review`; the two must agree.
-    assert r["bars"]["talon/implement"] == "talon/Implement"
-    assert r["bars"]["talon/review"] == "talon/Review"
+    # The bars — an LLM stage, its LLM marker, and a CHAIN stage: one rule, and
+    # not one of the three kinds a gate could have been written against.
+    assert r["bars"]["implement"] == "Implement"
+    assert r["bars"]["implement (started)"] == "Implement (started)"
+    assert r["bars"]["review"] == "Review"
     assert r["bars"]["gate"] == "Gate"
-    # Untouched: the leaf children carrying the same stage token, and the run
-    # root — whose NAME holds a slash but which has no worker at all.
+    # Untouched: the children that inherit their stage's token, the event span
+    # whose worker comes from a prefixed agent name alone, and the run root —
+    # whose NAME holds a slash but which has no worker at all.
     assert r["bars"]["Bash"] == "Bash"
-    assert r["bars"]["chat"] == "chat"
+    assert r["bars"]["command_execution"] == "command_execution"
+    assert r["bars"]["self-review"] == "self-review"
+    assert r["bars"]["agent_response"] == "agent_response"
     assert r["bars"]["UncleSaurus/widget#7"] == "UncleSaurus/widget#7"
 
     # Display only: names, kinds and `kestrel.stage` are exactly as exported.
     assert r["contract"] == [
         {"name": "UncleSaurus/widget#7", "kind": "AGENT", "stage": None, "worker": None},
+        {"name": "implement", "kind": "LLM", "stage": "implement", "worker": "implement"},
         {
-            "name": "talon/implement",
-            "kind": "CHAIN",
+            "name": "implement (started)",
+            "kind": "LLM",
             "stage": "implement",
             "worker": "implement",
         },
-        {"name": "talon/review", "kind": "CHAIN", "stage": None, "worker": "review"},
-        {"name": "gate", "kind": "CHAIN", "stage": "gate", "worker": "gate"},
         {"name": "Bash", "kind": "TOOL", "stage": "implement", "worker": "implement"},
-        {"name": "chat", "kind": "LLM", "stage": "implement", "worker": "implement"},
+        {
+            "name": "command_execution",
+            "kind": "TOOL",
+            "stage": "implement",
+            "worker": "implement",
+        },
+        {"name": "review", "kind": "LLM", "stage": "review", "worker": "review"},
+        {"name": "agent_response", "kind": "TOOL", "stage": None, "worker": "review"},
+        {"name": "gate", "kind": "CHAIN", "stage": "gate", "worker": "gate"},
+        {"name": "self-review", "kind": "CHAIN", "stage": "gate", "worker": "gate"},
     ]
 
     # The gutter agrees with the bars, and keys off the raw token.

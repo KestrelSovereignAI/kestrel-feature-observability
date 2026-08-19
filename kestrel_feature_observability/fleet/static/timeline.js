@@ -52,6 +52,7 @@ import {
   ATTR_OUTPUT_VALUE,
   ATTR_MODEL_NAME,
   ATTR_RUN_ID,
+  ATTR_STAGE,
   ATTR_MARKER,
   MARKER_START,
   ATTR_TOOL_OUTCOME,
@@ -235,71 +236,48 @@ function startedBase(name) {
 
 // ── Talon stage labels (#104) ─────────────────────────────────
 //
-// Talon names a stage span for the stage itself — `implement`, `review`,
-// `coordinate`, `gate`, `completion-check` — so the Timeline rendered lane
-// gutters and bars as raw identifiers. They are prose to an operator, so they
-// read as prose: `Implement`, `Completion check`. A hyphenated stage becomes
-// SENTENCE case (one leading capital), not Title-Case-Every-Word.
+// Talon opens a stage scope as `start_span(stage)`, so the stage span is NAMED
+// by the stage it is — `implement`, `review`, `coordinate`, `gate`,
+// `completion-check` — and the Timeline painted both its lane gutter and its
+// bar as that raw identifier. To an operator these are prose, so they read as
+// prose: `Implement`, `Completion check`. A hyphenated stage becomes SENTENCE
+// case (one leading capital), not Title-Case-Every-Word.
 //
-// DISPLAY ONLY. The values this reads — `kestrel.stage` and `kestrel.agent_name`
-// — are producer contracts matched on elsewhere (`workerOf` keys the worker
-// sub-lanes off them exactly), so neither they nor the span's own `name` are
-// ever rewritten; only what gets painted changes.
-const KIND_CHAIN = "CHAIN"; // `stage_span()`'s OpenInference kind
-
+// DISPLAY ONLY. `kestrel.stage` is a producer contract matched on elsewhere
+// (`workerOf` keys the worker sub-lanes off it), so neither the attribute nor
+// the span's own `name` is ever rewritten — only what gets painted changes.
 function stageTitle(stage) {
   const s = String(stage).replace(/-+/g, " ");
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
-// The stage token a span belongs to, normalized exactly the way the lane split
-// normalizes it — `workerOf`: an explicit `kestrel.stage`, else the suffix of a
-// prefixed `kestrel.agent_name` (`talon/review` → `review`). `normalize()`
-// already resolved this onto `s.worker`; recompute only for a record that
-// predates it (the pure helpers are called on raw-ish spans in tests too).
-function stageTokenOf(s) {
-  const worker = s.worker != null && s.worker !== "" ? s.worker : workerOf(s.attrs);
-  return worker != null && worker !== "" ? String(worker) : null;
-}
-
 // The prose display name of a talon STAGE span, else null (leave it be).
 //
-// A stage span is a CHAIN (`tracing.py: stage_span()` → OpenInference CHAIN)
-// whose NAME is the stage token it belongs to. Talon writes that name three
-// ways and all three must land on the same prose, or one run paints two
-// spellings of one stage:
+// A stage span is one carrying a non-empty `kestrel.stage` whose NAME is that
+// stage value, or that value plus the `" (started)"` suffix of its
+// live-visibility twin (#80) — the same suffix the marker↔parent pairing below
+// already keys on. Both spellings must land on the same prose or one stage
+// paints two: a marker never equals its own stage value, which is precisely
+// what an equality-only rule misses (#103).
 //
-//   - bare — `gate` (the token itself),
-//   - agent-prefixed — `talon/implement`, `talon/review` (what the real fixture
-//     holds; `talon/review` carries NO `kestrel.stage` at all, so its token
-//     comes from the agent-name suffix — an attribute-only rule can't see it),
-//   - either, plus the `" (started)"` marker suffix — the twin marker talon
-//     parents under the bar, named for the bar (see the parent-pairing in
-//     `annotateRenderModel`). The suffix survives the casing.
-//
-// Matching the token (not the raw attribute) is what keeps the pair together:
-// equality with the bare `kestrel.stage` value misses BOTH the marker and the
-// prefixed form, re-casing only part of a run (#103's rejected rule, and the
-// gutter/bar divergence the #104 review caught).
-//
-// The CHAIN gate is what holds everything else still: a `Bash` / `chat` /
-// `command_execution` span nested under a stage carries the SAME stage token,
-// and a marker mirrors the kind of what it marks (`Bash (started)` is TOOL), so
-// a tool that happens to share its stage's name keeps its own name — bar and
-// marker alike. Only the stage's own CHAIN pair moves.
+// The NAME test alone is the whole rule — necessary AND sufficient.
+// `kestrel.stage` is stamped on EVERY span inside the stage (the
+// `command_execution` / `Bash` tool spans, the `ci` and `self-review` gate
+// checks, `ci (waiting)`), and none of those is named for its stage, so the
+// name test excludes them exactly. Gating on the span KIND on top of it is not
+// merely redundant but wrong: the producer picks the kind per stage (LLM for
+// implement/review, AGENT for coordinate, CHAIN for gate) and that mapping
+// drifts, so a kind gate silently stops recognizing the bars it was written
+// for while the gutter — which has no such gate — keeps reading as prose, and
+// one stage renders under two spellings.
 function stageDisplayName(s) {
-  const token = stageTokenOf(s);
-  if (token == null) return null;
-  if (spanKindOf(s) !== KIND_CHAIN) return null;
+  const stage = getAttr(s.attrs, ATTR_STAGE);
+  if (stage == null || stage === "") return null;
+  const token = String(stage);
   const raw = String(s.name || "");
   const base = startedBase(raw);
-  const suffix = raw.slice(base.length); // " (started)", else ""
-  if (base === token) return stageTitle(token) + suffix;
-  // Agent-prefixed variant: the AGENT segment is a name, never re-cased.
-  if (base.endsWith(`/${token}`)) {
-    return base.slice(0, base.length - token.length) + stageTitle(token) + suffix;
-  }
-  return null;
+  if (base !== token) return null;
+  return stageTitle(token) + raw.slice(base.length); // " (started)" survives
 }
 
 // The name a composed band label builds on: a stage span's prose form, else the

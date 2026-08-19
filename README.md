@@ -22,12 +22,17 @@ process boundaries):
   (`kestrel.agent_name`, `kestrel.orchestrator`) pair, so a run launched by an
   agent nests under that agent's lane (`Emma/talon` under Emma), a run whose
   launcher has no lane in that project stays top-level under its own label
-  (`claude-code/talon`), and unattributed runs keep the plain lane. Talon stage
-  spans — the bar, its `(started)` marker and the worker sub-lane — render their
-  stage as prose (`Implement`, `Completion check`, and `talon/Implement` where
-  the producer prefixes the agent, whose own name is never re-cased): a
-  display-only casing that never rewrites the `kestrel.stage` /
-  `kestrel.agent_name` values the lanes are keyed off.
+  (`claude-code/talon`), and unattributed runs keep the plain lane. Talon names a
+  stage span for the stage itself, so the bar, its `(started)` marker and the
+  worker sub-lane all read that stage as prose — `Implement`,
+  `Implement (started)`, `Completion check`, and a gutter of `talon/Implement`
+  whose agent segment is never re-cased. It is display-only and keys on the
+  span's *name*: `kestrel.stage` is stamped on every span nested inside a stage
+  (`command_execution`, `Bash`, `ci`, `self-review`), none of which is named for
+  its stage, so those are left exactly as emitted — as is the `kestrel.stage`
+  value itself, which the lanes are keyed off. Nothing keys on the span kind:
+  the producer picks that per stage (`LLM` for implement/review, `AGENT` for
+  coordinate, `CHAIN` for gate).
   **Navigator** answers where it
   fits with the hierarchical Tenant → Fleet → Agent → Subagent → Session → Turn
   → Events tree and a persistent inspector for the selected Turn/Event span;
