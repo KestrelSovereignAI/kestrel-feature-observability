@@ -52,6 +52,7 @@ import {
   ATTR_OUTPUT_VALUE,
   ATTR_MODEL_NAME,
   ATTR_RUN_ID,
+  ATTR_STAGE,
   ATTR_MARKER,
   MARKER_START,
   ATTR_TOOL_OUTCOME,
@@ -231,6 +232,59 @@ function effEnd(s, nowMs) {
 // The base name a "<name> (started)" marker pairs with its real closed span on.
 function startedBase(name) {
   return String(name).replace(/\s*\(started\)\s*$/i, "");
+}
+
+// ── Talon stage labels (#104) ─────────────────────────────────
+//
+// Talon opens a stage scope as `start_span(stage)`, so the stage span is NAMED
+// by the stage it is — `implement`, `review`, `coordinate`, `gate`,
+// `completion-check` — and the Timeline painted both its lane gutter and its
+// bar as that raw identifier. To an operator these are prose, so they read as
+// prose: `Implement`, `Completion check`. A hyphenated stage becomes SENTENCE
+// case (one leading capital), not Title-Case-Every-Word.
+//
+// DISPLAY ONLY. `kestrel.stage` is a producer contract matched on elsewhere
+// (`workerOf` keys the worker sub-lanes off it), so neither the attribute nor
+// the span's own `name` is ever rewritten — only what gets painted changes.
+function stageTitle(stage) {
+  const s = String(stage).replace(/-+/g, " ");
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+// The prose display name of a talon STAGE span, else null (leave it be).
+//
+// A stage span is one carrying a non-empty `kestrel.stage` whose NAME is that
+// stage value, or that value plus the `" (started)"` suffix of its
+// live-visibility twin (#80) — the same suffix the marker↔parent pairing below
+// already keys on. Both spellings must land on the same prose or one stage
+// paints two: a marker never equals its own stage value, which is precisely
+// what an equality-only rule misses (#103).
+//
+// The NAME test alone is the whole rule — necessary AND sufficient.
+// `kestrel.stage` is stamped on EVERY span inside the stage (the
+// `command_execution` / `Bash` tool spans, the `ci` and `self-review` gate
+// checks, `ci (waiting)`), and none of those is named for its stage, so the
+// name test excludes them exactly. Gating on the span KIND on top of it is not
+// merely redundant but wrong: the producer picks the kind per stage (LLM for
+// implement/review, AGENT for coordinate, CHAIN for gate) and that mapping
+// drifts, so a kind gate silently stops recognizing the bars it was written
+// for while the gutter — which has no such gate — keeps reading as prose, and
+// one stage renders under two spellings.
+function stageDisplayName(s) {
+  const stage = getAttr(s.attrs, ATTR_STAGE);
+  if (stage == null || stage === "") return null;
+  const token = String(stage);
+  const raw = String(s.name || "");
+  const base = startedBase(raw);
+  if (base !== token) return null;
+  return stageTitle(token) + raw.slice(base.length); // " (started)" survives
+}
+
+// The name a composed band label builds on: a stage span's prose form, else the
+// span name as the producer emitted it.
+function labelBase(s) {
+  const stage = stageDisplayName(s);
+  return stage != null ? stage : s.name;
 }
 
 // ── Render-model resolution (marker↔parent pairing, turn extents, summaries) ──
@@ -550,7 +604,7 @@ export function annotateRenderModel(spanIter, nowMs) {
     if (!outcome) continue;
     s.rOutcome = outcome;
     s.rOpen = false; // terminal: never a live/provisional band
-    if (s.rLabel == null) s.rLabel = `${s.name} · ${outcome}`;
+    if (s.rLabel == null) s.rLabel = `${labelBase(s)} · ${outcome}`;
   }
 
   // 2e. Idle scheduler heartbeats (#87): a tick that ran and did nothing. The
@@ -563,7 +617,21 @@ export function annotateRenderModel(spanIter, nowMs) {
     if (s.rHide || !isIdleBeat(s)) continue;
     s.rIdle = true;
     s.rOpen = false; // terminal: the tick completed, it just did no work
-    if (s.rLabel == null) s.rLabel = `${s.name} · ${OUTCOME_IDLE}`;
+    if (s.rLabel == null) s.rLabel = `${labelBase(s)} · ${OUTCOME_IDLE}`;
+  }
+
+  // 2f. Talon stage bars and their "(started)" markers read as prose (#104):
+  //     `implement` → `Implement`, `completion-check` → `Completion check`. The
+  //     draw layer paints `rLabel || name`, so the prose form rides on the same
+  //     label channel every other composed band uses — the span's `name` and its
+  //     `kestrel.stage` attribute are left exactly as the producer emitted them.
+  //     Resolved for EVERY stage span, paired-away marker included: whether a
+  //     marker paints depends on whether its twin has landed yet, and the label
+  //     a span carries must not depend on that.
+  for (const s of list) {
+    if (s.rLabel != null) continue;
+    const stage = stageDisplayName(s);
+    if (stage != null) s.rLabel = stage;
   }
 
   // 3. Turn roots: close at the summary child (step 1), else the next turn's
@@ -1071,7 +1139,11 @@ function projectLanes(projectName, projectSpans, agents) {
         agent: g.agent,
         orchestrator: g.orchestrator,
         worker: wk,
-        label: `${g.agent}/${wk}`,
+        // The worker segment IS a stage token (`workerOf`: `kestrel.stage`, else
+        // the `talon/review` agent-name suffix), so it reads as prose (#104);
+        // the agent segment is a name and is never re-cased. Display only — the
+        // lane's `worker` stays the raw value scroll-to-lane matches on.
+        label: `${g.agent}/${stageTitle(wk)}`,
         level: level + 1,
         items: g.workers.get(wk),
       });

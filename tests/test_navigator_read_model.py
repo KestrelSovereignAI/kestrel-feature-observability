@@ -192,8 +192,9 @@ process.stdout.write(
     # normalize under the base agent — never separate Agent-level entries.
     assert talon["agents"] == ["talon"]
     # Subagent level: the split comes from child stage spans, whichever way the
-    # producer stamped it — stage attr only (gate), prefixed name only
-    # (review), or both (implement). A root-only read finds none of these.
+    # producer stamped it — stage attr only (gate), both attr and prefixed name
+    # (implement, review), or prefixed name only (the agent_response event, whose
+    # payload carried no stage). A root-only read finds none of these.
     assert set(talon["workers"]) == {"implement", "review", "gate"}
     # The run root has no stage and no prefixed name → the worker-less bucket.
     assert talon["stagelessCount"] == 1
