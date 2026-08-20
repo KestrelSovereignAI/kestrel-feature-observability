@@ -194,7 +194,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-observability"
-version = "0.17.12"
+version = "0.17.13"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

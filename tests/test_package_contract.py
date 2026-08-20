@@ -20,7 +20,7 @@ import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-RELEASE_VERSION = "0.17.12"
+RELEASE_VERSION = "0.17.13"
 SDK_FLOOR = ">=0.34"
 SDK_SPECIFIER = ">=0.34,<1"
 
