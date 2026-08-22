@@ -38,9 +38,14 @@
 //
 // Pure read-model over Phoenix GraphQL through the same-origin `/phoenix/graphql`
 // proxy — no store, no new host routes. Live mode polls every POLL_MS for spans
-// with `startTime > watermark` per project (the shared span-page query, factored
-// into ./phoenix.js and reused with a `timeRange`); history paging is the same
-// query with a bounded window. Phoenix down → the same friendly notice as the
+// with `startTime >= watermark` per project (the shared span-page query, factored
+// into ./phoenix.js and reused with a `timeRange`) — inclusive, because the
+// millisecond the watermark sits on may still be half-ingested (#109); history
+// paging is the same query with a bounded window. Every paged fetch — live,
+// history gap, reveal window — is a WALK held in one registry keyed by (project,
+// purpose): capped at MAX_POLL_PAGES per pass, resumed on its own cursor and
+// fixed bounds, and counted as covering its range only once it finishes
+// (#109). Phoenix down → the same friendly notice as the
 // Navigator / embed sub-views. Canvas rendering keeps it smooth with thousands
 // of in-window spans.
 
@@ -87,7 +92,13 @@ const MIN_WINDOW_MS = 60 * 1000; // 1 min (max zoom-in)
 const MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 h (max zoom-out)
 const PAGE_SIZE = 500; // spans per GraphQL page
 const MAX_POLL_PAGES = 6; // per-project drain cap per tick (backlog catch-up)
+const MAX_HISTORY_ROUNDS = 4; // bounded walks per history pass (viewport moved mid-fetch)
 const SPAN_CAP = 60_000; // memory guard — prune oldest beyond this
+// Why a project can have a walk in flight — the second half of a walk's identity
+// in the registry, so the three fetch paths resume independently of each other.
+const WALK_LIVE = "live"; // watermark-forward drain (the poll)
+const WALK_HISTORY = "history"; // bounded gap left of what's loaded (a pan)
+const WALK_REVEAL = "reveal"; // bounded window around a cross-view reveal target
 const WHEEL_ZOOM_STEP = 1.15; // one modifier-scroll notch (out; 1/step zooms in)
 const LIVE_SNAP_PX = 8; // pan within this many px of `now` → snap + re-engage Live
 
@@ -1220,6 +1231,49 @@ export function magneticViewEnd(candidateViewEnd, nowMs, snapMs) {
   return { viewEnd: candidateViewEnd, live: false };
 }
 
+// ── Live poll walk boundary (#109) ──
+//
+// Where a project's next live walk starts. Two rules, both learned the hard way:
+//
+//   - RESUME BEATS RECOMPUTE. A walk is bounded by `MAX_POLL_PAGES`, so a deep
+//     backlog does not drain in one tick. An unfinished walk keeps the exact
+//     bounds it started with and the cursor it stopped on; recomputing a start
+//     for it would restart the walk at a boundary that moved while its own range
+//     is still un-ingested.
+//   - THE BOUNDARY IS INCLUSIVE. A fresh walk starts AT the watermark, never one
+//     millisecond past it: `+1` skips every span sharing the watermark's
+//     millisecond, and ties are routine (a burst flush emits several summaries in
+//     the same instant). If a truncated walk stopped mid-millisecond, that `+1`
+//     dropped the rest of that millisecond permanently — a parent and child
+//     emitted together could be split across the page bound with the parent gone
+//     for good. Re-pulling the boundary millisecond is idempotent: `mergeSpans`
+//     keys on span id.
+//
+// Pure + exported so the boundary rules are unit-testable without a mount.
+export function pollWalkBounds({
+  pending = null,
+  watermark = null,
+  openFloor = null,
+  viewStart = null,
+} = {}) {
+  if (pending) {
+    return {
+      startMs: pending.startMs,
+      endMs: pending.endMs != null ? pending.endMs : null,
+      after: pending.after || null,
+      resumed: true,
+    };
+  }
+  if (watermark == null) return { startMs: viewStart, endMs: null, after: null, resumed: false };
+  let startMs = watermark;
+  // Back the cursor down to this project's earliest still-open span so the poll
+  // re-fetches BACKDATED closes/summaries/twins (their start ≤ that open
+  // anchor's start, ≤ the watermark) that a forward-only walk skips — else live
+  // turns stay open and markers unpaired until reload (#62 P1).
+  if (openFloor != null && openFloor < startMs) startMs = openFloor;
+  return { startMs, endMs: null, after: null, resumed: false };
+}
+
 // ── View / mount ──────────────────────────────────────────────
 
 export function mount(container, opts = {}) {
@@ -1257,10 +1311,21 @@ export function mount(container, opts = {}) {
   const spanIdToId = new Map(); // OTel context.spanId → Phoenix node id
   const childrenByParent = new Map(); // parent OTel spanId → Set<Phoenix node id>
   const projects = []; // [{id, name}] — DEFAULT_PROJECT first
-  const watermarks = new Map(); // projectId → newest startTime ms fetched (live)
-  const historyFloor = new Map(); // projectId → oldest startTime ms fetched
+  // COVERAGE, not progress: a range is recorded here only once the walk over it
+  // ran out of pages (`hasNextPage: false`). A walk still in flight has ingested
+  // spans without covering its range, and `historyFloor` in particular is what
+  // later decides a range is already loaded (#109).
+  const watermarks = new Map(); // projectId → newest startTime ms COVERED (live)
+  const historyFloor = new Map(); // projectId → oldest startTime ms COVERED
   const openFloors = new Map(); // projectId → earliest still-open span start (live re-fetch floor, #62 P1)
   const projectFetching = new Set(); // projectId → history fetch in flight
+  // THE registry of unfinished paged walks — one map, keyed by (project,
+  // purpose), held across ticks AND across errors so the next pass resumes on
+  // the cursor + bounds it stopped on instead of restarting from a recomputed
+  // boundary (#109). Every walk site goes through it: a site that keeps its own
+  // state map is a site whose truncated walk is never resumed by anything.
+  const walks = new Map(); // `${purpose} ${projectId}` → pending walk
+  let revealPending = Boolean(revealTarget); // reveal owes a real outcome
 
   // ── Layout cache (rebuilt on data / collapse change, projected each frame) ──
   const collapsed = new Set(); // collapsed project names
@@ -1405,6 +1470,11 @@ export function mount(container, opts = {}) {
     }
   }
 
+  // Ingest one page. Merging is idempotent — a span already held is replaced in
+  // place and not counted as `added` — so re-pulling an overlapping range (the
+  // boundary millisecond of a live walk, a resumed page) costs nothing but the
+  // request. Coverage is NOT recorded here: a page says what was ingested, only
+  // a finished walk says what range is covered (see `commitWalkCoverage`, #109).
   function mergeSpans(rawSpans, projectId, projectName) {
     let added = 0;
     let newestStart = null;
@@ -1421,16 +1491,8 @@ export function mount(container, opts = {}) {
       spans.set(s.id, s);
       indexSpan(s);
     }
-    if (newestStart != null) {
-      const prev = watermarks.get(projectId);
-      if (prev == null || newestStart > prev) watermarks.set(projectId, newestStart);
-    }
-    if (oldestStart != null) {
-      const prev = historyFloor.get(projectId);
-      if (prev == null || oldestStart < prev) historyFloor.set(projectId, oldestStart);
-    }
     if (spans.size > SPAN_CAP) pruneSpans();
-    return added;
+    return { added, newestStart, oldestStart };
   }
 
   // Memory guard: when we blow past the cap, drop the oldest-ending spans.
@@ -1482,6 +1544,85 @@ export function mount(container, opts = {}) {
     return { raw, hasNext: Boolean(pageInfo.hasNextPage), cursor: pageInfo.endCursor || null };
   }
 
+  // ── Resumable paged walks (#109) ──
+
+  // A walk over a FIXED range: its bounds never move once it starts, so its
+  // cursor stays meaningful across ticks and across a failed page.
+  function newWalk({ startMs = null, endMs = null, after = null } = {}) {
+    return { startMs, endMs, after, newestStart: null, oldestStart: null };
+  }
+
+  // A walk is identified by the project it pages and WHY it is paging it, so the
+  // live drain, a history gap and a reveal window can each be owed at once on the
+  // same project without overwriting one another's cursor.
+  const walkKey = (purpose, projectId) => `${purpose} ${projectId}`;
+  const pendingWalk = (purpose, projectId) => walks.get(walkKey(purpose, projectId)) || null;
+  const dropWalk = (purpose, projectId) => walks.delete(walkKey(purpose, projectId));
+  function walkOwed(purpose) {
+    for (const key of walks.keys()) {
+      if (key.startsWith(`${purpose} `)) return true;
+    }
+    return false;
+  }
+
+  // A finished walk (and only a finished walk) is what makes its range covered.
+  function commitWalkCoverage(projectId, walk) {
+    if (walk.newestStart != null) {
+      const prev = watermarks.get(projectId);
+      if (prev == null || walk.newestStart > prev) watermarks.set(projectId, walk.newestStart);
+    }
+    if (walk.oldestStart != null) {
+      const prev = historyFloor.get(projectId);
+      if (prev == null || walk.oldestStart < prev) historyFloor.set(projectId, walk.oldestStart);
+    }
+  }
+
+  // Drain up to MAX_POLL_PAGES of `walk`, merging each page.
+  //
+  // The walk is registered under (project, purpose) up front and its cursor
+  // advanced after every SUCCESSFUL page, so a throw mid-walk leaves it exactly
+  // where the last good page ended — the next pass resumes rather than restarts.
+  // It leaves the registry only when Phoenix reports `hasNextPage: false`, which
+  // is also the only moment its range becomes covered; a walk stopped by the page
+  // cap (or by `stopEarly`) keeps its range explicitly incomplete.
+  async function drainWalk(walk, projectId, projectName, purpose, stopEarly) {
+    walks.set(walkKey(purpose, projectId), walk);
+    let added = 0;
+    let done = false;
+    for (let page = 0; page < MAX_POLL_PAGES; page++) {
+      const { raw, hasNext, cursor } = await fetchSpanPage(projectId, {
+        startMs: walk.startMs,
+        endMs: walk.endMs,
+        after: walk.after,
+      });
+      const merged = mergeSpans(raw, projectId, projectName);
+      added += merged.added;
+      if (
+        merged.newestStart != null &&
+        (walk.newestStart == null || merged.newestStart > walk.newestStart)
+      ) {
+        walk.newestStart = merged.newestStart;
+      }
+      if (
+        merged.oldestStart != null &&
+        (walk.oldestStart == null || merged.oldestStart < walk.oldestStart)
+      ) {
+        walk.oldestStart = merged.oldestStart;
+      }
+      if (!hasNext || !cursor) {
+        done = true;
+        break;
+      }
+      walk.after = cursor;
+      if (stopEarly && stopEarly(raw)) break;
+    }
+    if (done) {
+      dropWalk(purpose, projectId);
+      commitWalkCoverage(projectId, walk);
+    }
+    return { added, done };
+  }
+
   function revealProject() {
     if (!revealTarget) return null;
     return (
@@ -1493,32 +1634,61 @@ export function mount(container, opts = {}) {
     );
   }
 
+  // The reveal target, if it has been ingested — the same lookup `finishReveal`
+  // reports on, so "keep paging" and "what the notice says" can never disagree.
+  function revealHit() {
+    if (!revealTarget) return null;
+    if (revealTarget.spanId != null) {
+      const nodeId = spanIdToId.get(String(revealTarget.spanId));
+      return nodeId != null ? spans.get(nodeId) || null : null;
+    }
+    if (revealTarget.nodeId != null) return spans.get(String(revealTarget.nodeId)) || null;
+    return null;
+  }
+
   // A Navigator round-trip may target history far outside the normal live
   // window. Load a bounded, timestamp-centered slice from the exact project
   // instead of walking every span from that time through "now".
+  //
+  // It stops the moment the exact span lands, which — like the page cap — leaves
+  // the rest of the window un-ingested, so this walk covers nothing unless it
+  // genuinely runs out of pages; the live poll re-walks whatever it skipped.
+  //
+  // A target past the page cap does NOT settle the reveal: the walk is persisted
+  // like any other and resumed by the poll timer until the span lands or the
+  // window is genuinely drained, because a reveal opens the view PAUSED and
+  // nothing else would ever finish it. Reporting "could not be loaded" off the
+  // first truncated pass is a lie about a span that is right there on page 7
+  // (#109).
   async function loadRevealWindow() {
+    if (!revealPending) return;
     const project = revealProject();
-    if (!project) return;
-    let after = null;
-    for (let page = 0; page < MAX_POLL_PAGES; page++) {
-      const { raw, hasNext, cursor } = await fetchSpanPage(project.id, {
-        startMs: viewStart(),
-        endMs: viewEnd,
-        after,
-      });
-      mergeSpans(raw, project.id, project.name);
-      const exactLoaded = raw.some((span) => {
-        if (revealTarget.spanId != null) {
-          return (
-            String((span.context && span.context.spanId) || "") ===
-            String(revealTarget.spanId)
-          );
-        }
-        return revealTarget.nodeId != null && String(span.id) === String(revealTarget.nodeId);
-      });
-      if (exactLoaded || !hasNext || !cursor) break;
-      after = cursor;
+    if (!project) {
+      revealPending = false; // no such project — an outcome, just not a happy one
+      return;
     }
+    const walk =
+      pendingWalk(WALK_REVEAL, project.id) || newWalk({ startMs: viewStart(), endMs: viewEnd });
+    const { done } = await drainWalk(walk, project.id, project.name, WALK_REVEAL, () => {
+      return revealHit() != null;
+    });
+    // Settled either way it can be: the span landed, or the window is drained
+    // and it genuinely is not there. A walk stopped short of both is still owed.
+    if (revealHit() != null || done) {
+      revealPending = false;
+      dropWalk(WALK_REVEAL, project.id);
+    }
+  }
+
+  // Resume the reveal walk from the poll timer and settle the view the moment it
+  // reaches an outcome: the layout has to be built before `finishReveal` (it
+  // reads `rHide` and the lane rows), and rebuilt after (it may un-collapse a
+  // project and re-anchor the window) — which the caller's own repaint does.
+  async function continueReveal() {
+    await loadRevealWindow();
+    if (destroyed || revealPending) return;
+    buildLayout();
+    finishReveal();
   }
 
   function showRevealNotice(message, isFallback) {
@@ -1530,13 +1700,7 @@ export function mount(container, opts = {}) {
 
   function finishReveal() {
     if (!revealTarget) return;
-    let hit = null;
-    if (revealTarget.spanId != null) {
-      const nodeId = spanIdToId.get(String(revealTarget.spanId));
-      if (nodeId != null) hit = spans.get(nodeId) || null;
-    } else if (revealTarget.nodeId != null) {
-      hit = spans.get(String(revealTarget.nodeId)) || null;
-    }
+    const hit = revealHit();
     if (!hit) {
       highlightedSpanId = null;
       showRevealNotice(
@@ -1577,40 +1741,44 @@ export function mount(container, opts = {}) {
     showRevealNotice(`Exact span ${hit.spanId || hit.id} highlighted.`, false);
   }
 
-  // Live/initial poll: pull everything since the project's watermark (or the
-  // visible window's start on the first pass), draining backlog up to a cap.
+  // Live/initial poll: pull everything since the project's covered watermark (or
+  // the visible window's start on the first pass), draining backlog up to a cap.
+  // A backlog deeper than that cap continues on the next tick from this walk's
+  // own cursor — never from a recomputed boundary (#109).
   async function pollProject(projectId, projectName) {
-    let startMs = watermarks.get(projectId);
-    if (startMs == null) startMs = viewStart();
-    else {
-      startMs += 1; // startTime > watermark (right-open), avoid re-pulling it
-      // Back the cursor down to this project's earliest still-open span so the
-      // poll re-fetches BACKDATED closes/summaries/twins (their start ≤ that
-      // open anchor's start, ≤ the watermark) that a forward-only walk skips —
-      // else live turns stay open and markers unpaired until reload (#62 P1).
-      // Re-merges are idempotent; only genuinely new closes count as `added`.
-      const floor = openFloors.get(projectId);
-      if (floor != null && floor < startMs) startMs = floor;
-    }
-    let after = null;
-    let added = 0;
-    for (let page = 0; page < MAX_POLL_PAGES; page++) {
-      const { raw, hasNext, cursor } = await fetchSpanPage(projectId, { startMs, after });
-      added += mergeSpans(raw, projectId, projectName);
-      if (!hasNext || !cursor) break;
-      after = cursor;
-    }
+    const pending = pendingWalk(WALK_LIVE, projectId);
+    const bounds = pollWalkBounds({
+      pending,
+      watermark: watermarks.get(projectId),
+      openFloor: openFloors.get(projectId),
+      viewStart: viewStart(),
+    });
+    const walk = bounds.resumed ? pending : newWalk(bounds);
+    const { added } = await drainWalk(walk, projectId, projectName, WALK_LIVE);
     return added;
   }
 
   let polling = false;
   async function pollTick(manual) {
-    if (destroyed || polling || (!manual && !live) || (!manual && document.hidden)) return;
+    if (destroyed || polling || (!manual && document.hidden)) return;
+    if (historyPassOwed()) loadHistory();
+    // Paused, the timer starts no NEW live walk — but one already truncated
+    // mid-backlog (a boot-time fill deeper than MAX_POLL_PAGES, a pause that
+    // landed mid-drain) still owes the range it claimed no coverage for, and
+    // only its own cursor can finish it. Those resume; nothing else does. So
+    // does an unsettled reveal, which is paused BY DEFINITION (#109).
+    const resumeOnly = !manual && !live;
+    if (resumeOnly && !revealPending && !walkOwed(WALK_LIVE)) return;
     polling = true;
     let added = 0;
     try {
+      if (revealPending) await continueReveal();
       for (const p of projects) {
-        if (destroyed || (!manual && !live)) break;
+        if (destroyed) break;
+        // Re-read `live` per project rather than once per tick: a pause landing
+        // mid-tick stops fresh walks from here on, while a pending walk keeps
+        // draining.
+        if (!manual && !live && !pendingWalk(WALK_LIVE, p.id)) continue;
         added += await pollProject(p.id, p.name);
       }
     } catch (_e) {
@@ -1632,40 +1800,84 @@ export function mount(container, opts = {}) {
     }
   }
 
+  // Does a FINISHED walk already reach back to what the view is showing? Only a
+  // finished walk gets to make that claim, so a project still owing a truncated
+  // gap is never "covered" (#109).
+  function historyCovered(projectId) {
+    if (pendingWalk(WALK_HISTORY, projectId)) return false;
+    const floor = historyFloor.get(projectId);
+    return floor != null && floor <= viewStart();
+  }
+
+  // Should the poll timer run a history pass? Yes while any gap walk is still
+  // owed — truncated by the page cap or dropped by a failed page, either way it
+  // has claimed no coverage and only its own cursor can finish it.
+  //
+  // And yes for a PAUSED view whose left edge a FINISHED walk stopped short of:
+  // that is the gap a pan opened while another walk held the project (its bounds
+  // were already fixed, so the `projectFetching` guard dropped that call), and a
+  // paused `viewStart` never drifts off it the way a live one does — without
+  // this it would wait for the operator's next gesture (#109). A project with no
+  // committed floor is NOT owed here: no walk has finished for it yet, so the
+  // live/initial walk still owns that range and is being drained above.
+  function historyPassOwed() {
+    if (walkOwed(WALK_HISTORY)) return true;
+    if (live) return false;
+    const target = viewStart();
+    return projects.some((p) => {
+      const floor = historyFloor.get(p.id);
+      return floor != null && floor > target;
+    });
+  }
+
   // History paging: when the user pans left of what we've loaded, pull the gap
   // [viewStart, floor) for each project. Lazy + guarded against re-entrancy.
+  //
+  // A gap deeper than MAX_POLL_PAGES is finished across several passes: the
+  // unfinished walk keeps the gap it was opened for and resumes on its cursor,
+  // and the gap only counts as covered once that walk runs out of pages (#109).
+  //
+  // Each project is drained in bounded ROUNDS, and every round re-derives the
+  // gap from the CURRENT `viewStart`. A walk's bounds are fixed once it starts —
+  // that is what keeps its cursor meaningful — so it cannot widen to swallow a
+  // pan that lands mid-flight, and such a pan is dropped by the `projectFetching`
+  // guard. Re-deriving here is what asks for the newly exposed range instead of
+  // leaving it for the operator's next gesture (#109). Rounds are capped so one
+  // pass can't chase a continuous drag indefinitely; whatever is still uncovered
+  // is picked up by the poll timer, which re-checks a paused view every tick.
   async function loadHistory() {
-    const target = viewStart();
     for (const p of projects) {
       if (destroyed) break;
-      const floor = historyFloor.get(p.id);
-      if (floor != null && floor <= target) continue; // already covered
-      if (projectFetching.has(p.id)) continue;
+      if (historyCovered(p.id)) continue;
+      if (projectFetching.has(p.id)) continue; // in flight — that walk re-checks
       projectFetching.add(p.id);
       try {
-        let after = null;
-        let added = 0;
-        const endMs = floor != null ? floor : viewEnd;
-        for (let page = 0; page < MAX_POLL_PAGES; page++) {
-          const { raw, hasNext, cursor } = await fetchSpanPage(p.id, {
-            startMs: target,
-            endMs,
-            after,
-          });
-          added += mergeSpans(raw, p.id, p.name);
-          if (!hasNext || !cursor) break;
-          after = cursor;
-        }
-        // Mark the requested floor as covered even if the page was empty, so we
-        // don't refetch the same empty gap every frame while panned back.
-        const prev = historyFloor.get(p.id);
-        if (prev == null || target < prev) historyFloor.set(p.id, target);
-        if (added) {
-          buildLayout();
-          requestDraw();
+        for (let round = 0; round < MAX_HISTORY_ROUNDS; round++) {
+          if (destroyed || historyCovered(p.id)) break;
+          const target = viewStart();
+          const pending = pendingWalk(WALK_HISTORY, p.id);
+          const floor = historyFloor.get(p.id);
+          const walk =
+            pending || newWalk({ startMs: target, endMs: floor != null ? floor : viewEnd });
+          const { added, done } = await drainWalk(walk, p.id, p.name, WALK_HISTORY);
+          // Mark the requested floor as covered even if the page was empty, so we
+          // don't refetch the same empty gap every frame while panned back — but
+          // only for a gap whose walk actually finished.
+          if (done) {
+            const prev = historyFloor.get(p.id);
+            if (prev == null || walk.startMs < prev) historyFloor.set(p.id, walk.startMs);
+          }
+          if (added) {
+            buildLayout();
+            requestDraw();
+          }
+          // Truncated: this walk owns the rest of its gap and resumes on its own
+          // cursor from the next tick — starting another one here would fetch a
+          // range it has already claimed.
+          if (!done) break;
         }
       } catch (_e) {
-        /* non-fatal */
+        /* non-fatal — the walk keeps its cursor and the next tick resumes it */
       } finally {
         projectFetching.delete(p.id);
       }
@@ -2943,14 +3155,21 @@ export function mount(container, opts = {}) {
       return;
     }
     if (destroyed) return;
-    if (revealTarget) {
-      await loadRevealWindow();
-    } else {
-      await pollTick(true); // initial fill of the visible window
+    try {
+      if (revealTarget) {
+        await loadRevealWindow();
+      } else {
+        await pollTick(true); // initial fill of the visible window
+      }
+    } catch (_e) {
+      // A failed initial page must not cost us the poll timer — that timer is
+      // what resumes the walk, which kept its cursor across the throw (#109).
     }
     if (destroyed) return;
     buildLayout();
-    if (revealTarget) finishReveal();
+    // Only a SETTLED reveal gets to report — a walk the page cap cut short is
+    // still owed, and the poll timer below finishes it and reports then (#109).
+    if (revealTarget && !revealPending) finishReveal();
     pollTimer = setInterval(() => pollTick(false), POLL_MS);
     booted = true;
     // `live` is `!revealTarget` unless setState() restored a paused window
