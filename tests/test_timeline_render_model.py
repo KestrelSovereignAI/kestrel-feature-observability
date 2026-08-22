@@ -2712,6 +2712,127 @@ process.stdout.write(JSON.stringify({
     assert result["idle"] == 6
 
 
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_reveal_walk_past_the_page_cap_resumes_instead_of_reporting_missing(tmp_path):
+    """A reveal target on page MAX_POLL_PAGES + 1 is found, not written off.
+
+    A reveal opens the view PAUSED around its target, so nothing but the reveal
+    walk itself will ever look for that span. Truncated by the page cap and
+    dropped, the view reports a span that is right there on the next page as
+    "could not be loaded" — permanently, since no pan, tick or Live toggle
+    resumes a walk whose cursor was thrown away.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-reveal-resume.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+// A reveal centers a MIN_WINDOW_MS (60s) window on its target, so the whole
+// backlog has to sit inside that one minute, ahead of the target.
+const TARGET = T0 - 40 * MIN;
+const AHEAD = 3000; // exactly MAX_POLL_PAGES pages of 500 before the target
+const spans = [];
+for (let i = 0; i < AHEAD; i++) {
+  spans.push(rawSpan({
+    id: `ahead-${String(i).padStart(5, "0")}`, name: `ahead ${i}`,
+    start: TARGET - 29_500 + i * 9, dur: 5,
+    agent: "revealbulk", spanId: `as-${i}`, projectId: PROJECT.id,
+  }));
+}
+// Sorts last of the window — page MAX_POLL_PAGES + 1, all on its own.
+spans.push(rawSpan({
+  id: "zz-target", name: "the revealed tool", start: TARGET, dur: 8 * 1000,
+  agent: "revealtarget", spanId: "wanted", projectId: PROJECT.id,
+}));
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+
+const highlights = (canvas) =>
+  (canvas.context.frames || []).filter((frame) =>
+    frame.operations.some((op) => op.type === "strokeRect" && op.strokeStyle === "#facc15"),
+  ).length;
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, {
+  openTrace() {}, openNavigator() {},
+  revealTarget: {
+    projectId: PROJECT.id,
+    projectName: PROJECT.name,
+    spanId: "wanted",
+    startTime: TARGET,
+  },
+});
+const canvas = container.querySelector("[data-canvas]");
+const notice = container.querySelector("[data-reveal-notice]");
+
+await settle(phoenix.calls);
+const boot = {
+  calls: phoenix.calls.length,
+  live: mounted.getState().live,
+  target: phoenix.served.includes("zz-target"),
+  // Nothing is claimed either way while the walk is still owed: no "highlighted",
+  // and — the actual bug — no "could not be loaded" about a span on the next page.
+  notice: notice.textContent,
+  fallback: notice.classList.values.has("obs-tl__reveal--fallback"),
+  highlightFrames: highlights(canvas),
+};
+
+tick(); // the poll timer, paused: the reveal walk is owed, so it resumes
+await settle(phoenix.calls);
+const afterTick = {
+  calls: phoenix.calls.length,
+  target: phoenix.served.includes("zz-target"),
+  notice: notice.textContent,
+  fallback: notice.classList.values.has("obs-tl__reveal--fallback"),
+  highlightFrames: highlights(canvas),
+};
+
+const painted = paintedText(canvas);
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  boot,
+  afterTick,
+  windowStart: new Date(TARGET - 30 * 1000).toISOString(),
+  windowEnd: new Date(TARGET + 30 * 1000).toISOString(),
+  paintedTarget: painted.includes("the revealed tool"),
+}));
+""",
+    )
+
+    calls = result["calls"]
+    # The reveal walk is bounded to its centered window and cut off by the cap.
+    assert result["boot"]["live"] is False
+    assert result["boot"]["calls"] == MAX_POLL_PAGES
+    assert calls[0]["start"] == result["windowStart"]
+    assert calls[0]["end"] == result["windowEnd"]
+    assert all(c["end"] == calls[0]["end"] for c in calls[:MAX_POLL_PAGES])
+    assert calls[MAX_POLL_PAGES - 1]["hasNext"] is True
+    assert result["boot"]["target"] is False
+
+    # An owed reveal reports NOTHING yet — the old behaviour called the span
+    # missing here, on evidence it had not finished gathering.
+    assert result["boot"]["notice"] == ""
+    assert result["boot"]["fallback"] is False
+    assert result["boot"]["highlightFrames"] == 0
+
+    # The timer resumes it on its persisted cursor and the bounds it started
+    # with, finds the target on the very next page, and only THEN reports.
+    assert result["afterTick"]["calls"] == MAX_POLL_PAGES + 1
+    resumed = calls[MAX_POLL_PAGES]
+    assert resumed["after"] == calls[MAX_POLL_PAGES - 1]["endCursor"]
+    assert resumed["start"] == result["windowStart"]
+    assert resumed["end"] == result["windowEnd"]
+    assert resumed["hasNext"] is False
+    assert result["afterTick"]["target"] is True
+    assert result["afterTick"]["notice"] == "Exact span wanted highlighted."
+    assert result["afterTick"]["fallback"] is False
+    # And the late page repaints: the highlight is on screen and the span drawn.
+    assert result["afterTick"]["highlightFrames"] > 0
+    assert result["paintedTarget"] is True
+
+
 _WALK_BOUNDS_HARNESS = r"""
 import { pollWalkBounds } from "./timeline.js";
 
