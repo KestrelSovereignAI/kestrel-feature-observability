@@ -16,6 +16,11 @@ The Timeline's raw geometry can't paint three producer span shapes directly:
 run under node here over span records shaped like ``normalize()``'s output (the
 real producer contract in ``hook.py`` / ``kestrel_obs_claude_hook.py`` / talon via
 ``tracing.py``), asserting the shipped resolution — not a source-string proxy.
+
+The tail of the module covers what feeds that model: the paged POLL WALK (#109),
+mounted for real against a Phoenix double whose time-range and cursor semantics
+are the server's, so a walk that gets truncated has to resume where it stopped
+instead of quietly writing off the spans it never pulled.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ import subprocess
 
 import pytest
 
+from test_span_navigation_contract import _write_fake_dom
+
 STATIC = (
     pathlib.Path(__file__).resolve().parent.parent
     / "kestrel_feature_observability"
@@ -35,6 +42,11 @@ STATIC = (
 )
 
 NODE = shutil.which("node")
+
+# timeline.js tuning the poll-walk tests are written against.
+PAGE_SIZE = 500
+MAX_POLL_PAGES = 6
+MAX_HISTORY_ROUNDS = 4
 
 
 def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -58,6 +70,191 @@ def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
         (STATIC / "timeline.js").read_text(encoding="utf-8"), encoding="utf-8"
     )
     return pkg
+
+
+_FAKE_PHOENIX = r"""
+// A Phoenix span-page double with REAL paging semantics (#109).
+//
+// The bug class this exists to catch is invisible to a lenient double, so this
+// one refuses to fabricate anything the shipped server would not give:
+//
+//   - `timeRange` really filters: [start, end) over startTime, start INCLUSIVE
+//     (which is what makes a boundary-millisecond tie observable at all).
+//   - results are ascending by (startTime, id) and `first` really bounds a page.
+//   - a cursor is an opaque handle into ONE query's result set. `after: null`
+//     means "from the top" — it NEVER auto-advances (a previous harness did,
+//     which fabricated continuation the client does not have and hid this whole
+//     class of bug) — and a cursor replayed under different bounds is an error,
+//     not a silently-reinterpreted offset.
+//   - `holdCalls` parks a page in flight until `release()`, so a scenario can
+//     interact with the view (pan, tick) DURING a walk — the real server is slow
+//     and the client's own guards key on "a fetch is in flight".
+export function installFakePhoenix({ projects, spans = [], failCalls = [], holdCalls = [] }) {
+  const store = [...spans];
+  const calls = [];
+  const served = [];
+  const failures = new Set(failCalls);
+  const holds = new Set(holdCalls);
+  const gates = new Map(); // call index → resolve fn of the parked page
+  const order = (a, b) =>
+    Date.parse(a.startTime) - Date.parse(b.startTime) || String(a.id).localeCompare(String(b.id));
+  const boundsKey = (projectId, timeRange) =>
+    JSON.stringify([
+      projectId,
+      (timeRange && timeRange.start) || null,
+      (timeRange && timeRange.end) || null,
+    ]);
+  const ok = (data) => ({ status: 200, ok: true, json: async () => ({ data }) });
+
+  globalThis.fetch = async (_url, options) => {
+    const { query, variables = {} } = JSON.parse(options.body);
+    if (query.includes("NavigatorProjects")) {
+      return ok({ projects: { edges: projects.map((node) => ({ node })) } });
+    }
+    if (!query.includes("NavigatorSpanPage")) throw new Error("unexpected GraphQL operation");
+    const { projectId, first, after = null, timeRange = null } = variables;
+    const call = { projectId, first, after, timeRange, endCursor: null, hasNext: null };
+    calls.push(call);
+    const index = calls.length - 1;
+    if (failures.has(index)) throw new Error(`phoenix page ${index} failed`);
+    if (holds.has(index)) {
+      await new Promise((resolve) => gates.set(index, resolve));
+    }
+
+    const key = boundsKey(projectId, timeRange);
+    const startMs = timeRange && timeRange.start != null ? Date.parse(timeRange.start) : null;
+    const endMs = timeRange && timeRange.end != null ? Date.parse(timeRange.end) : null;
+    const pool = store
+      .filter((s) => {
+        if (s.projectId !== projectId) return false;
+        const t = Date.parse(s.startTime);
+        if (startMs != null && t < startMs) return false; // start is INCLUSIVE
+        if (endMs != null && t >= endMs) return false;
+        return true;
+      })
+      .sort(order);
+
+    let offset = 0;
+    if (after != null) {
+      const parsed = JSON.parse(globalThis.atob(after));
+      if (parsed.key !== key) {
+        throw new Error(`cursor replayed under different bounds: ${parsed.key} vs ${key}`);
+      }
+      offset = parsed.offset + 1;
+    }
+    const page = pool.slice(offset, offset + first);
+    for (const s of page) served.push(s.id);
+    call.hasNext = offset + page.length < pool.length;
+    call.endCursor = page.length
+      ? globalThis.btoa(JSON.stringify({ key, offset: offset + page.length - 1 }))
+      : null;
+    return ok({
+      node: {
+        spans: {
+          pageInfo: { hasNextPage: call.hasNext, endCursor: call.endCursor },
+          edges: page.map((node) => ({ node })),
+        },
+      },
+    });
+  };
+
+  return {
+    calls,
+    served,
+    add: (...more) => store.push(...more),
+    held: () => [...gates.keys()],
+    release(index) {
+      const open = gates.get(index);
+      if (!open) throw new Error(`call ${index} is not held`);
+      gates.delete(index);
+      open();
+    },
+  };
+}
+
+// A raw Phoenix span node as the client's normalize() reads it, plus the
+// `projectId` this double routes on (the real node is reached THROUGH a project,
+// so the field is harness bookkeeping the client never looks at).
+export function rawSpan({
+  id,
+  name,
+  start,
+  dur = 40,
+  agent,
+  spanId,
+  parentId = null,
+  kind = "TOOL",
+  projectId,
+}) {
+  return {
+    id,
+    name,
+    spanKind: kind.toLowerCase(),
+    startTime: new Date(start).toISOString(),
+    endTime: new Date(start + dur).toISOString(),
+    latencyMs: dur,
+    statusCode: "OK",
+    parentId,
+    attributes: JSON.stringify({
+      openinference: { span: { kind } },
+      kestrel: { agent_name: agent },
+    }),
+    context: { spanId, traceId: "trace-1" },
+    projectId,
+  };
+}
+
+// Let every in-flight walk finish: wait until fetch activity goes quiet.
+export async function settle(calls) {
+  let last = -1;
+  let quiet = 0;
+  for (let i = 0; i < 600; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    if (calls.length === last) {
+      quiet += 1;
+      if (quiet >= 8) return;
+    } else {
+      quiet = 0;
+      last = calls.length;
+    }
+  }
+  throw new Error("fetch activity never settled");
+}
+
+// Every string the canvas painted — lane gutter labels and span bar labels — so
+// "was it ingested" is answered by what the view actually renders.
+export function paintedText(canvas) {
+  const frames = (canvas.context && canvas.context.frames) || [];
+  const out = [];
+  for (const frame of frames) {
+    for (const op of frame.operations) {
+      if (op.type === "fillText") out.push(String(op.args[0]));
+    }
+  }
+  return out;
+}
+"""
+
+
+def _poll_pkg(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Module dir for the mounted poll-walk tests: shipped JS + DOM/Phoenix doubles."""
+    pkg = _module_dir(tmp_path)
+    _write_fake_dom(pkg)
+    (pkg / "fake-phoenix.mjs").write_text(_FAKE_PHOENIX, encoding="utf-8")
+    return pkg
+
+
+def _run_scenario(pkg: pathlib.Path, name: str, source: str) -> dict:
+    (pkg / name).write_text(source, encoding="utf-8")
+    proc = subprocess.run(
+        [NODE, str(pkg / name)],
+        cwd=str(pkg),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    return json.loads(proc.stdout)
 
 
 _HARNESS = r"""
@@ -1783,3 +1980,780 @@ def test_stage_labels_over_real_talon_fixture(tmp_path):
         {"label": "talon/Implement", "level": 2, "worker": "implement"},
         {"label": "talon/Review", "level": 2, "worker": "review"},
     ]
+
+
+# ── Poll-walk resumption + coverage honesty (#109) ─────────────────────────
+#
+# A poll walk is capped at MAX_POLL_PAGES pages, so a backlog deeper than that
+# does not drain in one tick. It used to be restarted every tick from a
+# recomputed `startMs` — cursor thrown away, boundary advanced by +1 ms, and
+# `watermarks`/`historyFloor` already claiming coverage the walk never ingested.
+# The scenarios below mount the real view against a Phoenix double with real
+# time-range and cursor semantics and hold the walk to its contract: resume, and
+# claim only what you finished.
+
+_TIMELINE_PRELUDE = r"""
+import { FakeElement, installFakeDom } from "./fake-dom.mjs";
+import { installFakePhoenix, rawSpan, settle, paintedText } from "./fake-phoenix.mjs";
+
+installFakeDom();
+const MIN = 60 * 1000;
+const T0 = Date.now();
+const PROJECT = { id: "p1", name: "kestrel-fleet", traceCount: 1, endTime: new Date(T0).toISOString() };
+
+// Claim the poll timer. The mount registers `() => pollTick(false)` on
+// setInterval; these scenarios drive it by hand (`tick()`) so a tick is an
+// explicit event with an exact call count, not an ambient 5s alarm that may or
+// may not fire mid-scenario. A `tick()` is deliberately NOT a `[data-refresh]`
+// click: the click polls with `manual: true`, which is precisely the flag a
+// paused view's timer does not have.
+let pollTimerFn = null;
+globalThis.setInterval = (fn) => {
+  pollTimerFn = fn;
+  return 1;
+};
+globalThis.clearInterval = () => {
+  pollTimerFn = null;
+};
+function tick() {
+  if (!pollTimerFn) throw new Error("no poll timer registered");
+  pollTimerFn();
+}
+
+// One long run root with a deep backlog of tool children beneath it, laid end to
+// end so the lane packs into a couple of tracks.
+function backlog({ agent, base, step, count, tailAgent = null, rootName = "backlog run" }) {
+  const out = [
+    rawSpan({
+      id: "run-root",
+      name: rootName,
+      start: base - 1000,
+      dur: 24 * MIN,
+      agent,
+      spanId: "run",
+      kind: "AGENT",
+      projectId: PROJECT.id,
+    }),
+  ];
+  for (let i = 0; i < count; i++) {
+    const last = i === count - 1;
+    out.push(
+      rawSpan({
+        id: `tool-${String(i).padStart(5, "0")}`,
+        name: `tool ${i}`,
+        start: base + i * step,
+        agent: last && tailAgent ? tailAgent : agent,
+        spanId: `ts-${i}`,
+        parentId: last && tailAgent ? null : "run",
+        projectId: PROJECT.id,
+      }),
+    );
+  }
+  return out;
+}
+
+function callLog(calls) {
+  return calls.map((c) => ({
+    after: c.after,
+    start: (c.timeRange && c.timeRange.start) || null,
+    end: (c.timeRange && c.timeRange.end) || null,
+    endCursor: c.endCursor,
+    hasNext: c.hasNext,
+    first: c.first,
+  }));
+}
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_truncated_poll_walk_resumes_from_its_cursor(tmp_path):
+    """A backlog deeper than MAX_POLL_PAGES resumes; nothing is left behind."""
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-backlog.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const BASE = T0 - 25 * MIN;
+const STEP = 400;
+const COUNT = 3200; // 7 pages of 500 — one more than a single tick can drain
+// The newest child gets its own lane, so its gutter label is proof the deepest
+// page was not just fetched but ingested and painted.
+const spans = backlog({ agent: "backlog", base: BASE, step: STEP, count: COUNT, tailAgent: "backlogtail" });
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+const refresh = container.querySelector("[data-refresh]");
+
+await settle(phoenix.calls);
+const firstTick = phoenix.calls.length;
+refresh.dispatch("click"); // second tick
+await settle(phoenix.calls);
+const secondTick = phoenix.calls.length;
+refresh.dispatch("click"); // third tick — the backlog is drained by now
+await settle(phoenix.calls);
+
+const painted = paintedText(canvas);
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  firstTick,
+  secondTick,
+  total: spans.length,
+  servedUnique: new Set(phoenix.served).size,
+  missing: spans.map((s) => s.id).filter((id) => !phoenix.served.includes(id)).slice(0, 5),
+  newestStart: new Date(BASE + (COUNT - 1) * STEP).toISOString(),
+  laneLabels: [...new Set(painted.filter((t) => t.startsWith("backlog")))].sort(),
+}));
+""",
+    )
+
+    calls = result["calls"]
+    # Tick 1 stops at the page cap, mid-backlog.
+    assert result["firstTick"] == MAX_POLL_PAGES
+    assert calls[0]["after"] is None
+    assert all(c["first"] == PAGE_SIZE for c in calls)
+    for i in range(1, MAX_POLL_PAGES):
+        assert calls[i]["after"] == calls[i - 1]["endCursor"]
+        assert calls[i]["start"] == calls[0]["start"]
+    assert calls[MAX_POLL_PAGES - 1]["hasNext"] is True
+
+    # Tick 2 RESUMES: the persisted cursor, on the bounds the walk started with.
+    # Those bounds are also the proof that the watermark was NOT advanced by the
+    # truncated walk — an advanced watermark is a different `timeRange.start`.
+    resumed = calls[MAX_POLL_PAGES]
+    assert resumed["after"] == calls[MAX_POLL_PAGES - 1]["endCursor"]
+    assert resumed["start"] == calls[0]["start"]
+    assert resumed["hasNext"] is False  # walk complete → coverage may commit
+    assert result["secondTick"] == MAX_POLL_PAGES + 1
+
+    # Only NOW does the watermark move — to the newest ingested start exactly,
+    # not one millisecond past it.
+    fresh = calls[MAX_POLL_PAGES + 1]
+    assert fresh["after"] is None
+    assert fresh["start"] == result["newestStart"]
+
+    # Every span in the backlog was ingested, and the deepest page's span is on
+    # screen in its own lane.
+    assert result["missing"] == []
+    assert result["servedUnique"] == result["total"]
+    # ("backlog run" is the root's own bar label, in the "backlog" lane.)
+    assert result["laneLabels"] == ["backlog", "backlog run", "backlogtail"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_millisecond_tie_across_the_page_bound_is_not_skipped(tmp_path):
+    """A parent and child sharing one millisecond, split by the page cap."""
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-tie.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const BASE = T0 - 25 * MIN;
+const STEP = 400;
+const KIDS = 2998; // root + kids = 2999 spans, so the tie pair straddles page 6/7
+const TIE = BASE + KIDS * STEP;
+const spans = backlog({ agent: "tie", base: BASE, step: STEP, count: KIDS, rootName: "tie run" });
+// Emitted in the same millisecond, on either side of the page bound: the CHILD
+// is the last span of page 6, its PARENT the first of page 7. A walk that
+// advanced past the boundary millisecond would lose the parent for good.
+spans.push(rawSpan({
+  id: "z-tie-child", name: "tie child", start: TIE, dur: 30,
+  agent: "tie", spanId: "tiechild", parentId: "tieparent", projectId: PROJECT.id,
+}));
+spans.push(rawSpan({
+  id: "zz-tie-parent", name: "tie parent band", start: TIE, dur: 5 * MIN,
+  agent: "tie", spanId: "tieparent", parentId: "run", kind: "CHAIN", projectId: PROJECT.id,
+}));
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+const refresh = container.querySelector("[data-refresh]");
+
+await settle(phoenix.calls);
+const truncated = {
+  calls: phoenix.calls.length,
+  child: phoenix.served.includes("z-tie-child"),
+  parent: phoenix.served.includes("zz-tie-parent"),
+};
+refresh.dispatch("click");
+await settle(phoenix.calls);
+const resumedCalls = phoenix.calls.length;
+
+// A late arrival in the boundary millisecond itself: the watermark now sits on
+// exactly this timestamp, and an exclusive (+1 ms) boundary would never ask for
+// it again.
+phoenix.add(rawSpan({
+  id: "zzz-late-twin", name: "late twin", start: TIE, dur: 4 * MIN,
+  agent: "latetwin", spanId: "latetwin", projectId: PROJECT.id,
+}));
+refresh.dispatch("click");
+await settle(phoenix.calls);
+
+const painted = paintedText(canvas);
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  truncated,
+  resumedCalls,
+  tie: new Date(TIE).toISOString(),
+  served: {
+    child: phoenix.served.includes("z-tie-child"),
+    parent: phoenix.served.includes("zz-tie-parent"),
+    lateTwin: phoenix.served.includes("zzz-late-twin"),
+  },
+  painted: [...new Set(painted)].filter((t) => t === "tie parent band" || t === "latetwin" || t === "tie"),
+}));
+""",
+    )
+
+    calls = result["calls"]
+    # The cap really did split the tie pair.
+    assert result["truncated"]["calls"] == MAX_POLL_PAGES
+    assert result["truncated"]["child"] is True
+    assert result["truncated"]["parent"] is False
+
+    # Resumption picks the parent up on the very next page — neither half of the
+    # pair is skipped, and the parent band paints.
+    assert calls[MAX_POLL_PAGES]["after"] == calls[MAX_POLL_PAGES - 1]["endCursor"]
+    assert calls[MAX_POLL_PAGES]["start"] == calls[0]["start"]
+    assert result["resumedCalls"] == MAX_POLL_PAGES + 1
+    assert result["served"]["parent"] is True
+    assert "tie parent band" in result["painted"]
+
+    # The committed watermark is the tie millisecond ITSELF: the next walk asks
+    # from it inclusively, so a span landing in that same millisecond after the
+    # walk finished is still pulled in.
+    boundary = calls[MAX_POLL_PAGES + 1]
+    assert boundary["after"] is None
+    assert boundary["start"] == result["tie"]
+    assert result["served"]["lateTwin"] is True
+    assert "latetwin" in result["painted"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_truncated_history_walk_does_not_claim_the_gap(tmp_path):
+    """historyFloor is a claim only a finished walk gets to make."""
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-history.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const GAP_BASE = T0 - 58 * MIN;
+const STEP = 400;
+const COUNT = 3200; // 7 pages once the run root is counted
+const spans = backlog({ agent: "old", base: GAP_BASE, step: STEP, count: COUNT, rootName: "old run" });
+// Live-window spans, so the boot poll finishes and commits a real floor for the
+// history walk to page back from.
+for (let i = 0; i < 3; i++) {
+  spans.push(rawSpan({
+    id: `recent-${i}`, name: `recent ${i}`, start: T0 - (20 - i * 4) * MIN,
+    agent: "recent", spanId: `rs-${i}`, projectId: PROJECT.id,
+  }));
+}
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+
+await settle(phoenix.calls);
+const liveCalls = phoenix.calls.length;
+
+// Pan back a window: a gap far deeper than one walk can drain.
+const paused = {
+  windowMs: 30 * MIN,
+  viewEnd: T0 - 30 * MIN,
+  live: false,
+  laneScrollY: 0,
+  collapsed: [],
+  highlightedSpanId: null,
+};
+mounted.setState(paused);
+await settle(phoenix.calls);
+const afterTruncated = phoenix.calls.length;
+
+mounted.setState(paused); // same window again — must RESUME, not skip as covered
+await settle(phoenix.calls);
+const afterResumed = phoenix.calls.length;
+
+mounted.setState(paused); // and now the gap really is covered
+await settle(phoenix.calls);
+const afterCovered = phoenix.calls.length;
+
+mounted.destroy();
+const gapIds = spans.filter((s) => Date.parse(s.startTime) < T0 - 30 * MIN).map((s) => s.id);
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  liveCalls,
+  afterTruncated,
+  afterResumed,
+  afterCovered,
+  target: new Date(T0 - 60 * MIN).toISOString(),
+  gapMissing: gapIds.filter((id) => !phoenix.served.includes(id)).slice(0, 5),
+}));
+""",
+    )
+
+    calls = result["calls"]
+    # Boot: one live page over the visible window, which completes and commits.
+    assert result["liveCalls"] == 1
+    gap = calls[1:]
+    # The gap walk stops at the page cap with the range still owed.
+    assert result["afterTruncated"] - result["liveCalls"] == MAX_POLL_PAGES
+    assert all(c["start"] == result["target"] for c in gap[:MAX_POLL_PAGES])
+    assert all(c["end"] == gap[0]["end"] for c in gap[:MAX_POLL_PAGES])
+    assert gap[MAX_POLL_PAGES - 1]["hasNext"] is True
+
+    # Panning to the same window again re-enters the SAME walk on its cursor. A
+    # `historyFloor` advanced by the truncated walk would have skipped the
+    # project outright ("already covered") and issued nothing at all.
+    assert result["afterResumed"] == result["afterTruncated"] + 1
+    resumed = gap[MAX_POLL_PAGES]
+    assert resumed["after"] == gap[MAX_POLL_PAGES - 1]["endCursor"]
+    assert resumed["start"] == result["target"]
+    assert resumed["end"] == gap[0]["end"]
+    assert resumed["hasNext"] is False
+
+    # Once the walk finished, the gap IS covered — and stops being refetched.
+    assert result["afterCovered"] == result["afterResumed"]
+    assert result["gapMissing"] == []
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_failed_page_leaves_the_walk_cursor_intact(tmp_path):
+    """An error mid-walk is resumed on the next tick, not restarted."""
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-error.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const BASE = T0 - 25 * MIN;
+const STEP = 400;
+const COUNT = 3200;
+const spans = backlog({ agent: "flaky", base: BASE, step: STEP, count: COUNT });
+// The third page of the first walk fails, two pages in.
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans, failCalls: [2] });
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const refresh = container.querySelector("[data-refresh]");
+
+await settle(phoenix.calls);
+const afterFailure = phoenix.calls.length;
+refresh.dispatch("click");
+await settle(phoenix.calls);
+const afterRetry = phoenix.calls.length;
+refresh.dispatch("click");
+await settle(phoenix.calls);
+
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  afterFailure,
+  afterRetry,
+  total: spans.length,
+  missing: spans.map((s) => s.id).filter((id) => !phoenix.served.includes(id)).slice(0, 5),
+}));
+""",
+    )
+
+    calls = result["calls"]
+    # Two good pages, then the throw aborts the walk mid-flight.
+    assert result["afterFailure"] == 3
+    assert calls[2]["after"] == calls[1]["endCursor"]
+    assert calls[2]["endCursor"] is None  # never answered
+
+    # The next tick picks up exactly where the last GOOD page ended, on the same
+    # bounds — it neither restarts at the top nor recomputes a moved boundary.
+    retry = calls[3]
+    assert retry["after"] == calls[1]["endCursor"]
+    assert retry["start"] == calls[0]["start"]
+    assert result["afterRetry"] > result["afterFailure"]
+    assert result["missing"] == []
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_paused_view_resumes_its_truncated_live_walk(tmp_path):
+    """A restored-PAUSED window still finishes the backlog its boot poll started.
+
+    The initial fill is always a manual poll, so a window restored paused (#86)
+    can end up owing a live walk it never asked for. The poll timer is the only
+    thing that comes back — and while paused it starts no fresh walk, which is
+    exactly why it must still resume the one already owed. Otherwise the pages
+    past the cap wait for the operator to hit Refresh.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-paused-resume.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const STEP = 400;
+const COUNT = 3200; // 7 pages once the run root is counted
+const BASE = T0 - 89 * MIN;
+const ROOT_START = BASE - 1000;
+const TAIL = `tool-${String(COUNT - 1).padStart(5, "0")}`;
+const spans = backlog({
+  agent: "restored", base: BASE, step: STEP, count: COUNT,
+  tailAgent: "restoredtail", rootName: "restored run",
+});
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+
+// The console restores the persisted view right after mount — BEFORE boot's
+// initial poll — so that poll fills a window which is already paused. The window
+// opens exactly on the run root, so a finished walk's floor covers its left edge
+// and the view is left owing nothing at all.
+mounted.setState({
+  windowMs: 30 * MIN,
+  viewEnd: ROOT_START + 30 * MIN,
+  live: false,
+  laneScrollY: 0,
+  collapsed: [],
+  highlightedSpanId: null,
+});
+
+await settle(phoenix.calls);
+const boot = {
+  calls: phoenix.calls.length,
+  live: mounted.getState().live,
+  tail: phoenix.served.includes(TAIL),
+};
+
+tick(); // the poll TIMER, paused: no fresh walk — but the owed one resumes
+await settle(phoenix.calls);
+const afterTick = phoenix.calls.length;
+
+tick(); // and with nothing owed, a paused tick asks for nothing
+await settle(phoenix.calls);
+const afterIdleTick = phoenix.calls.length;
+
+const painted = paintedText(canvas);
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  boot,
+  afterTick,
+  afterIdleTick,
+  total: spans.length,
+  servedUnique: new Set(phoenix.served).size,
+  missing: spans.map((s) => s.id).filter((id) => !phoenix.served.includes(id)).slice(0, 5),
+  laneLabels: [...new Set(painted.filter((t) => t.startsWith("restored")))].sort(),
+}));
+""",
+    )
+
+    calls = result["calls"]
+    # Boot polls the restored window manually and is cut off by the page cap.
+    assert result["boot"]["live"] is False
+    assert result["boot"]["calls"] == MAX_POLL_PAGES
+    assert calls[MAX_POLL_PAGES - 1]["hasNext"] is True
+    assert result["boot"]["tail"] is False  # the deepest page was never reached
+    assert all(c["end"] is None for c in calls[:MAX_POLL_PAGES])  # a live walk
+
+    # The TIMER resumes it — on the persisted cursor and the bounds the walk
+    # started with — even though the view is paused and no manual refresh, pan or
+    # Live toggle ever happened.
+    assert result["afterTick"] == MAX_POLL_PAGES + 1
+    resumed = calls[MAX_POLL_PAGES]
+    assert resumed["after"] == calls[MAX_POLL_PAGES - 1]["endCursor"]
+    assert resumed["start"] == calls[0]["start"]
+    assert resumed["end"] is None
+    assert resumed["hasNext"] is False
+
+    # Resuming is all it does: with the walk finished and its coverage committed,
+    # the next paused tick starts no fresh live walk.
+    assert result["afterIdleTick"] == result["afterTick"]
+
+    # And the backlog is whole — including the last page, painted in its own lane.
+    assert result["missing"] == []
+    assert result["servedUnique"] == result["total"]
+    assert result["laneLabels"] == ["restored", "restored run", "restoredtail"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_pan_during_an_in_flight_history_walk_still_loads_the_new_gap(tmp_path):
+    """A pan that lands mid-fetch is serviced when that walk lands, not dropped.
+
+    A walk's bounds are fixed for the life of its cursor, so it cannot widen to
+    cover a viewport that moved under it — and the in-flight guard drops the
+    concurrent call. The walk therefore has to re-derive the gap from the CURRENT
+    view start when it finishes, or the newly exposed range waits for the next
+    gesture that happens not to collide with a fetch.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-pan-midflight.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+function band(prefix, agent, offsets) {
+  return offsets.map((mins, i) => rawSpan({
+    id: `${prefix}-${i}`, name: `${prefix} ${i}`, start: T0 - mins * MIN,
+    agent, spanId: `${prefix}s-${i}`, projectId: PROJECT.id,
+  }));
+}
+// Three bands: the live window, the gap one pan back, the gap two pans back.
+const recent = band("recent", "recent", [20, 16, 12]);
+const gapA = band("gapa", "gapa", [48, 44, 40]);
+const gapB = band("gapb", "gapb", [78, 74, 70]);
+// Park the FIRST page of the gap-A walk in flight.
+const phoenix = installFakePhoenix({
+  projects: [PROJECT],
+  spans: [...recent, ...gapA, ...gapB],
+  holdCalls: [1],
+});
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+
+await settle(phoenix.calls);
+const bootCalls = phoenix.calls.length; // one live page, which finishes + commits
+
+const windowA = {
+  windowMs: 30 * MIN, viewEnd: T0 - 20 * MIN, live: false,
+  laneScrollY: 0, collapsed: [], highlightedSpanId: null,
+};
+mounted.setState(windowA); // pan back one window → the gap-A walk, held mid-page
+await settle(phoenix.calls);
+const inFlight = { calls: phoenix.calls.length, held: phoenix.held() };
+
+// Pan FARTHER left while that page is still in flight.
+mounted.setState({ ...windowA, viewEnd: T0 - 50 * MIN });
+await settle(phoenix.calls);
+const suppressed = phoenix.calls.length;
+
+phoenix.release(1); // the walk lands — no gesture and no tick after this point
+await settle(phoenix.calls);
+const afterRelease = phoenix.calls.length;
+
+tick(); // and once it IS covered, a paused tick re-walks nothing
+await settle(phoenix.calls);
+
+const painted = paintedText(canvas);
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  bootCalls,
+  inFlight,
+  suppressed,
+  afterRelease,
+  aStart: new Date(T0 - 50 * MIN).toISOString(),
+  aEnd: new Date(T0 - 20 * MIN).toISOString(),
+  bStart: new Date(T0 - 80 * MIN).toISOString(),
+  missingA: gapA.map((s) => s.id).filter((id) => !phoenix.served.includes(id)),
+  missingB: gapB.map((s) => s.id).filter((id) => !phoenix.served.includes(id)),
+  laneLabels: [...new Set(painted)].filter((t) => t === "gapa" || t === "gapb"),
+}));
+""",
+    )
+
+    calls = result["calls"]
+    assert result["bootCalls"] == 1
+    # The gap-A walk is issued and parked mid-page.
+    assert result["inFlight"] == {"calls": 2, "held": [1]}
+    assert calls[1]["start"] == result["aStart"]
+    assert calls[1]["end"] == result["aEnd"]
+
+    # Panning farther left while it is in flight issues nothing: the walk owns
+    # the project and its bounds can no longer move.
+    assert result["suppressed"] == 2
+
+    # When the walk lands it re-derives the gap from where the view now is, and
+    # loads it — no further pan, click or tick.
+    assert result["afterRelease"] == 3
+    assert len(calls) == 3  # the tick that followed added nothing: the gap is covered
+    newly_exposed = calls[2]
+    assert newly_exposed["after"] is None
+    assert newly_exposed["start"] == result["bStart"]
+    assert newly_exposed["end"] == result["aStart"]  # bounded by the committed floor
+    assert result["missingA"] == []
+    assert result["missingB"] == []
+    assert "gapb" in result["laneLabels"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_history_rounds_are_bounded_and_the_paused_timer_finishes_them(tmp_path):
+    """Re-deriving the gap is capped per pass; the paused timer picks up the rest.
+
+    A pass re-checks the viewport after each walk, so a viewport that keeps
+    moving during each fetch could otherwise chase a drag forever inside one
+    call. The cap makes that bounded — which is only honest if the range the cap
+    left behind is still owed by something, hence the paused timer's own check.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "poll-history-rounds.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const MAX_HISTORY_ROUNDS = 4; // timeline.js tuning this scenario drives
+function band(prefix, offsets) {
+  return offsets.map((mins, i) => rawSpan({
+    id: `${prefix}-${i}`, name: `${prefix} ${i}`, start: T0 - mins * MIN,
+    agent: prefix, spanId: `${prefix}s-${i}`, projectId: PROJECT.id,
+  }));
+}
+// One band per 30-minute window, walking back: the live one, then five gaps.
+const bands = {
+  recent: band("recent", [20, 16, 12]),
+  gapa: band("gapa", [48, 44, 40]),
+  gapb: band("gapb", [78, 74, 70]),
+  gapc: band("gapc", [108, 104, 100]),
+  gapd: band("gapd", [138, 134, 130]),
+  gape: band("gape", [168, 164, 160]),
+};
+// Every gap page is parked, so the viewport can move during each one.
+const phoenix = installFakePhoenix({
+  projects: [PROJECT],
+  spans: Object.values(bands).flat(),
+  holdCalls: [1, 2, 3, 4, 5],
+});
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+
+await settle(phoenix.calls);
+const bootCalls = phoenix.calls.length;
+
+const panTo = async (minutesAgo) => {
+  mounted.setState({
+    windowMs: 30 * MIN, viewEnd: T0 - minutesAgo * MIN, live: false,
+    laneScrollY: 0, collapsed: [], highlightedSpanId: null,
+  });
+  await settle(phoenix.calls);
+};
+
+// Pan one window back, then keep panning while each page is still in flight —
+// every one of those calls is dropped by the in-flight guard, and every release
+// makes the pass re-derive the gap and start ANOTHER round.
+await panTo(20);
+const rounds = [];
+for (let held = 1; held <= MAX_HISTORY_ROUNDS; held++) {
+  rounds.push({ calls: phoenix.calls.length, held: phoenix.held() });
+  await panTo(20 + held * 30); // moves the viewport while page `held` is parked
+  phoenix.release(held);
+  await settle(phoenix.calls);
+}
+// The last pan landed during the last round the cap allows, so the pass ends
+// here — no walk pending, no gesture coming, and the exposed gap unfetched.
+const afterCap = {
+  calls: phoenix.calls.length,
+  held: phoenix.held(),
+  gape: phoenix.served.includes("gape-0"),
+};
+
+tick(); // the paused timer: the visible left edge is still not covered
+await settle(phoenix.calls);
+const afterTick = { calls: phoenix.calls.length, held: phoenix.held() };
+if (phoenix.held().includes(5)) {
+  phoenix.release(5);
+  await settle(phoenix.calls);
+}
+const afterFinish = phoenix.calls.length;
+
+tick(); // covered at last — and quiet
+await settle(phoenix.calls);
+
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls: callLog(phoenix.calls),
+  bootCalls,
+  rounds,
+  afterCap,
+  afterTick,
+  afterFinish,
+  idle: phoenix.calls.length,
+  eStart: new Date(T0 - 170 * MIN).toISOString(),
+  eEnd: new Date(T0 - 140 * MIN).toISOString(),
+  missing: Object.values(bands).flat().map((s) => s.id)
+    .filter((id) => !phoenix.served.includes(id)),
+}));
+""",
+    )
+
+    # One pass, one project: a walk per round, each one issued only because the
+    # viewport moved while the previous page was in flight.
+    assert result["bootCalls"] == 1
+    assert len(result["rounds"]) == MAX_HISTORY_ROUNDS
+    assert [r["calls"] for r in result["rounds"]] == [2, 3, 4, 5]
+    assert [r["held"] for r in result["rounds"]] == [[1], [2], [3], [4]]
+    # One round past the cap never starts — the pass stops with the gap the last
+    # pan exposed still unfetched, and nothing pending to finish it.
+    assert result["afterCap"] == {"calls": 5, "held": [], "gape": False}
+
+    # The paused timer is what owes it: a finished walk's floor stops short of the
+    # window on screen, and a paused view never drifts off it.
+    assert result["afterTick"] == {"calls": 6, "held": [5]}
+    gap_e = result["calls"][5]
+    assert gap_e["start"] == result["eStart"]
+    assert gap_e["end"] == result["eEnd"]
+    assert result["afterFinish"] == 6
+    assert result["missing"] == []
+    # Covered now — the next tick asks for nothing.
+    assert result["idle"] == 6
+
+
+_WALK_BOUNDS_HARNESS = r"""
+import { pollWalkBounds } from "./timeline.js";
+
+const out = {};
+// First pass for a project: the visible window's start, nothing to resume.
+out.firstPass = pollWalkBounds({ viewStart: 1_000 });
+// A watermark is walked from INCLUSIVELY — `+1` would skip its millisecond.
+out.watermark = pollWalkBounds({ watermark: 5_000, viewStart: 1_000 });
+// The still-open floor (#62 P1) still backs the boundary down when it is older.
+out.openFloor = pollWalkBounds({ watermark: 5_000, openFloor: 4_000, viewStart: 1_000 });
+out.laterFloor = pollWalkBounds({ watermark: 5_000, openFloor: 9_000, viewStart: 1_000 });
+// An unfinished walk outranks all of it: same bounds, same cursor.
+out.resumed = pollWalkBounds({
+  pending: { startMs: 2_000, endMs: 3_000, after: "cursor-7" },
+  watermark: 5_000,
+  openFloor: 4_000,
+  viewStart: 1_000,
+});
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_poll_walk_bounds_are_resumable_and_tie_safe(tmp_path):
+    """The pure boundary rules behind the live walk (#109)."""
+    pkg = _module_dir(tmp_path)
+    result = _run_scenario(pkg, "walk-bounds.mjs", _WALK_BOUNDS_HARNESS)
+
+    assert result["firstPass"] == {
+        "startMs": 1_000,
+        "endMs": None,
+        "after": None,
+        "resumed": False,
+    }
+    # Inclusive: the boundary millisecond is re-pulled (merges are idempotent)
+    # rather than skipped.
+    assert result["watermark"]["startMs"] == 5_000
+    assert result["openFloor"]["startMs"] == 4_000
+    assert result["laterFloor"]["startMs"] == 5_000
+    assert result["resumed"] == {
+        "startMs": 2_000,
+        "endMs": 3_000,
+        "after": "cursor-7",
+        "resumed": True,
+    }
