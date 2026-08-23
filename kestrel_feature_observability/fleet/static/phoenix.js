@@ -83,14 +83,19 @@ export async function mintPhoenixSession() {
   phoenixSessionMinted = true;
 }
 
-export async function gql(query, variables) {
+// `opts.signal` is an optional AbortSignal: a view torn down mid-flight (a
+// sub-tab switch) aborts its own in-flight queries instead of waking up later to
+// merge into a detached mount (#108).
+export async function gql(query, variables, opts) {
   if (!phoenixSessionMinted) await mintPhoenixSession();
+  const signal = (opts && opts.signal) || undefined;
   const post = () =>
     fetch(PHOENIX_GRAPHQL_URL, {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query, variables: variables || {} }),
+      signal,
     });
   let resp = await post();
   if (resp.status === 401) {
@@ -236,6 +241,28 @@ export function workerFilter(agentName, worker) {
     `${agentFilter(agentName)} and (${attrRef(ATTR_STAGE)} == ${dslString(worker)}` +
     ` or ${attrRef(ATTR_AGENT_NAME)} == ${dslString(`${agentName}/${worker}`)})`
   );
+}
+
+// EXACT spans by OTel span id, with NO time window — the only way to fetch a
+// span whose `startTime` falls outside the caller's window, since Phoenix's
+// `timeRange` filters on startTime alone. A run root that began before the
+// visible window is invisible to every windowed page while its children, which
+// started inside it, page in fine (#108).
+//
+// `span_id` is a first-class name in the filter DSL and the list form is real
+// membership (not the substring `in` that `agentFilter` relies on): verified live
+// against Phoenix 17.7.0 — `span_id in ['…','…']` returns exactly those spans and
+// silently returns nothing for ids it does not have. Span ids are OTel hex, so
+// anything else is dropped rather than interpolated into the DSL. Returns null
+// when no id survives, so the caller can skip the request entirely.
+export function spanIdFilter(spanIds) {
+  const ids = new Set();
+  for (const id of spanIds || []) {
+    const hex = String(id);
+    if (/^[0-9a-f]+$/i.test(hex)) ids.add(hex);
+  }
+  if (!ids.size) return null;
+  return `span_id in [${[...ids].map(dslString).join(", ")}]`;
 }
 
 export function ts(iso) {
