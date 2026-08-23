@@ -96,6 +96,10 @@ export function installFakePhoenix({ projects, spans = [], failCalls = [], holdC
   const failures = new Set(failCalls);
   const holds = new Set(holdCalls);
   const gates = new Map(); // call index → resolve fn of the parked page
+  // One result set per (project, bounds), memoized: a cap-sized fixture is paged
+  // ~120 times and re-filtering + re-sorting 60k rows per page dominates the run.
+  // Semantics are unchanged — the cache is dropped whenever the store changes.
+  const pools = new Map();
   const order = (a, b) =>
     Date.parse(a.startTime) - Date.parse(b.startTime) || String(a.id).localeCompare(String(b.id));
   const boundsKey = (projectId, timeRange) =>
@@ -124,15 +128,19 @@ export function installFakePhoenix({ projects, spans = [], failCalls = [], holdC
     const key = boundsKey(projectId, timeRange);
     const startMs = timeRange && timeRange.start != null ? Date.parse(timeRange.start) : null;
     const endMs = timeRange && timeRange.end != null ? Date.parse(timeRange.end) : null;
-    const pool = store
-      .filter((s) => {
-        if (s.projectId !== projectId) return false;
-        const t = Date.parse(s.startTime);
-        if (startMs != null && t < startMs) return false; // start is INCLUSIVE
-        if (endMs != null && t >= endMs) return false;
-        return true;
-      })
-      .sort(order);
+    let pool = pools.get(key);
+    if (!pool) {
+      pool = store
+        .filter((s) => {
+          if (s.projectId !== projectId) return false;
+          const t = Date.parse(s.startTime);
+          if (startMs != null && t < startMs) return false; // start is INCLUSIVE
+          if (endMs != null && t >= endMs) return false;
+          return true;
+        })
+        .sort(order);
+      pools.set(key, pool);
+    }
 
     let offset = 0;
     if (after != null) {
@@ -161,7 +169,10 @@ export function installFakePhoenix({ projects, spans = [], failCalls = [], holdC
   return {
     calls,
     served,
-    add: (...more) => store.push(...more),
+    add: (...more) => {
+      pools.clear();
+      store.push(...more);
+    },
     held: () => [...gates.keys()],
     release(index) {
       const open = gates.get(index);
@@ -175,6 +186,15 @@ export function installFakePhoenix({ projects, spans = [], failCalls = [], holdC
 // A raw Phoenix span node as the client's normalize() reads it, plus the
 // `projectId` this double routes on (the real node is reached THROUGH a project,
 // so the field is harness bookkeeping the client never looks at).
+//
+// `open: true` is a span with NO closed end yet (a held-open talon run root, an
+// in-flight turn): Phoenix reports a null `endTime`, which `normalize()` turns
+// into `openEnded` with `end = start` — the degradation that used to sort live
+// work to the FRONT of the eviction order (#111).
+// `session`/`traceId` decide which eviction UNIT a span belongs to
+// (`sessionKeyFor`: the stamped session id, else the trace), and `kestrel`
+// carries any further producer attributes under that namespace (`tool_outcome`,
+// `turn_index`, ...), merged over the shorthands.
 export function rawSpan({
   id,
   name,
@@ -185,21 +205,31 @@ export function rawSpan({
   parentId = null,
   kind = "TOOL",
   projectId,
+  open = false,
+  marker = null,
+  session = null,
+  traceId = "trace-1",
+  kestrel = null,
 }) {
   return {
     id,
     name,
     spanKind: kind.toLowerCase(),
     startTime: new Date(start).toISOString(),
-    endTime: new Date(start + dur).toISOString(),
-    latencyMs: dur,
+    endTime: open ? null : new Date(start + dur).toISOString(),
+    latencyMs: open ? null : dur,
     statusCode: "OK",
     parentId,
     attributes: JSON.stringify({
       openinference: { span: { kind } },
-      kestrel: { agent_name: agent },
+      kestrel: {
+        agent_name: agent,
+        ...(marker != null ? { marker } : {}),
+        ...(session != null ? { session_id: session } : {}),
+        ...(kestrel || {}),
+      },
     }),
-    context: { spanId, traceId: "trace-1" },
+    context: { spanId, traceId },
     projectId,
   };
 }
@@ -232,6 +262,23 @@ export function paintedText(canvas) {
     }
   }
   return out;
+}
+
+// The operations of the MOST RECENT frame only. A cap-sized store paints tens of
+// thousands of operations per frame, so scenarios that repaint many times drop
+// earlier frames (`forgetFrames`) and read the last one — the only frame that
+// shows the settled store.
+export function lastFrame(canvas) {
+  const frames = (canvas.context && canvas.context.frames) || [];
+  return frames.length ? frames[frames.length - 1].operations : [];
+}
+
+export function forgetFrames(canvas) {
+  if (canvas.context) canvas.context.frames.length = 0;
+}
+
+export function frameText(ops) {
+  return ops.filter((op) => op.type === "fillText").map((op) => String(op.args[0]));
 }
 """
 
@@ -1994,7 +2041,15 @@ def test_stage_labels_over_real_talon_fixture(tmp_path):
 
 _TIMELINE_PRELUDE = r"""
 import { FakeElement, installFakeDom } from "./fake-dom.mjs";
-import { installFakePhoenix, rawSpan, settle, paintedText } from "./fake-phoenix.mjs";
+import {
+  installFakePhoenix,
+  rawSpan,
+  settle,
+  paintedText,
+  lastFrame,
+  forgetFrames,
+  frameText,
+} from "./fake-phoenix.mjs";
 
 installFakeDom();
 const MIN = 60 * 1000;
@@ -2878,3 +2933,547 @@ def test_poll_walk_bounds_are_resumable_and_tie_safe(tmp_path):
         "after": "cursor-7",
         "resumed": True,
     }
+
+
+# ── Cap eviction: whole closed sessions, never individual spans (#111) ────────
+#
+# `pruneSpans` used to sort the store ascending by the RAW span end and drop that
+# prefix. `normalize()` degrades an open-ended span to `end = start`, so a live
+# talon run root or an in-flight turn sorted as the OLDEST thing in the store and
+# was evicted BEFORE its own finished children; and individual eviction shredded
+# the units the render model folds — a turn root separated from its "turn <n>
+# summary" re-annotates as still running, a "(started)" marker separated from its
+# twin repaints as a phantom open band.
+#
+# The unit is now the SESSION (`sessionKeyFor`: the stamped session id, else the
+# trace). The fixtures below are the real cap — 60k spans, mounted view, real
+# paging. `SPAN_CAP` is production tuning and gets no test seam, so the store is
+# proved through what the canvas paints: a lane's gutter label is painted iff the
+# store still holds a span for that agent, a band's label iff that span survived,
+# and the cyan right-edge cap iff a band is rendering as still-running.
+
+SPAN_CAP = 60_000
+
+_EVICTION_PRELUDE = r"""
+const hex = (n) => n.toString(16).padStart(8, "0");
+
+// The cyan cap timeline.js paints at the right edge of an OPEN bar, and only
+// there — the one unambiguous "this band is rendering as still-running" signal.
+const OPEN_EDGE_COLOR = "#22d3ee";
+const openEdges = (ops) =>
+  ops.filter((o) => o.type === "fillRect" && o.fillStyle === OPEN_EDGE_COLOR).length;
+
+// Drive ticks until the project's walk runs out of pages, keeping only the
+// CURRENT tick's canvas frames (a cap-sized store paints tens of thousands of
+// operations per frame, and every tick repaints). Eviction happens at the end of
+// the tick whose walk DRAINED, so that tick's snapshot is the post-eviction
+// paint. Returns one snapshot per tick: pages fetched, whether the walk drained,
+// and which watched lanes its final paint still shows.
+async function drainTicks(phoenix, canvas, refresh, watched, maxTicks = 45) {
+  const snapshot = () => {
+    const seen = new Set(frameText(lastFrame(canvas)));
+    const lanes = {};
+    for (const name of watched) lanes[name] = seen.has(name);
+    return lanes;
+  };
+  const ticks = [];
+  for (let i = 0; i < maxTicks; i++) {
+    const before = phoenix.calls.length;
+    forgetFrames(canvas);
+    refresh.dispatch("click");
+    await settle(phoenix.calls);
+    const last = phoenix.calls[phoenix.calls.length - 1];
+    const drained = Boolean(last && last.hasNext === false);
+    ticks.push({ pages: phoenix.calls.length - before, drained, lanes: snapshot() });
+    if (drained) break;
+  }
+  return ticks;
+}
+
+// Filler spans: one closed session of leaves laid end to end, newer than
+// everything the fixture cares about, so it is never the eviction candidate.
+function filler(count, { session, agent, from, step = 8 }) {
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push(rawSpan({
+      id: `zz-${hex(i)}`, name: `fill ${i}`, start: from + i * step, dur: 4,
+      agent, spanId: `fl${hex(i)}`, session, traceId: session, projectId: PROJECT.id,
+    }));
+  }
+  return out;
+}
+"""
+
+
+_LIVE_VS_CLOSED_FIXTURE = r"""
+// 60_100 spans = the cap + 100, in three sessions:
+//
+//   - a LIVE session (`S-live`): a still-running root — Phoenix reports a null
+//     endTime, so `normalize()` gives it `end = start`, and its start is the
+//     OLDEST in the store. Under the old order that made it the first thing
+//     evicted, ahead of its own finished children.
+//   - a CLOSED session (`S-victim`): 100 leaves, and the oldest session END in
+//     the store — the one candidate, and exactly the overage.
+//   - the filler (`S-fill`): closed, newer, and never a candidate here.
+const spans = [
+  rawSpan({ id: "a0-live-root", name: "live run root", start: T0 - 19 * MIN, open: true,
+            agent: "livework", spanId: "liveroot", kind: "AGENT",
+            session: "S-live", traceId: "S-live", projectId: PROJECT.id }),
+  rawSpan({ id: "a1-live-a", name: "live tool a", start: T0 - 18 * MIN, dur: 4 * MIN,
+            agent: "livework", spanId: "livea", parentId: "liveroot",
+            session: "S-live", traceId: "S-live", projectId: PROJECT.id }),
+  rawSpan({ id: "a2-live-b", name: "live tool b", start: T0 - 12 * MIN, dur: 4 * MIN,
+            agent: "livework", spanId: "liveb", parentId: "liveroot",
+            session: "S-live", traceId: "S-live", projectId: PROJECT.id }),
+  rawSpan({ id: "a3-live-c", name: "live tool c", start: T0 - 6 * MIN, dur: 4 * MIN,
+            agent: "livework", spanId: "livec", parentId: "liveroot",
+            session: "S-live", traceId: "S-live", projectId: PROJECT.id }),
+];
+for (let i = 0; i < 100; i++) {
+  spans.push(rawSpan({
+    id: `b-${hex(i)}`, name: `victim ${i}`, start: T0 - 17 * MIN + i * 500, dur: 4,
+    agent: "victim", spanId: `vc${hex(i)}`, session: "S-victim", traceId: "S-victim",
+    projectId: PROJECT.id,
+  }));
+}
+spans.push(...filler(59_996, { session: "S-fill", agent: "filler", from: T0 - 15 * MIN }));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_cap_evicts_the_closed_session_whole_and_keeps_the_live_one(tmp_path):
+    """At the cap: the open session survives, the closed one goes whole — twice.
+
+    Three claims off one cap-sized fixture:
+
+    - the LIVE session is not a candidate at all. Its root is open (null
+      ``endTime`` → ``end == start``, the oldest sort key in the store), which is
+      exactly what the old order evicted first, ahead of its own finished
+      children; here it and all three children survive, still rendering open.
+    - the closed session is evicted WHOLE — its lane goes dark, all 100 spans.
+    - and the policy keeps no memory of that. The next cycle's walk backs down to
+      the live root's start (the #62 re-fetch floor), so the evicted session is
+      served again: it merges back as an ordinary session mid-walk — no
+      tombstone, no suppression table — and is evicted again when that cycle
+      completes. The cap binds every cycle; retention grows nothing.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "cap-live-vs-closed.mjs",
+        _TIMELINE_PRELUDE
+        + _EVICTION_PRELUDE
+        + _LIVE_VS_CLOSED_FIXTURE
+        + r"""
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+const refresh = container.querySelector("[data-refresh]");
+const LANES = ["livework", "victim", "filler"];
+
+await settle(phoenix.calls); // boot pass
+const first = await drainTicks(phoenix, canvas, refresh, LANES);
+const firstOps = lastFrame(canvas);
+const firstText = frameText(firstOps);
+// The next cycle starts a FRESH walk, backed down to the live root's start, so
+// the evicted session is served all over again.
+const second = await drainTicks(phoenix, canvas, refresh, LANES);
+
+mounted.destroy();
+const BARS = ["live run root", "live tool a", "live tool b", "live tool c"];
+process.stdout.write(JSON.stringify({
+  total: spans.length,
+  firstDrained: first[first.length - 1].drained,
+  firstPages: first.map((t) => t.pages),
+  settled: first[first.length - 1].lanes,
+  midWalk: first.length >= 2 ? first[first.length - 2].lanes : null,
+  bars: [...new Set(firstText)].filter((t) => BARS.includes(t)).sort(),
+  openEdges: openEdges(firstOps),
+  abandoned: firstText.some((t) => t.startsWith("⚠")),
+  reFetched: second[0].lanes,
+  reSettled: second[second.length - 1].lanes,
+  secondDrained: second[second.length - 1].drained,
+}));
+""",
+    )
+
+    assert result["total"] == SPAN_CAP + 100
+
+    # The walk really was paged over the cap and really did finish: only a
+    # drained walk is allowed to evict anything.
+    assert result["firstDrained"] is True
+    assert result["firstPages"][0] == MAX_POLL_PAGES
+
+    # Mid-walk — the store already past the cap, one page still owed — nothing
+    # has been evicted: a session's closing summary can be on the page still to
+    # come, so eviction is not a per-page decision.
+    assert result["midWalk"]["victim"] is True
+
+    # Drained → the closed session is gone WHOLE, and only it.
+    assert result["settled"]["victim"] is False
+    assert result["settled"]["livework"] is True
+    assert result["settled"]["filler"] is True
+
+    # The open root — `end == start`, the very first thing the old sort dropped —
+    # survives with every child, and still renders as running (the cyan cap at
+    # the live edge, no "⚠" abandonment).
+    assert result["bars"] == ["live run root", "live tool a", "live tool b", "live tool c"]
+    assert result["openEdges"] >= 1
+    assert result["abandoned"] is False
+
+    # No memory: re-served, the evicted session merges back as an ordinary
+    # session — and is evicted again when that cycle completes, so the cap binds
+    # every cycle rather than being spent once.
+    assert result["reFetched"]["victim"] is True
+    assert result["secondDrained"] is True
+    assert result["reSettled"]["victim"] is False
+    assert result["reSettled"]["livework"] is True
+    assert result["reSettled"]["filler"] is True
+
+
+_UNIT_FIXTURE = r"""
+// 61_000 spans = the cap + 1_000, in three sessions. The overage is HALF the
+// oldest session, so a policy that evicted by span count would stop in the
+// middle of it — and the 1_000 oldest RAW ends are not that session's leaves
+// but the KEPT session's instants (a turn root, a session marker, a refused
+// tool and its marker all sit at their start), which is precisely the shredding.
+const kept = [
+  // The session marker root: an instant, and the oldest end in the whole store.
+  rawSpan({ id: "a0-session-root", name: "claude-code", start: T0 - 19 * MIN, dur: 0,
+            agent: "kept", spanId: "sessionroot", kind: "AGENT",
+            session: "S-kept", traceId: "S-kept", projectId: PROJECT.id }),
+  // Turn 1: a PARENTLESS instant turn root closed only by its summary CHILD.
+  rawSpan({ id: "a1-turn1", name: "claude-code turn 1", start: T0 - 19 * MIN + 1000, dur: 0,
+            agent: "kept", spanId: "turnroot", kind: "AGENT", marker: "start",
+            session: "S-kept", traceId: "S-kept", kestrel: { turn_index: 1 },
+            projectId: PROJECT.id }),
+  rawSpan({ id: "a2-turn1-summary", name: "turn 1 summary", start: T0 - 19 * MIN + 1000,
+            dur: 10 * MIN, agent: "kept", spanId: "turnsum", parentId: "turnroot",
+            kind: "CHAIN", session: "S-kept", traceId: "S-kept",
+            kestrel: { turn_index: 1, tool_count: 2, duration_ms: 600000 },
+            projectId: PROJECT.id }),
+  // A classifier-refused Bash (#84): the terminal span is zero-duration at the
+  // start its marker recorded, so the two tie on end AND on start — page order
+  // alone decided which a span-level eviction took first, and taking the twin
+  // leaves the marker to repaint as a phantom open band.
+  rawSpan({ id: "a3-bash-real", name: "Bash", start: T0 - 18 * MIN, dur: 0,
+            agent: "kept", spanId: "bashreal", parentId: "turnroot",
+            session: "S-kept", traceId: "S-kept", kestrel: { tool_outcome: "denied" },
+            projectId: PROJECT.id }),
+  rawSpan({ id: "a4-bash-mark", name: "Bash (started)", start: T0 - 18 * MIN, dur: 0,
+            agent: "kept", spanId: "bashmark", parentId: "turnroot", marker: "start",
+            session: "S-kept", traceId: "S-kept", projectId: PROJECT.id }),
+  // Turn 2: also parentless, and its closing summary is parented to the SESSION
+  // MARKER — related to the turn it closes by nothing but the session key.
+  rawSpan({ id: "a5-turn2", name: "claude-code turn 2", start: T0 - 8 * MIN, dur: 0,
+            agent: "kept", spanId: "turn2root", kind: "AGENT", marker: "start",
+            session: "S-kept", traceId: "S-kept", kestrel: { turn_index: 2 },
+            projectId: PROJECT.id }),
+  rawSpan({ id: "a6-turn2-summary", name: "turn 2 summary", start: T0 - 8 * MIN, dur: 3 * MIN,
+            agent: "kept", spanId: "turn2sum", parentId: "sessionroot", kind: "CHAIN",
+            session: "S-kept", traceId: "S-kept",
+            kestrel: { turn_index: 2, tool_count: 1, duration_ms: 180000 },
+            projectId: PROJECT.id }),
+  rawSpan({ id: "a7-session-summary", name: "session summary", start: T0 - 19 * MIN,
+            dur: 15 * MIN, agent: "kept", spanId: "sesssum", parentId: "sessionroot",
+            kind: "CHAIN", session: "S-kept", traceId: "S-kept",
+            kestrel: { turn_count: 2, tool_count: 3, duration_ms: 900000 },
+            projectId: PROJECT.id }),
+];
+// The victim: the oldest session END in the store, and the same shape at its
+// head — a parentless turn root whose closing summary hangs off the session
+// marker. It goes whole, that head included.
+const victim = [
+  rawSpan({ id: "b0-session-root", name: "victim-agent", start: T0 - 17 * MIN, dur: 0,
+            agent: "victim", spanId: "vroot", kind: "AGENT",
+            session: "S-victim", traceId: "S-victim", projectId: PROJECT.id }),
+  rawSpan({ id: "b1-turn", name: "victim turn 1", start: T0 - 17 * MIN, dur: 0,
+            agent: "victim", spanId: "vturn", kind: "AGENT", marker: "start",
+            session: "S-victim", traceId: "S-victim", kestrel: { turn_index: 1 },
+            projectId: PROJECT.id }),
+  rawSpan({ id: "b2-turn-summary", name: "turn 1 summary", start: T0 - 17 * MIN, dur: 1 * MIN,
+            agent: "victim", spanId: "vturnsum", parentId: "vroot", kind: "CHAIN",
+            session: "S-victim", traceId: "S-victim",
+            kestrel: { turn_index: 1, tool_count: 1, duration_ms: 60000 },
+            projectId: PROJECT.id }),
+  rawSpan({ id: "b3-session-summary", name: "session summary", start: T0 - 17 * MIN,
+            dur: 9.5 * MIN, agent: "victim", spanId: "vsesssum", parentId: "vroot",
+            kind: "CHAIN", session: "S-victim", traceId: "S-victim",
+            kestrel: { turn_count: 1, tool_count: 1, duration_ms: 570000 },
+            projectId: PROJECT.id }),
+];
+for (let i = 0; i < 1_996; i++) {
+  victim.push(rawSpan({
+    id: `bb-${hex(i)}`, name: `victim ${i}`, start: T0 - 16.9 * MIN + i * 290, dur: 4,
+    agent: "victim", spanId: `vc${hex(i)}`, session: "S-victim", traceId: "S-victim",
+    projectId: PROJECT.id,
+  }));
+}
+const spans = [...kept, ...victim,
+               ...filler(58_992, { session: "S-fill", agent: "filler", from: T0 - 6 * MIN, step: 4 })];
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_cap_never_splits_a_session_unit(tmp_path):
+    """The eviction unit is the session — the render model's folds stay intact.
+
+    The overage is 1_000 spans and the oldest session holds 2_000, so the unit is
+    dropped WHOLE and the store lands a thousand spans under the cap rather than
+    stopping halfway through a session. What that buys, asserted on the retained
+    session:
+
+    - a completed turn is never separated from its ``turn <n> summary``: it still
+      paints its folded label and nothing in the frame renders as still-running;
+    - a ``(started)`` marker is never separated from its twin: the refused Bash
+      still reads as the one terminal stub it is, with no phantom open band;
+    - a parentless turn root whose closing summary is parented to the SESSION
+      MARKER — related to it by nothing but the session key — is retained with
+      it. The victim session carries that same shape and is dropped with it.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "cap-session-unit.mjs",
+        _TIMELINE_PRELUDE
+        + _EVICTION_PRELUDE
+        + _UNIT_FIXTURE
+        + r"""
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+const refresh = container.querySelector("[data-refresh]");
+
+await settle(phoenix.calls); // boot pass
+const ticks = await drainTicks(phoenix, canvas, refresh, ["kept", "victim", "filler"]);
+const ops = lastFrame(canvas);
+const text = frameText(ops);
+mounted.destroy();
+
+process.stdout.write(JSON.stringify({
+  total: spans.length,
+  keptSize: kept.length,
+  victimSize: victim.length,
+  drained: ticks[ticks.length - 1].drained,
+  settled: ticks[ticks.length - 1].lanes,
+  // Folded from its summary the turn 1 band reads "turn 1 · 2 tools · …";
+  // separated from it, with nothing left to fold, it falls back to the bare span
+  // name and runs open-ended to the right edge.
+  foldedTurn: text.filter((t) => t.startsWith("turn 1")),
+  reopenedTurn: text.includes("claude-code turn 1"),
+  // Turn 2 is closed by the session summary alone — its own summary hangs off
+  // the session marker — so its band is the bare name, and closed.
+  turn2: text.includes("claude-code turn 2"),
+  refusalStub: text.includes("Bash · denied"),
+  phantomBand: text.includes("Bash (started)"),
+  victimTurn: text.includes("victim turn 1"),
+  openEdges: openEdges(ops),
+}));
+""",
+    )
+
+    assert result["total"] == SPAN_CAP + 1_000
+    assert result["victimSize"] == 2_000  # twice the overage: half of it is spare
+    assert result["drained"] is True
+
+    # The unit went whole — head, leaves and the summary that hangs off its
+    # session marker — and nothing of it is left behind.
+    assert result["settled"]["victim"] is False
+    assert result["victimTurn"] is False
+    assert result["settled"]["kept"] is True
+    assert result["settled"]["filler"] is True
+
+    # Turn 1 kept its summary: the folded label, no bare name, and not one
+    # open-edge cap painted anywhere in the frame.
+    assert result["foldedTurn"] and result["foldedTurn"][0].startswith("turn 1 · 2 tools")
+    assert result["reopenedTurn"] is False
+    assert result["openEdges"] == 0
+
+    # Turn 2 — parentless, closed only through the session key — is retained with
+    # the session marker its summary hangs off.
+    assert result["turn2"] is True
+
+    # The refused call kept its twin: one terminal stub, no phantom open band.
+    assert result["refusalStub"] is True
+    assert result["phantomBand"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_a_session_larger_than_the_cap_exceeds_it_rather_than_splitting(tmp_path):
+    """One session bigger than the whole cap: the explicit, logged branch.
+
+    Whole-unit eviction cannot satisfy the cap here — the store is over it
+    because of ONE session, and that session cannot be split. The old policy's
+    answer (take the oldest-ending spans, wherever they live) is exactly the
+    behaviour being removed, so there is no fallback to it: the cycle evicts the
+    one closed session it CAN take whole, logs why it is still over, and leaves
+    the oversized session untouched. Its oldest span — the first casualty of any
+    span-level policy — is still painted.
+
+    The decision is a function of the state, so a second cycle that re-reaches it
+    does not re-log: an operator gets a record, not a stream.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "cap-oversized-session.mjs",
+        _TIMELINE_PRELUDE
+        + _EVICTION_PRELUDE
+        + r"""
+// 60_250 spans = the cap + 250. One session holds 60_200 of them — more than
+// the whole cap — and the other 50 are a small closed session that CAN go whole.
+const spans = [];
+for (let i = 0; i < 50; i++) {
+  spans.push(rawSpan({
+    id: `a-${hex(i)}`, name: `small ${i}`, start: T0 - 19 * MIN + i * 200, dur: 4,
+    agent: "small", spanId: `sm${hex(i)}`, session: "S-small", traceId: "S-small",
+    projectId: PROJECT.id,
+  }));
+}
+// The oldest span in the oversized session, wide enough to read: the very first
+// thing a span-level eviction would take.
+spans.push(rawSpan({
+  id: "b0-mono-head", name: "mono head", start: T0 - 20 * MIN, dur: 3 * MIN,
+  agent: "mono", spanId: "monohead", kind: "AGENT", session: "S-mono",
+  traceId: "S-mono", projectId: PROJECT.id,
+}));
+spans.push(...filler(60_199, { session: "S-mono", agent: "mono", from: T0 - 16 * MIN }));
+
+const warnings = [];
+console.warn = (...args) => warnings.push(args.map(String).join(" "));
+
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+const refresh = container.querySelector("[data-refresh]");
+
+await settle(phoenix.calls); // boot pass
+const ticks = await drainTicks(phoenix, canvas, refresh, ["small", "mono"]);
+const text = frameText(lastFrame(canvas));
+const afterFirst = warnings.length;
+// A second cycle reaches the same decision about the same store.
+await drainTicks(phoenix, canvas, refresh, ["small", "mono"]);
+mounted.destroy();
+
+process.stdout.write(JSON.stringify({
+  total: spans.length,
+  drained: ticks[ticks.length - 1].drained,
+  settled: ticks[ticks.length - 1].lanes,
+  monoHead: text.includes("mono head"),
+  warnings,
+  afterFirst,
+}));
+""",
+    )
+
+    assert result["total"] == SPAN_CAP + 250
+    assert result["drained"] is True
+
+    # The closed session small enough to take went whole; the oversized one was
+    # left entirely alone — including the span every span-level order eats first.
+    assert result["settled"]["small"] is False
+    assert result["settled"]["mono"] is True
+    assert result["monoHead"] is True
+
+    # And the store staying over the cap is a decision on the record, not an
+    # accident — logged once, with the reason and the promise it does not break.
+    assert result["afterFirst"] == 1
+    assert len(result["warnings"]) == 1
+    notice = result["warnings"][0]
+    assert f"{SPAN_CAP + 200} spans over the {SPAN_CAP} cap" in notice
+    assert "1 larger than the cap" in notice
+    assert "spans are never evicted individually" in notice
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_the_cap_binds_again_on_every_cycle_as_new_sessions_arrive(tmp_path):
+    """Repeated forced evictions: retention never accumulates.
+
+    Whole-unit eviction retains more than the old policy did — a unit is dropped
+    whole, and a live one is not dropped at all — so the question it has to answer
+    is whether the cap still binds under continuous ingestion. It does, once per
+    completed cycle: five closed sessions of 400 spans sit behind a cap-filling
+    store, and each arriving wave of 400 costs exactly one of them, oldest first.
+    The store returns under the cap every cycle and no cycle needs the
+    over-cap branch.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "cap-repeated.mjs",
+        _TIMELINE_PRELUDE
+        + _EVICTION_PRELUDE
+        + r"""
+// A session of 400 leaves under its own agent, so its lane label answers
+// "is this session still in the store?".
+function cohort(tag, start) {
+  const out = [];
+  for (let i = 0; i < 400; i++) {
+    out.push(rawSpan({
+      id: `${tag}-${hex(i)}`, name: `${tag} ${i}`, start: start + i * 100, dur: 4,
+      agent: tag, spanId: `${tag}${hex(i)}`, session: `S-${tag}`, traceId: `S-${tag}`,
+      projectId: PROJECT.id,
+    }));
+  }
+  return out;
+}
+
+// 60_100 = the cap + 100: the store opens one eviction over, and every wave
+// below puts it right back over by the same 100.
+const spans = [];
+for (let k = 0; k < 5; k++) spans.push(...cohort(`gen${k}`, T0 - (19 - k) * MIN));
+spans.push(...filler(58_100, { session: "S-fill", agent: "filler", from: T0 - 13 * MIN }));
+
+const warnings = [];
+console.warn = (...args) => warnings.push(args.map(String).join(" "));
+
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+const refresh = container.querySelector("[data-refresh]");
+const LANES = ["gen0", "gen1", "gen2", "gen3", "gen4", "filler",
+               "wave1", "wave2", "wave3", "wave4"];
+
+await settle(phoenix.calls); // boot pass
+const base = await drainTicks(phoenix, canvas, refresh, LANES);
+const cycles = [{ ticks: base.length, lanes: base[base.length - 1].lanes }];
+for (let k = 1; k <= 4; k++) {
+  // Newer than every span the base walk covered, so the forward-only live poll
+  // picks the wave up on its next tick.
+  phoenix.add(...cohort(`wave${k}`, T0 - (5 - k) * MIN));
+  const wave = await drainTicks(phoenix, canvas, refresh, LANES);
+  cycles.push({ ticks: wave.length, lanes: wave[wave.length - 1].lanes });
+}
+mounted.destroy();
+
+process.stdout.write(JSON.stringify({ total: spans.length, cycles, warnings }));
+""",
+    )
+
+    assert result["total"] == SPAN_CAP + 100
+
+    # Every wave is one page: the walk drains inside a single tick, so each cycle
+    # is a complete ingestion and gets to bind the cap.
+    for cycle in result["cycles"][1:]:
+        assert cycle["ticks"] == 1
+
+    # Cycle by cycle, exactly one more session is gone — oldest first — and the
+    # arriving waves are all retained.
+    for index, cycle in enumerate(result["cycles"]):
+        lanes = cycle["lanes"]
+        for k in range(5):
+            assert lanes[f"gen{k}"] is (k > index), (index, k, lanes)
+        for k in range(1, 5):
+            assert lanes[f"wave{k}"] is (k <= index), (index, k, lanes)
+        assert lanes["filler"] is True
+
+    # The cap was reachable every time, so nothing took the over-cap branch.
+    assert result["warnings"] == []

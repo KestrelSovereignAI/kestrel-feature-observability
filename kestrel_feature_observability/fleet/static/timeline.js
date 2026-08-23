@@ -93,7 +93,7 @@ const MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 h (max zoom-out)
 const PAGE_SIZE = 500; // spans per GraphQL page
 const MAX_POLL_PAGES = 6; // per-project drain cap per tick (backlog catch-up)
 const MAX_HISTORY_ROUNDS = 4; // bounded walks per history pass (viewport moved mid-fetch)
-const SPAN_CAP = 60_000; // memory guard — prune oldest beyond this
+const SPAN_CAP = 60_000; // memory guard — evict oldest CLOSED SESSIONS beyond this (#111)
 // Why a project can have a walk in flight — the second half of a walk's identity
 // in the registry, so the three fetch paths resume independently of each other.
 const WALK_LIVE = "live"; // watermark-forward drain (the poll)
@@ -1305,9 +1305,10 @@ export function mount(container, opts = {}) {
   const spans = new Map(); // Phoenix node id → normalized span
   // Incremental parent-link indexes, maintained on every merge/prune so the
   // layout can rebuild the span tree cheaply and tolerate orphans (children
-  // paged before parents; talon leaves exported before their held-open roots;
-  // a pruned parent kept children) — an orphan renders at its best-known depth
-  // and re-parents when the parent arrives on a later rebuild (#54.2).
+  // paged before parents; talon leaves exported before their held-open roots) —
+  // an orphan renders at its best-known depth and re-parents when the parent
+  // arrives on a later rebuild (#54.2). Eviction no longer makes orphans: it
+  // takes whole sessions, never a parent out from under its children (#111).
   const spanIdToId = new Map(); // OTel context.spanId → Phoenix node id
   const childrenByParent = new Map(); // parent OTel spanId → Set<Phoenix node id>
   const projects = []; // [{id, name}] — DEFAULT_PROJECT first
@@ -1491,20 +1492,120 @@ export function mount(container, opts = {}) {
       spans.set(s.id, s);
       indexSpan(s);
     }
-    if (spans.size > SPAN_CAP) pruneSpans();
     return { added, newestStart, oldestStart };
   }
 
-  // Memory guard: when we blow past the cap, drop the oldest-ending spans.
-  // Dropping a parent while keeping its children is fine — the orphans fall
-  // back to depth-0 roots until (if) the parent is re-fetched (#54.2).
-  function pruneSpans() {
-    const all = [...spans.values()].sort((a, b) => a.end - b.end);
-    const drop = all.length - SPAN_CAP;
-    for (let i = 0; i < drop; i++) {
-      deindexSpan(all[i]);
-      spans.delete(all[i].id);
+  // ── Memory guard: evict whole CLOSED SESSIONS, never individual spans (#111) ──
+  //
+  // The session is the self-contained unit — session root/marker, turn roots,
+  // their summaries, marker twins, tool calls — and its members are exactly what
+  // `sessionKeyFor` groups (the stamped session id, else the trace, the same
+  // fallback `laneBands` bands by). Nothing smaller is safe to drop on its own,
+  // because the render model is a pure function of the loaded set: a turn root
+  // separated from its `turn <n> summary` re-annotates as STILL RUNNING (and drags
+  // the live re-fetch floors with it), a "(started)" marker separated from its
+  // twin repaints as a phantom open band. So the unit goes whole or stays whole.
+  //
+  // This replaces span-level eviction ordered by the raw `end` — the note that
+  // stood here ("dropping a parent while keeping its children is fine — the
+  // orphans fall back to depth-0 roots until (if) the parent is re-fetched") is
+  // the opposite intent and must not come back. It was wrong twice over:
+  // `normalize()` gives an OPEN span `end = start`, so a live talon run root or
+  // an in-flight turn sorted to the very front and was evicted BEFORE its own
+  // finished children — destroying exactly the band an operator is watching —
+  // and individual eviction shredded the units above.
+  //
+  // The policy deliberately has NO memory: no tombstones, no suppression table,
+  // nothing keyed on span names. Spans of an evicted session that are fetched
+  // again merge back as an ordinary session — that is correct behaviour, not a
+  // leak to suppress.
+  //
+  //   - a session holding ANY open span is never a candidate (that is live work);
+  //   - candidates are ordered oldest-first by the session's latest end;
+  //   - whole sessions are evicted until the store is back under the cap.
+  //
+  // Runs at the end of a COMPLETED poll cycle (#109) and after
+  // `annotateRenderModel` has resolved, so membership, summaries and twins are
+  // known — never per page inside `mergeSpans`, where the parent chain is still
+  // half-loaded and no twin is paired yet.
+
+  // Is a span still open? The resolved render model answers it (`rOpen` — an
+  // abandoned run is closed, a summary-less live turn is open); a span the model
+  // has not seen falls back to its raw open-endedness.
+  function spanStillOpen(s) {
+    if (s.rOpen != null) return s.rOpen === true;
+    return s.openEnded === true;
+  }
+
+  // Group the store into eviction units: session key → members, latest end, and
+  // whether any member is still open.
+  function sessionUnits() {
+    const units = new Map();
+    for (const s of spans.values()) {
+      const key = sessionKeyFor(s);
+      let unit = units.get(key);
+      if (!unit) {
+        unit = { key, members: [], latestEnd: -Infinity, open: false };
+        units.set(key, unit);
+      }
+      unit.members.push(s);
+      const end = Math.max(s.start, s.rEnd != null ? s.rEnd : s.end);
+      if (end > unit.latestEnd) unit.latestEnd = end;
+      if (spanStillOpen(s)) unit.open = true;
     }
+    return units;
+  }
+
+  // The cap decisions below repeat every cycle for as long as they hold, so only
+  // a CHANGE of decision is logged — an explicit record, not a per-poll stream.
+  let capDecision = null;
+  function noteCapDecision(message) {
+    if (message === capDecision) return;
+    capDecision = message;
+    if (typeof console !== "undefined" && console.warn) console.warn(message);
+  }
+
+  // Returns whether anything was evicted (the caller rebuilds the layout).
+  function pruneSpans() {
+    if (spans.size <= SPAN_CAP) {
+      capDecision = null;
+      return false;
+    }
+    const units = [...sessionUnits().values()];
+    // A session bigger than the whole cap can never be retained AND under it, and
+    // it cannot be split — dropping it would trade the operator's entire view for
+    // a byte count. It is not a candidate; the cap gives way instead (below).
+    const candidates = units
+      .filter((u) => !u.open && u.members.length <= SPAN_CAP)
+      .sort((a, b) => a.latestEnd - b.latestEnd);
+    let evicted = 0;
+    for (const unit of candidates) {
+      if (spans.size <= SPAN_CAP) break;
+      for (const s of unit.members) {
+        deindexSpan(s);
+        spans.delete(s.id);
+      }
+      evicted += 1;
+    }
+    if (spans.size > SPAN_CAP) {
+      // The explicit branch: every session is live, or one is bigger than the cap.
+      // Exceed the cap for this cycle and say why — splitting a unit to satisfy a
+      // span count is the behaviour being removed, so there is no other fallback.
+      // Re-decided next cycle, when a session may have closed, grown or been
+      // evicted. The message is a function of that state alone, so an unchanged
+      // decision is logged once rather than every poll.
+      const oversized = units.filter((u) => u.members.length > SPAN_CAP).length;
+      const live = units.filter((u) => u.open).length;
+      noteCapDecision(
+        `kestrel timeline: ${spans.size} spans over the ${SPAN_CAP} cap — ` +
+          `${live} of ${units.length - evicted} session(s) live, ${oversized} larger than the cap. ` +
+          `Exceeding the cap this cycle rather than splitting a session ` +
+          `(spans are never evicted individually).`,
+      );
+    } else {
+      capDecision = null;
+    }
+    return evicted > 0;
   }
 
   // ── Fetch ──
@@ -1768,7 +1869,10 @@ export function mount(container, opts = {}) {
     // only its own cursor can finish it. Those resume; nothing else does. So
     // does an unsettled reveal, which is paused BY DEFINITION (#109).
     const resumeOnly = !manual && !live;
-    if (resumeOnly && !revealPending && !walkOwed(WALK_LIVE)) return;
+    if (resumeOnly && !revealPending && !walkOwed(WALK_LIVE)) {
+      capPausedStore(); // a paused view still ingests history — see below
+      return;
+    }
     polling = true;
     let added = 0;
     try {
@@ -1795,6 +1899,31 @@ export function mount(container, opts = {}) {
     // until a reload (#67 P1). Re-annotation is also self-healing: a fresh
     // child or a backdated twin flips an abandoned span back to live/closed.
     if (!destroyed) {
+      buildLayout();
+      // Cap the store only on a SETTLED ingestion: every walk reported
+      // `hasNextPage: false` and none is in flight (#109), and `buildLayout()`
+      // just resolved the render model, so a session's membership, summaries and
+      // twins are known. Mid-walk the store is a half-loaded set — a session's
+      // closing summary can be on the page still owed — and evicting off that is
+      // how a unit gets broken. Rebuild once more on whatever the cap took (#111).
+      if (ingestionSettled() && pruneSpans()) buildLayout();
+      requestDraw();
+    }
+  }
+
+  // Is the ingestion settled — nothing owed, nothing in flight?
+  function ingestionSettled() {
+    return walks.size === 0 && projectFetching.size === 0;
+  }
+
+  // The timer starts no live walk for a paused view, but panning back keeps
+  // pulling history into the same store, so the cap still has to bind for it —
+  // under exactly the same terms (settled ingestion, resolved model). Guarded on
+  // the cap so a paused tick costs nothing while the store is within it (#111).
+  function capPausedStore() {
+    if (destroyed || spans.size <= SPAN_CAP || !ingestionSettled()) return;
+    buildLayout();
+    if (pruneSpans()) {
       buildLayout();
       requestDraw();
     }
