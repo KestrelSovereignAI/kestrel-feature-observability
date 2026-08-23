@@ -69,6 +69,7 @@ import {
   gql,
   PROJECTS_QUERY,
   SPAN_PAGE_QUERY,
+  spanIdFilter,
   escapeHtml,
   parseAttributes,
   getAttr,
@@ -94,6 +95,11 @@ const PAGE_SIZE = 500; // spans per GraphQL page
 const MAX_POLL_PAGES = 6; // per-project drain cap per tick (backlog catch-up)
 const MAX_HISTORY_ROUNDS = 4; // bounded walks per history pass (viewport moved mid-fetch)
 const SPAN_CAP = 60_000; // memory guard — evict oldest CLOSED SESSIONS beyond this (#111)
+// Ancestor backfill (#108) — bounds of ONE on-demand resolve; see `resolveAncestors`.
+const ANCESTOR_HOPS = 8; // parent generations one RUN may walk up (depth — never per pass)
+const ANCESTOR_BATCH = 100; // span ids per exact-id request (breadth of one request)
+const ANCESTOR_PASS_IDS = 400; // ids one pass may ask for; the surplus CARRIES to the next
+const ANCESTOR_SETTLE_MS = 250; // pan/zoom debounce — resolve once the gesture stops
 // Why a project can have a walk in flight — the second half of a walk's identity
 // in the registry, so the three fetch paths resume independently of each other.
 const WALK_LIVE = "live"; // watermark-forward drain (the poll)
@@ -798,6 +804,109 @@ export function openStartFloors(spanIter) {
     if (cur == null || s.start < cur) floors.set(key, s.start);
   }
   return floors;
+}
+
+// ── Ancestor backfill (#108) ──────────────────────────────────
+//
+// Every paged fetch is windowed on `startTime`, and Phoenix's `timeRange` filters
+// on startTime ALONE. So a run/turn root that STARTED before the visible window
+// is never pulled while its children — which started inside it — are: pan back,
+// or open the panel mid-run, and the run renders as a scatter of orphaned tool
+// ticks with no parent band. The draw-time overlap test is correct; the spans are
+// simply not loaded, which is why this is a fetch fix and not a paint one.
+//
+// The missing parents are fetched EXACTLY, by OTel span id (`spanIdFilter`),
+// which needs no time window at all — so there are no page cursors, no retry
+// ledger and no per-trace settled state here.
+//
+// Key an ancestor request by (project, span id): the fetch goes through a project
+// node, so the same id under two projects is two different asks.
+export function ancestorAskKey(projectId, spanId) {
+  return `${projectId} ${spanId}`;
+}
+
+// The pure half: which parents are missing, and at what DEPTH each would be
+// fetched. An entry is `{ projectId, spanId, depth }` — a parent id some loaded
+// span names that is not itself loaded.
+//
+// Depth belongs to the ID, not to the pass or the loop that asks for it. A parent
+// named by a span this run never fetched is one hop out (depth 1); one revealed by
+// a span the run fetched at depth d is d + 1, read from `depths` (ask key → the
+// depth that id was asked at). Anything past `maxDepth` is not returned at all —
+// that chain is left orphaned, which the render model already draws at its
+// best-known depth. Carrying the depth this way is what makes the bound hold when
+// a wide frontier is drained across several passes: a carried id keeps the depth
+// it was discovered at instead of starting over at one, so breadth can never buy
+// depth.
+//
+// Deduplicated per (project, parent), keeping the SHALLOWEST claim — two children
+// at different depths naming one parent is one ask, at the honest hop count.
+export function ancestorFrontier(spanIter, depths, maxDepth) {
+  const list = [...spanIter];
+  const loaded = new Set();
+  for (const s of list) if (s.spanId) loaded.add(s.spanId);
+  const seen = new Map(); // ask key → entry
+  const out = [];
+  for (const s of list) {
+    const pid = s.parentId;
+    if (!pid || loaded.has(pid)) continue;
+    const projectId = s.projectId != null ? s.projectId : null;
+    const childDepth = (depths && depths.get(ancestorAskKey(projectId, s.spanId))) || 0;
+    const depth = childDepth + 1;
+    if (maxDepth != null && depth > maxDepth) continue; // past the hop cap — leave it
+    const key = ancestorAskKey(projectId, pid);
+    const prev = seen.get(key);
+    if (prev) {
+      if (depth < prev.depth) prev.depth = depth;
+      continue;
+    }
+    const entry = { projectId, spanId: pid, depth };
+    seen.set(key, entry);
+    out.push(entry);
+  }
+  return out;
+}
+
+// What ONE pass should ask for out of a frontier: every entry not asked for yet,
+// grouped into requests of at most `batchSize` ids sharing a (project, depth) —
+// EXCEPT the surplus past `budget`, which comes back as `carried` ENTRIES, depth
+// intact, for the next pass to ask for.
+//
+// Breadth and depth are separate, and this function only ever bounds breadth: the
+// budget caps the ids one pass asks for before the caller re-checks, never how
+// deep the run may walk. The surplus is carried, not dropped, which is exactly
+// what #105 got wrong when it truncated at its first 800 ids and never came back
+// for the rest — and each carried id keeps its own accumulated depth, so a
+// frontier too wide for one pass costs more passes, never more hops.
+//
+// Pure (it does not touch `asked`) + exported for the render-model tests.
+export function ancestorRequestPlan(frontier, asked, opts) {
+  const o = opts || {};
+  const budget = Number.isFinite(o.budget) ? o.budget : ANCESTOR_PASS_IDS;
+  const batchSize = Number.isFinite(o.batchSize) ? o.batchSize : ANCESTOR_BATCH;
+  const seen = asked || new Set();
+  const requests = [];
+  const carried = [];
+  const open = new Map(); // `${projectId} ${depth}` → the request still filling
+  let remaining = budget;
+  for (const entry of frontier) {
+    if (seen.has(ancestorAskKey(entry.projectId, entry.spanId))) continue;
+    if (remaining <= 0) {
+      carried.push(entry); // over budget for this pass — the next one asks for it
+      continue;
+    }
+    remaining -= 1;
+    const key = `${entry.projectId} ${entry.depth}`;
+    let req = open.get(key);
+    if (!req) {
+      req = { projectId: entry.projectId, depth: entry.depth, ids: [] };
+      open.set(key, req);
+      requests.push(req);
+    }
+    req.ids.push(entry.spanId);
+    if (req.ids.length >= batchSize) open.delete(key); // full — the next id opens another
+  }
+  return { requests, carried };
 }
 
 // ── Virtual scheduler-session band (#87/#92) ──
@@ -1790,6 +1899,13 @@ export function mount(container, opts = {}) {
     if (destroyed || revealPending) return;
     buildLayout();
     finishReveal();
+    // A reveal that settles on a later tick re-anchors the window on its target:
+    // a viewport change like any other, landing on history whose run/turn roots
+    // were never inside any window this view has asked for. Its walk is done by
+    // definition here (`revealPending` is false), but the obligation is still
+    // spent through the same gate — the live walk this tick resumed may not be,
+    // and one obligation shared with boot's is one resolve, not two (#108).
+    armAncestorResolve();
   }
 
   function showRevealNotice(message, isFallback) {
@@ -1859,6 +1975,222 @@ export function mount(container, opts = {}) {
     return added;
   }
 
+  // ── Ancestor backfill: fetch the parents no window can see (#108) ──
+  //
+  // Runs ON DEMAND — once the initial load settles, and debounced when the
+  // viewport settles after a pan/zoom, which is precisely when the operator is
+  // looking at history whose ancestors were never fetched. Each of those OWES one
+  // resolve and none of them spends it: the gesture is not the settle, so the
+  // obligation waits for the ingestion to go quiet (`settleAncestorResolve`, the
+  // gate #111 prunes on). There is deliberately
+  // NO periodic resolver: a five-second retry loop is what turned #105 into
+  // request storms, per-tick budgets, id rotation and live-poll starvation. A
+  // given orphan set is resolved at most once per settle, and a parent that
+  // genuinely does not come back (never exported, aged out of Phoenix) is simply
+  // left orphaned — the render model already tolerates that, drawing an orphan at
+  // its best-known depth, and chasing it with retry/backoff bookkeeping is the
+  // failure mode of the two previous attempts, not a fix.
+  //
+  // Nothing here has to interact with the memory guard: eviction takes whole
+  // CLOSED sessions (#111), so an ancestor inside a retained session cannot be
+  // dropped out from under the child that needed it, and there are no tombstones
+  // or suppression tables for a re-fetch to trip over.
+  //
+  // The one place a backfilled span reaches back into the poll is `openFloors`: a
+  // pre-window ancestor that is still OPEN anchors the live re-fetch floor at its
+  // start, which can be far behind the watermark. That is the #62 floor working as
+  // designed and it no longer starves live-follow — since #109 a walk truncated by
+  // the page cap resumes on its own cursor instead of restarting at the floor, so
+  // the drain reaches the live edge and commits — and a run that is merely dead
+  // stops anchoring the floor once the abandoned cap fires (#67).
+
+  // Aborts whatever is on the wire at teardown, so a sub-tab switch cannot leave
+  // a resolve running against a detached mount.
+  const ancestorAbort = typeof AbortController === "function" ? new AbortController() : null;
+
+  // Spans this run's exact merges ADDED, counted AT each merge rather than as a
+  // net `spans.size` delta: it survives a hop that throws (whatever already
+  // landed still repaints) and cannot be confused by an eviction that happens to
+  // offset the insert.
+  let ancestorMerged = 0;
+
+  // Fetch exactly these spans by OTel span id — no `timeRange`, which is the
+  // whole point: an ancestor starts BEFORE the window its children sit in, so no
+  // windowed page can ever see it. Ids Phoenix does not have come back empty.
+  async function fetchAncestors(projectId, spanIds) {
+    if (destroyed) return;
+    const filter = spanIdFilter(spanIds);
+    if (!filter) return;
+    const project = projects.find((p) => p.id === projectId);
+    if (!project) return; // no project node to query against
+    const data = await gql(
+      SPAN_PAGE_QUERY,
+      {
+        projectId,
+        first: Math.min(PAGE_SIZE, ANCESTOR_BATCH),
+        after: null,
+        filter,
+        rootOnly: false,
+        sort: null,
+        timeRange: null,
+      },
+      { signal: ancestorAbort ? ancestorAbort.signal : undefined },
+    );
+    // Torn down while this was in flight: the response belongs to a mount nothing
+    // will draw again, so drop it rather than merge into a detached store (an
+    // aborted fetch usually throws first; one that had already landed does not).
+    if (destroyed) return;
+    const conn = data.node && data.node.spans;
+    const raw = ((conn && conn.edges) || []).map((e) => e && e.node).filter(Boolean);
+    // Exact ids cover no time RANGE, so this merge moves no cursor — coverage is
+    // a finished walk's claim alone (#109), which is exactly right here.
+    ancestorMerged += mergeSpans(raw, projectId, project.name).added;
+  }
+
+  // ONE run: hop up the chain until every orphan's parent is loaded (or does not
+  // exist). The chain is at LEAST two hops — a tool's parent is its turn, the
+  // turn's parent is the run root — so stopping after one still loses the run
+  // band; each pass re-reads the store, so the parents fetched by one pass are
+  // what the next asks about.
+  //
+  // Depth is a property of the ID (`ancestorFrontier` stamps it, `asked`/`depths`
+  // remember it), never of the pass: a frontier wider than `ANCESTOR_PASS_IDS` is
+  // drained across as many passes as it takes and every carried id keeps the depth
+  // it was discovered at. A per-pass hop counter would let BREADTH buy DEPTH — 400
+  // orphan chains spend a whole pass per generation, each pass starts over with a
+  // fresh budget, and the run walks the chain arbitrarily far, which is the
+  // unbounded request run the cap exists to prevent.
+  //
+  // Bounded four ways: `ANCESTOR_HOPS` caps how far from a loaded span any id may
+  // be, `ANCESTOR_BATCH` the ids per request, `ANCESTOR_PASS_IDS` the ids asked
+  // before the frontier is re-read, and `asked` — an id is requested at most once
+  // per run, so a parent CYCLE terminates instead of spinning, and a pass with
+  // nothing new to ask ends the run.
+  //
+  // `asked` is per RUN and remembered nowhere afterwards: a table of "already
+  // resolved" is exactly what leaves a later-discovered orphan orphaned.
+  async function ancestorRun() {
+    ancestorMerged = 0;
+    try {
+      const asked = new Set(); // ask keys this run has already requested
+      const depths = new Map(); // ask key → the hop count it was asked at
+      // The carried surplus of a pass is the NEXT pass's frontier, so a wide
+      // generation is finished before the one above it is even looked at (#105
+      // truncated at its first 800 ids and never came back for the rest).
+      let frontier = ancestorFrontier(spans.values(), depths, ANCESTOR_HOPS);
+      while (frontier.length && !destroyed) {
+        const plan = ancestorRequestPlan(frontier, asked, {
+          budget: ANCESTOR_PASS_IDS,
+          batchSize: ANCESTOR_BATCH,
+        });
+        let askedThisPass = 0;
+        for (const req of plan.requests) {
+          if (destroyed) break;
+          for (const id of req.ids) {
+            const key = ancestorAskKey(req.projectId, id);
+            asked.add(key);
+            depths.set(key, req.depth); // what the ids it reveals are measured from
+          }
+          askedThisPass += req.ids.length;
+          await fetchAncestors(req.projectId, req.ids);
+        }
+        // Nothing left to ask: every outstanding parent is either already asked
+        // for in this run (a cycle, a shared ancestor) or past the hop cap.
+        if (!askedThisPass) break;
+        frontier = plan.carried.length
+          ? plan.carried
+          : ancestorFrontier(spans.values(), depths, ANCESTOR_HOPS);
+      }
+    } catch (_e) {
+      /* transient (or aborted at teardown) — the next settle asks again */
+    }
+    // Ancestors landing must show the band WITHOUT a remount — and in a paused or
+    // panned view nothing else would ever rebuild: `pollTick(false)` starts no
+    // walk there, so this is the only repaint the band gets.
+    if (ancestorMerged > 0 && !destroyed) {
+      buildLayout();
+      requestDraw();
+    }
+    return ancestorMerged;
+  }
+
+  let resolvingAncestors = false;
+  let ancestorResolveQueued = false;
+
+  // One resolve at a time. A settle landing mid-run folds into a single follow-up
+  // run rather than being dropped — the view the operator stopped on is the one
+  // whose ancestors have to be resolved — and rather than overlapping it, which
+  // would ask for the same ids twice from two `asked` sets.
+  async function resolveAncestors() {
+    if (destroyed) return 0;
+    if (resolvingAncestors) {
+      ancestorResolveQueued = true;
+      return 0;
+    }
+    resolvingAncestors = true;
+    let merged = 0;
+    try {
+      do {
+        ancestorResolveQueued = false;
+        merged += await ancestorRun();
+      } while (ancestorResolveQueued && !destroyed);
+    } catch (_e) {
+      /* every caller is fire-and-forget (boot, the debounce), so a failed
+         repaint must not surface as an unhandled rejection */
+    } finally {
+      resolvingAncestors = false;
+    }
+    return merged;
+  }
+
+  // ONE outstanding obligation to resolve, armed by the things that expose
+  // missing ancestors — the initial load, a settled viewport gesture, a reveal —
+  // and never by anything periodic. Arming twice before it is spent is still one
+  // resolve.
+  let ancestorResolveOwed = false;
+
+  function armAncestorResolve() {
+    if (destroyed) return;
+    ancestorResolveOwed = true;
+    settleAncestorResolve();
+  }
+
+  // …and SPENT only on a settled ingestion — the same gate, for the same reason,
+  // that #111 prunes on. An unsettled walk means "the parent has not been fetched
+  // YET", not "this span is an orphan": every paged walk is capped
+  // (MAX_POLL_PAGES), so a deep fill hands back a store that is only half loaded,
+  // and the initial load is the sharpest case of all because almost nothing above
+  // the window has arrived. Resolving there asks Phoenix for spans already on
+  // their way, and asks about page six's orphans while page seven's — merged in
+  // later by a tick that schedules nothing — are never asked about at all. So the
+  // obligation waits for `ingestionSettled()` and is spent by whichever path
+  // finishes last (#108).
+  function settleAncestorResolve() {
+    if (destroyed || !ancestorResolveOwed || !ingestionSettled()) return;
+    ancestorResolveOwed = false;
+    resolveAncestors();
+  }
+
+  // Pan/zoom arrive as a burst of events, so the obligation is armed once the
+  // gesture stops. Debounced, never periodic: no timer re-arms itself here.
+  let ancestorTimer = null;
+  function scheduleAncestorResolve() {
+    if (destroyed) return;
+    if (ancestorTimer) clearTimeout(ancestorTimer);
+    ancestorTimer = setTimeout(() => {
+      ancestorTimer = null;
+      armAncestorResolve();
+    }, ANCESTOR_SETTLE_MS);
+  }
+
+  // THE viewport-gesture commit point: pull the history the new window exposes,
+  // and owe a resolve for whatever that turns out to leave orphaned — spent once
+  // those pages have actually landed, not while they are still being walked.
+  function viewportChanged() {
+    loadHistory();
+    scheduleAncestorResolve();
+  }
+
   let polling = false;
   async function pollTick(manual) {
     if (destroyed || polling || (!manual && document.hidden)) return;
@@ -1871,6 +2203,10 @@ export function mount(container, opts = {}) {
     const resumeOnly = !manual && !live;
     if (resumeOnly && !revealPending && !walkOwed(WALK_LIVE)) {
       capPausedStore(); // a paused view still ingests history — see below
+      // A paused view ingests down other paths (a history walk resumed above), so
+      // an owed resolve is spent here too — this early return is the only thing a
+      // paused tick runs, and it is exactly the mode this bug is hit in (#108).
+      settleAncestorResolve();
       return;
     }
     polling = true;
@@ -1908,6 +2244,11 @@ export function mount(container, opts = {}) {
       // how a unit gets broken. Rebuild once more on whatever the cap took (#111).
       if (ingestionSettled() && pruneSpans()) buildLayout();
       requestDraw();
+      // If this is the tick that finished the fill — the deep backlog boot could
+      // not drain, the retry after a failed page — an owed resolve is spent now,
+      // on the whole store rather than on the part of it that had arrived when
+      // the obligation was armed (#108).
+      settleAncestorResolve();
     }
   }
 
@@ -2011,6 +2352,12 @@ export function mount(container, opts = {}) {
         projectFetching.delete(p.id);
       }
     }
+    // The pan that armed the obligation is only really settled once its pages
+    // land — several ticks later for a gap deeper than the page cap. Spending it
+    // here, and only when every walk is finished, is what gets the freshly paged
+    // history its ancestors without a second gesture; a partial drain spends
+    // nothing, because a walk still owed has not yet said what is orphaned (#108).
+    settleAncestorResolve();
   }
 
   // ── Layout: project → agent lane → worker sub-lanes → session bands → tree ──
@@ -3065,7 +3412,7 @@ export function mount(container, opts = {}) {
       windowMs = next;
     }
     clampScroll();
-    loadHistory();
+    viewportChanged();
     requestDraw();
   }
 
@@ -3076,7 +3423,7 @@ export function mount(container, opts = {}) {
     viewEnd = snapped.viewEnd;
     if (snapped.live) setLive(true);
     else pauseLive();
-    loadHistory();
+    viewportChanged();
     requestDraw();
   }
 
@@ -3184,7 +3531,7 @@ export function mount(container, opts = {}) {
       if (viewEnd > Date.now()) {
         viewEnd = Date.now();
       }
-      loadHistory();
+      viewportChanged();
       requestDraw();
       return;
     }
@@ -3299,6 +3646,12 @@ export function mount(container, opts = {}) {
     // Only a SETTLED reveal gets to report — a walk the page cap cut short is
     // still owed, and the poll timer below finishes it and reports then (#109).
     if (revealTarget && !revealPending) finishReveal();
+    // Whatever the initial load pulled, the run/turn roots above it may have
+    // started before the window and be missing entirely, and there is no gesture
+    // coming to trigger a resolve — opening the panel mid-run is the other way
+    // this bug is hit. So arm the obligation: it is spent here if the fill above
+    // actually settled, and otherwise on whichever tick finishes it (#108).
+    armAncestorResolve();
     pollTimer = setInterval(() => pollTick(false), POLL_MS);
     booted = true;
     // `live` is `!revealTarget` unless setState() restored a paused window
@@ -3361,7 +3714,9 @@ export function mount(container, opts = {}) {
       buildLayout();
       setLive(live);
       requestDraw();
-      if (!live) loadHistory();
+      // A restored window is a viewport change like any other: it can land on
+      // history whose run/turn roots start before it (#108).
+      if (!live) viewportChanged();
     }
     return true;
   }
@@ -3371,6 +3726,20 @@ export function mount(container, opts = {}) {
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
+    }
+    // A debounced resolve must not fire into a dead mount, and one already in
+    // flight stops at its next checkpoint (`destroyed`) while the abort drops
+    // whatever is on the wire (#108).
+    if (ancestorTimer) {
+      clearTimeout(ancestorTimer);
+      ancestorTimer = null;
+    }
+    if (ancestorAbort) {
+      try {
+        ancestorAbort.abort();
+      } catch (_e) {
+        /* aborting is best-effort */
+      }
     }
     window.removeEventListener("resize", onResize);
   }
