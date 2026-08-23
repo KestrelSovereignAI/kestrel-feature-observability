@@ -3559,11 +3559,13 @@ process.stdout.write(JSON.stringify({ total: spans.length, cycles, warnings }));
 # never pulled while its children — which started inside it — page in fine. Pan
 # back, or open the panel mid-run, and the run is a scatter of orphaned tool ticks
 # with no parent band. The parents are fetched EXACTLY, by span id, on demand:
-# once the initial load settles and once a pan/zoom settles. There is no periodic
+# the initial load and a settled pan/zoom each OWE one resolve, spent only once
+# the ingestion itself has settled — the gate #111 prunes on, because a walk still
+# in flight or truncated has not yet said what is orphaned. There is no periodic
 # resolver — that is what turned the previous attempt into request storms.
 
 _ANCESTOR_PLAN_HARNESS = r"""
-import { orphanParentIds, ancestorRequestPlan, ancestorAskKey } from "./timeline.js";
+import { ancestorFrontier, ancestorRequestPlan, ancestorAskKey } from "./timeline.js";
 
 const span = (spanId, parentId, projectId = "P1") => ({
   id: `node-${spanId}`,
@@ -3571,25 +3573,43 @@ const span = (spanId, parentId, projectId = "P1") => ({
   parentId: parentId || null,
   projectId,
 });
-const pairs = (map) => [...map].map(([p, ids]) => [p, [...ids].sort()]);
 const shape = (plan) => ({
-  requests: plan.requests.map((r) => ({ projectId: r.projectId, ids: r.ids })),
+  requests: plan.requests.map((r) => ({ projectId: r.projectId, depth: r.depth, ids: r.ids })),
   carried: plan.carried,
 });
-// A pass is planned over a FRONTIER — one generation's orphan parents, fixed
-// before any of them is fetched — never over the store directly, so draining a
-// wide generation across several passes cannot pick up the next generation's ids.
-const plan = (loaded, asked, opts) => ancestorRequestPlan(orphanParentIds(loaded), asked, opts);
+// A pass is planned over a FRONTIER — orphan parents, each stamped with the hop
+// count it sits at — never over the store directly, so what one pass could not
+// afford is carried WITH ITS DEPTH rather than re-derived as if it were fresh.
+const frontier = (loaded, depths, maxDepth) => ancestorFrontier(loaded, depths, maxDepth);
+const plan = (loaded, asked, opts) => ancestorRequestPlan(frontier(loaded), asked, opts);
 const out = {};
 
-// The bug's starting state: one loaded tool whose turn is not in the store.
-out.orphans = pairs(orphanParentIds([span("tool", "turn-1")]));
+// The bug's starting state: one loaded tool whose turn is not in the store — one
+// hop out, since nothing fetched the tool for us.
+out.orphans = frontier([span("tool", "turn-1")]);
 // A whole loaded chain owes nothing, and a parentless root asks for nothing.
-out.chainLoaded = pairs(
-  orphanParentIds([span("run", null), span("turn", "run"), span("tool", "turn")]),
-);
+out.chainLoaded = frontier([span("run", null), span("turn", "run"), span("tool", "turn")]);
 
-// Batched per project: the fetch goes THROUGH a project node, so ids never mix.
+// Depth ACCUMULATES from the span that revealed the orphan: a parent named by a
+// span this run fetched at hop 3 is itself at hop 4 — and at the cap it is not
+// returned at all, which is how the chain is left orphaned rather than chased.
+{
+  const loaded = [span("deep", "deeper")];
+  const depths = new Map([[ancestorAskKey("P1", "deep"), 3]]);
+  out.accumulated = frontier(loaded, depths, 8);
+  out.pastTheCap = frontier(loaded, new Map([[ancestorAskKey("P1", "deep"), 8]]), 8);
+}
+
+// Two children naming one parent is ONE ask, at the shallowest hop count either
+// of them claims.
+{
+  const loaded = [span("far", "shared-parent"), span("near", "shared-parent")];
+  const depths = new Map([[ancestorAskKey("P1", "far"), 4]]);
+  out.shallowest = frontier(loaded, depths, 8);
+}
+
+// Batched per (project, depth): the fetch goes THROUGH a project node, so ids
+// never mix, and a request's depth is what the ids it reveals are measured from.
 {
   const loaded = [];
   for (let i = 0; i < 5; i++) loaded.push(span(`c${i}`, `p${i}`));
@@ -3598,22 +3618,28 @@ out.chainLoaded = pairs(
 }
 
 // The per-pass cap CARRIES its surplus instead of dropping it (#105 lost every
-// ancestor past its first 800 ids): the ids one pass could not afford are
-// reported, and the next pass — which shares the run's `asked` set — asks for
-// exactly those, so the union is every id and no id is asked twice.
+// ancestor past its first 800 ids): the entries one pass could not afford come
+// back whole — depth included — and the next pass, which shares the run's `asked`
+// set, asks for exactly those, so the union is every id and no id is asked twice.
 {
   const loaded = [];
   for (let i = 0; i < 5; i++) loaded.push(span(`c${i}`, `p${i}`));
+  // Every orphan here was revealed at hop 5, so the carried remainder must still
+  // be asked for as hop 6 — a carry that reset the depth to 1 would let this
+  // chain walk five hops further than the cap allows.
+  const depths = new Map();
+  for (let i = 0; i < 5; i++) depths.set(ancestorAskKey("P1", `c${i}`), 5);
   const asked = new Set();
-  const first = plan(loaded, asked, { budget: 3, batchSize: 2 });
+  const first = ancestorRequestPlan(frontier(loaded, depths, 8), asked, { budget: 3, batchSize: 2 });
   for (const req of first.requests) {
     for (const id of req.ids) asked.add(ancestorAskKey(req.projectId, id));
   }
-  const second = plan(loaded, asked, { budget: 3, batchSize: 2 });
+  // The next pass plans over the CARRIED entries, not a re-read of the store.
+  const second = ancestorRequestPlan(first.carried, asked, { budget: 3, batchSize: 2 });
   for (const req of second.requests) {
     for (const id of req.ids) asked.add(ancestorAskKey(req.projectId, id));
   }
-  const third = plan(loaded, asked, { budget: 3, batchSize: 2 });
+  const third = ancestorRequestPlan(second.carried, asked, { budget: 3, batchSize: 2 });
   out.carry = {
     first: shape(first),
     second: shape(second),
@@ -3644,22 +3670,29 @@ process.stdout.write(JSON.stringify(out));
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_ancestor_request_plan_batches_per_project_and_carries_the_surplus(tmp_path):
-    """The pure half of the backfill: who is orphaned, and what one pass asks."""
+    """The pure half of the backfill: who is orphaned, at what depth, and what
+    one pass asks for."""
     pkg = _module_dir(tmp_path)
     result = _run_scenario(pkg, "ancestor-plan.mjs", _ANCESTOR_PLAN_HARNESS)
 
-    assert result["orphans"] == [["P1", ["turn-1"]]]
+    assert result["orphans"] == [{"projectId": "P1", "spanId": "turn-1", "depth": 1}]
     assert result["chainLoaded"] == []
+
+    # Depth rides with the id: one hop past the span that revealed it, and past
+    # the cap it is not offered at all.
+    assert result["accumulated"] == [{"projectId": "P1", "spanId": "deeper", "depth": 4}]
+    assert result["pastTheCap"] == []
+    assert result["shallowest"] == [{"projectId": "P1", "spanId": "shared-parent", "depth": 1}]
 
     # One request per batch, and a project boundary always ends a batch.
     assert result["batching"] == {
         "requests": [
-            {"projectId": "P1", "ids": ["p0", "p1"]},
-            {"projectId": "P1", "ids": ["p2", "p3"]},
-            {"projectId": "P1", "ids": ["p4"]},
-            {"projectId": "P2", "ids": ["other-parent"]},
+            {"projectId": "P1", "depth": 1, "ids": ["p0", "p1"]},
+            {"projectId": "P1", "depth": 1, "ids": ["p2", "p3"]},
+            {"projectId": "P1", "depth": 1, "ids": ["p4"]},
+            {"projectId": "P2", "depth": 1, "ids": ["other-parent"]},
         ],
-        "carried": 0,
+        "carried": [],
     }
 
     # Budget 3 of 5 ids: two are CARRIED, and the next pass asks for those two —
@@ -3667,24 +3700,29 @@ def test_ancestor_request_plan_batches_per_project_and_carries_the_surplus(tmp_p
     carry = result["carry"]
     assert carry["first"] == {
         "requests": [
-            {"projectId": "P1", "ids": ["p0", "p1"]},
-            {"projectId": "P1", "ids": ["p2"]},
+            {"projectId": "P1", "depth": 6, "ids": ["p0", "p1"]},
+            {"projectId": "P1", "depth": 6, "ids": ["p2"]},
         ],
-        "carried": 2,
+        # The surplus keeps the hop count it was discovered at — a carry that
+        # reset it to 1 would make the depth bound unenforceable.
+        "carried": [
+            {"projectId": "P1", "spanId": "p3", "depth": 6},
+            {"projectId": "P1", "spanId": "p4", "depth": 6},
+        ],
     }
     assert carry["second"] == {
-        "requests": [{"projectId": "P1", "ids": ["p3", "p4"]}],
-        "carried": 0,
+        "requests": [{"projectId": "P1", "depth": 6, "ids": ["p3", "p4"]}],
+        "carried": [],
     }
-    assert carry["third"] == {"requests": [], "carried": 0}
+    assert carry["third"] == {"requests": [], "carried": []}
     assert carry["asked"] == [f"P1 p{i}" for i in range(5)]
 
     # A cycle cannot spin: an id asked once in a run is never asked again.
-    assert result["askedSuppresses"] == {"requests": [], "carried": 0}
+    assert result["askedSuppresses"] == {"requests": [], "carried": []}
     # …and "asked" is per (project, span id), so the other project still asks.
     assert result["perProject"] == {
-        "requests": [{"projectId": "P2", "ids": ["shared"]}],
-        "carried": 0,
+        "requests": [{"projectId": "P2", "depth": 1, "ids": ["shared"]}],
+        "carried": [],
     }
 
 
@@ -3990,6 +4028,193 @@ process.stdout.write(JSON.stringify({
     # Both chains are on the canvas — the page-seven orphan is no longer a loose
     # tick, and it took no viewport gesture to get there.
     assert {"early run", "early turn", "late run", "late turn"} <= set(result["settledFrame"])
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_ancestor_resolve_waits_for_the_history_walk_a_pan_opened(tmp_path):
+    """A pan owes ONE resolve, spent when its pages land — not while they page.
+
+    The gesture is not the settle. A pan opens a gap that is walked over several
+    ticks against a server that is genuinely slow, and while that walk is owed the
+    store is a half-loaded set in which "the parent has not been fetched yet" is
+    indistinguishable from "this span is orphaned". Resolving there asks Phoenix
+    for spans already on their way — and asks again on every partial drain, which
+    is the request loop this design exists to avoid. So the obligation is gated on
+    the same settled cycle #111 prunes on: no exact-id query while the walk is
+    held or truncated, exactly one resolve once it finishes.
+    """
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "ancestor-history-settle.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const GAP_START = T0 - 60 * MIN; // the pan target
+const GAP_END = T0 - 30 * MIN;   // …and the floor the boot walk commits
+const STEP = 500;
+const FILL = 3200; // 7 pages of gap once the marked spans are counted
+
+// The chain only an exact-id fetch can reach: both hops start before the pan
+// target, so no page of the history walk can ever return them.
+const RUN_ROOT = hexId("aa", 1);
+const TURN = hexId("aa", 2);
+// A parent the WALK ITSELF delivers — in the same millisecond as its child, on
+// the far side of the page cap (the boundary shape #109 pins down). Asking for it
+// by exact id would be the resolve mistaking "not fetched yet" for "orphaned".
+const LATE_PARENT = hexId("bb", 1);
+const LATE_TIE = GAP_START + 2997 * STEP + 250; // page 6 ends on the child, 7 opens on the parent
+
+const spans = [];
+for (let i = 0; i < FILL; i++) {
+  spans.push(rawSpan({
+    id: `fill-${String(i).padStart(5, "0")}`, name: `fill ${i}`,
+    start: GAP_START + i * STEP, dur: 200, agent: "gapfill", spanId: hexId("f0", i),
+    session: "fill", traceId: "fill", projectId: PROJECT.id,
+  }));
+}
+// The live window: parentless, so BOOT's own resolve asks for nothing and every
+// exact-id request in this scenario belongs to the pan.
+for (let i = 0; i < 3; i++) {
+  spans.push(rawSpan({
+    id: `recent-${i}`, name: `recent ${i}`, start: T0 - (20 - i * 4) * MIN, dur: 60_000,
+    agent: "recent", spanId: hexId("ee", i), session: "recent", traceId: "recent",
+    projectId: PROJECT.id,
+  }));
+}
+spans.push(rawSpan({
+  id: "old-root", name: "old run", start: T0 - 150 * MIN, dur: 100 * MIN,
+  agent: "talon", spanId: RUN_ROOT, kind: "AGENT", session: "run-old",
+  traceId: "trace-old", projectId: PROJECT.id,
+}));
+spans.push(rawSpan({
+  id: "old-turn", name: "Implement", start: T0 - 90 * MIN, dur: 40 * MIN,
+  agent: "talon", spanId: TURN, parentId: RUN_ROOT, kind: "LLM",
+  session: "run-old", traceId: "trace-old", projectId: PROJECT.id,
+}));
+// The orphan the pan exposes: in the gap, both its ancestors before it.
+spans.push(rawSpan({
+  id: "gap-tool", name: "gap Bash", start: GAP_START + 1000, dur: 6 * MIN,
+  agent: "talon", spanId: hexId("ac", 3), parentId: TURN, session: "run-old",
+  traceId: "trace-old", projectId: PROJECT.id,
+}));
+// Ids order the tie: the child is the LAST span of page 6, its parent the FIRST
+// of page 7 — loaded and orphaned at truncation, reunited by the resuming tick.
+spans.push(rawSpan({
+  id: "za-late-child", name: "late child", start: LATE_TIE, dur: 5 * MIN,
+  agent: "late", spanId: hexId("bc", 2), parentId: LATE_PARENT, session: "late",
+  traceId: "late", projectId: PROJECT.id,
+}));
+spans.push(rawSpan({
+  id: "zb-late-parent", name: "late parent", start: LATE_TIE, dur: 8 * MIN,
+  agent: "late", spanId: LATE_PARENT, kind: "CHAIN", session: "late",
+  traceId: "late", projectId: PROJECT.id,
+}));
+
+// Call 0 is the boot page; call 1 is the pan's FIRST history page, parked in
+// flight so the walk is unsettled for as long as the scenario wants it to be.
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans, holdCalls: [1] });
+const exactCount = () => phoenix.calls.filter((c) => c.filter != null).length;
+// Well past ANCESTOR_SETTLE_MS: if the debounce were the settle, the resolve
+// would have fired several times over by the time this returns.
+const waitOutDebounce = async () => {
+  for (let i = 0; i < 160; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+};
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+
+await settle(phoenix.calls);
+const bootCalls = phoenix.calls.length;
+
+// 1. Pan back, PAUSED. The first page of the gap is held: a real Phoenix is slow,
+//    and this is the window in which the store knows least.
+mounted.setState({
+  windowMs: 30 * MIN, viewEnd: GAP_END, live: false,
+  laneScrollY: 0, collapsed: [], highlightedSpanId: null,
+});
+await waitLong(() => phoenix.held().includes(1), "the pan issued no history page");
+await waitOutDebounce();
+const whileHeld = { calls: phoenix.calls.length, exact: exactCount() };
+
+// 2. Release it: the walk runs on to the page cap and stops there, still owing
+//    the rest of the gap — and still not a settle.
+phoenix.release(1);
+await settle(phoenix.calls);
+await waitOutDebounce();
+const whileTruncated = {
+  calls: phoenix.calls.length,
+  exact: exactCount(),
+  child: phoenix.served.includes("za-late-child"),
+  parent: phoenix.served.includes("zb-late-parent"),
+};
+
+// 3. The tick that finishes the walk spends the obligation — once.
+forgetFrames(canvas);
+tick();
+await waitLong(
+  () => frameText(lastFrame(canvas)).includes("old run"),
+  "the pre-window run band never painted",
+);
+await settle(phoenix.calls);
+const afterResume = callLog(phoenix.calls).slice(whileTruncated.calls);
+
+// 4. …and no later tick asks again: there is no periodic resolver.
+tick();
+await settle(phoenix.calls);
+tick();
+await settle(phoenix.calls);
+await waitOutDebounce();
+const trailing = exactCount();
+
+const settledFrame = [...new Set(frameText(lastFrame(canvas)))];
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  bootCalls,
+  whileHeld,
+  whileTruncated,
+  afterResume,
+  trailing,
+  settledFrame,
+  ids: { RUN_ROOT, TURN, LATE_PARENT },
+}));
+""",
+    )
+
+    ids = result["ids"]
+    # Boot is one live page over the visible window; its own resolve has nothing
+    # to ask about, so every exact-id query below belongs to the pan.
+    assert result["bootCalls"] == 1
+
+    # Held: the walk is in flight and the debounce has long since fired. The
+    # obligation is owed, not spent — no exact-id query at all.
+    assert result["whileHeld"] == {"calls": 2, "exact": 0}
+
+    # Truncated at the page cap: the walk is owed rather than in flight now, which
+    # is the other half of "unsettled" — still nothing asked. The tie pair really
+    # is split, so the late child IS a loaded orphan at this moment.
+    assert result["whileTruncated"]["calls"] == 1 + MAX_POLL_PAGES
+    assert result["whileTruncated"]["exact"] == 0
+    assert result["whileTruncated"]["child"] is True
+    assert result["whileTruncated"]["parent"] is False
+
+    # The resuming tick pages the rest of the gap in, and only THEN resolves: hop
+    # one for the turn, hop two for the run root.
+    resume = result["afterResume"]
+    assert [c["exactIds"] for c in resume] == [None, [ids["TURN"]], [ids["RUN_ROOT"]]]
+    assert resume[0]["hasNext"] is False  # the walk that finished is what settled it
+    # The parent that was merely late is never asked for by exact id — a span
+    # whose parent arrives later in the same walk was never treated as orphaned.
+    asked = [i for c in resume if c["exactIds"] for i in c["exactIds"]]
+    assert ids["LATE_PARENT"] not in asked
+
+    # One resolve for one pan: the ticks after it ask for nothing more.
+    assert result["trailing"] == 2
+    # Both bands are on the canvas — the backfilled chain and the reunited pair.
+    assert {"old run", "Implement", "gap Bash", "late parent", "late child"} <= set(
+        result["settledFrame"]
+    )
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")

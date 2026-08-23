@@ -38,15 +38,18 @@ process boundaries):
   leave the children as loose ticks under no parent. The Timeline backfills the
   missing parents by **exact OTel span id** (Phoenix's `span_id in […]` filter
   condition, which needs no time window at all), hopping up until it reaches a
-  parentless root. It resolves **on demand** — once the initial load genuinely
-  settles (the walk that fills the window may take several ticks to drain) and
-  once a pan/zoom settles, which covers the paused and panned views the live poll
-  deliberately skips — never on a retry timer. Depth and breadth are bounded
-  independently: a fixed number of ancestor generations for the whole resolve, so
-  a wide graph cannot buy itself extra hops, and a fixed number of ids per pass,
-  the surplus carried to the next pass rather than dropped. A parent that never comes back
-  (never exported, aged out of Phoenix) is simply left orphaned at its best-known
-  depth rather than chased.
+  parentless root. It resolves **on demand** — the initial load and a settled
+  pan/zoom each owe exactly one resolve, which covers the paused and panned views
+  the live poll deliberately skips — never on a retry timer. An owed resolve is
+  spent only on a **settled ingestion**, the same gate the memory cap prunes on:
+  while a paged walk is in flight or truncated, "the parent has not been fetched
+  yet" is indistinguishable from "this span is orphaned", so resolving there
+  would ask Phoenix for spans already on their way. Depth and breadth are bounded
+  independently: a fixed number of hops from any loaded span, carried with each
+  id so a wide graph cannot buy itself extra depth, and a fixed number of ids per
+  pass, the surplus carried to the next pass rather than dropped. A parent that
+  never comes back (never exported, aged out of Phoenix) is simply left orphaned
+  at its best-known depth rather than chased.
   **Navigator** answers where it
   fits with the hierarchical Tenant → Fleet → Agent → Subagent → Session → Turn
   → Events tree and a persistent inspector for the selected Turn/Event span;
