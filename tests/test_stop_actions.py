@@ -645,6 +645,97 @@ process.stdout.write(JSON.stringify({ calls, first, model, second }));
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_reselection_keeps_indeterminate_route_and_late_completion(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "retained-reselection.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+const routes = [];
+const controller = createStopController({
+  correlationIdFactory: () => "corr-retained-reselection",
+  api: {
+    async requestForAgent(_path, _options, agent) {
+      routes.push(agent);
+      throw new Error("response lost after possible commit");
+    },
+  },
+});
+const original = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#retained",
+}, { completionKnown: true, completed: false });
+controller.select(original);
+await controller.stopSelected();
+controller.observe(stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#retained",
+}, { completionKnown: true, completed: true }));
+controller.clearSelection();
+const staleRenamed = stopTargetFromDetail({
+  agent: "Wrong redraw route",
+  agentDid: "did:kestrel:emma",
+  turnId: "emma#retained",
+}, { completionKnown: true, completed: false });
+controller.select(staleRenamed);
+const selected = controller.selected()[0];
+const outcomes = await controller.stopSelected();
+process.stdout.write(JSON.stringify({ routes, selected, outcomes }));
+""",
+    )
+
+    assert result["routes"] == ["Emma"]
+    assert result["selected"]["agentName"] == "Emma"
+    assert result["selected"]["completed"] is True
+    assert result["outcomes"][0]["state"] == "already_complete"
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_synthetic_unknown_lane_is_not_a_stop_route(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "synthetic-route.mjs",
+        r"""
+import {
+  ATTR_AGENT_DID,
+  ATTR_AGENT_NAME,
+  ATTR_TURN_ID,
+  UNKNOWN_AGENT,
+  normalizeSpanDetail,
+  stopTargetFromDetail,
+} from "./phoenix.js";
+const unstamped = normalizeSpanDetail({
+  name: "turn",
+  attributes: {
+    [ATTR_AGENT_DID]: "did:kestrel:missing-route",
+    [ATTR_TURN_ID]: "missing-route#1",
+  },
+}, { agent: UNKNOWN_AGENT });
+const stampedUnknown = normalizeSpanDetail({
+  name: "turn",
+  attributes: {
+    [ATTR_AGENT_NAME]: "unknown",
+    [ATTR_AGENT_DID]: "did:kestrel:real-unknown",
+    [ATTR_TURN_ID]: "unknown#1",
+  },
+}, { agent: UNKNOWN_AGENT });
+process.stdout.write(JSON.stringify({
+  unstampedDetail: unstamped,
+  unstampedTarget: stopTargetFromDetail(unstamped),
+  stampedTarget: stopTargetFromDetail(stampedUnknown),
+}));
+""",
+    )
+
+    assert result["unstampedDetail"]["agent"] == "unknown"
+    assert result["unstampedDetail"]["agentRoute"] is None
+    assert result["unstampedTarget"]["addressable"] is False
+    assert "agent route" in result["unstampedTarget"]["missing"]
+    assert result["stampedTarget"]["addressable"] is True
+    assert result["stampedTarget"]["agentName"] == "unknown"
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_navigator_completion_requires_untruncated_refreshable_inventory(tmp_path):
     pkg = _module_dir(tmp_path)
     (pkg / "navigator.js").write_text(

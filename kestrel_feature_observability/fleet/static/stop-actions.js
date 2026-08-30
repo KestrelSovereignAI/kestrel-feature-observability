@@ -245,7 +245,17 @@ export function createStopController({
       observe(target);
       return true;
     }
-    selected.set(target.key, target);
+    // A dismissed/deselected ambiguous operation still owns its original
+    // durable correlation and route. Re-selecting the same DID/turn must not
+    // replace that target with stale redraw metadata; merge only lifecycle
+    // evidence into the retained operation target.
+    const retainedTarget = storedResult(target.key)?.target;
+    selected.set(
+      target.key,
+      retainedTarget
+        ? mergeCompletionEvidence(retainedTarget, target)
+        : target,
+    );
     emit();
     return true;
   }

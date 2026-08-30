@@ -689,6 +689,7 @@ export function normalizeSpanDetail(span, context = {}) {
   );
 
   const attrAgent = getAttr(attrs, ATTR_AGENT_NAME);
+  const stampedAgentRoute = present(attrAgent) ? baseAgentName(attrAgent) : null;
   const sess = sessionKeyOf(attrs);
   const statusRaw = firstPresent(source.status, source.statusCode);
   const status = present(statusRaw) ? String(statusRaw).toLowerCase() : null;
@@ -724,7 +725,7 @@ export function normalizeSpanDetail(span, context = {}) {
     context.agent,
     context.agentName,
     source.agent,
-    present(attrAgent) ? baseAgentName(attrAgent) : null,
+    stampedAgentRoute,
   );
   const worker = firstPresent(context.worker, source.worker, workerOf(attrs));
   const sessionId = firstPresent(
@@ -765,6 +766,10 @@ export function normalizeSpanDetail(span, context = {}) {
     endMs,
     durationMs,
     agent: present(agent) ? String(agent) : null,
+    // Mutation routing is trace-stamped identity, not the Timeline/Navigator
+    // display lane. In particular, the synthetic `unknown` lane must never
+    // become a request route merely because no agent-name attribute arrived.
+    agentRoute: present(stampedAgentRoute) ? String(stampedAgentRoute) : null,
     feature: present(feature) ? String(feature) : null,
     orchestrator: present(orchestrator) ? String(orchestrator) : null,
     runId: present(runId) ? String(runId) : null,
@@ -828,7 +833,14 @@ export function stopTargetFromDetail(
   { completed = false, completionKnown = true } = {},
 ) {
   const source = detail && typeof detail === "object" ? detail : {};
-  const agentName = canonicalStopText(source.agent);
+  const hasStampedRoute = Object.prototype.hasOwnProperty.call(
+    source,
+    "agentRoute",
+  );
+  const agentName = canonicalStopText(
+    hasStampedRoute ? source.agentRoute : source.agent,
+  );
+  const displayAgent = canonicalStopText(source.agent) || agentName;
   const agentDid = canonicalStopText(source.agentDid);
   const turnId = canonicalStopText(source.turnId);
   const missing = [];
@@ -845,7 +857,10 @@ export function stopTargetFromDetail(
     turnId,
     traceId: canonicalStopText(source.traceId),
     spanId: canonicalStopText(source.spanId),
-    label: agentName && turnId ? `${agentName} · ${turnId}` : source.displayName || "Turn",
+    label:
+      displayAgent && turnId
+        ? `${displayAgent} · ${turnId}`
+        : source.displayName || "Turn",
     completed: completed === true,
     completionKnown: completionKnown === true,
   });
