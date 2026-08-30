@@ -71,6 +71,7 @@ import {
   gql,
   PROJECTS_QUERY,
   SPAN_PAGE_QUERY,
+  TRACE_SPANS_QUERY,
   spanIdFilter,
   escapeHtml,
   parseAttributes,
@@ -96,6 +97,7 @@ const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 min visible window
 const MIN_WINDOW_MS = 60 * 1000; // 1 min (max zoom-in)
 const MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 h (max zoom-out)
 const PAGE_SIZE = 500; // spans per GraphQL page
+const TURN_TRACE_SPAN_LIMIT = 1000; // focused completion check; a full page is unknown
 const MAX_POLL_PAGES = 6; // per-project drain cap per tick (backlog catch-up)
 const MAX_HISTORY_ROUNDS = 4; // bounded walks per history pass (viewport moved mid-fetch)
 const SPAN_CAP = 60_000; // memory guard — evict oldest CLOSED SESSIONS beyond this (#111)
@@ -810,6 +812,38 @@ export function openStartFloors(spanIter) {
   return floors;
 }
 
+/** Resolve completion only when the supplied turn inventory is authoritative. */
+export function turnCompletionEvidence(
+  spanIter,
+  detail,
+  { truncated = false } = {},
+) {
+  const target = detail && typeof detail === "object" ? detail : {};
+  let completed = false;
+  if (target.turnId && target.agentDid) {
+    for (const candidate of spanIter || []) {
+      const candidateDetail = normalizeSpanDetail(candidate);
+      if (
+        candidateDetail.turnId !== target.turnId ||
+        candidateDetail.agentDid !== target.agentDid
+      ) {
+        continue;
+      }
+      if (
+        TURN_SUMMARY_RE.test(String(candidate.name || "")) ||
+        (candidate.rSummary && candidate.rOpen === false)
+      ) {
+        completed = true;
+        break;
+      }
+    }
+  }
+  return Object.freeze({
+    completed,
+    completionKnown: completed || truncated !== true,
+  });
+}
+
 // ── Ancestor backfill (#108) ──────────────────────────────────
 //
 // Every paged fetch is windowed on `startTime`, and Phoenix's `timeRange` filters
@@ -1447,6 +1481,8 @@ export function mount(container, opts = {}) {
   let layout = { rows: [], contentH: 0 };
   let drawn = []; // {x,y,w,h,span?,density?,count} for hit-testing (per frame)
   const rollupCache = new Map(); // spanId → memberRollup (invalidated by buildLayout)
+  const turnCompletionCache = new Map(); // project+trace → authoritative focused read
+  const turnCompletionLoads = new Map(); // same key → one in-flight GraphQL read
 
   // ── DOM scaffold ──
   container.innerHTML = `
@@ -3229,28 +3265,52 @@ export function mount(container, opts = {}) {
 
   // A leaf tool's own closed span does not mean its owning turn is complete.
   // Only the folded/actual turn summary closes the operator's Stop door.
-  function turnIsComplete(detail) {
-    if (!detail.turnId || !detail.agentDid) return false;
-    for (const candidate of spans.values()) {
-      const candidateDetail = normalizeSpanDetail(candidate);
-      if (
-        candidateDetail.turnId !== detail.turnId ||
-        candidateDetail.agentDid !== detail.agentDid
-      ) {
-        continue;
+  function turnCompletionKey(s) {
+    return s?.projectId && s?.traceId ? `${s.projectId}\u0000${s.traceId}` : null;
+  }
+
+  function knownTurnCompletion(s, detail) {
+    // The windowed store can prove completion when it contains the summary, but
+    // absence is not proof of liveness. A focused full-trace read supplies that.
+    const local = turnCompletionEvidence(spans.values(), detail, { truncated: true });
+    if (local.completed) return local;
+    return turnCompletionCache.get(turnCompletionKey(s)) || local;
+  }
+
+  function loadTurnCompletion(s, detail) {
+    const key = turnCompletionKey(s);
+    if (!key || turnCompletionCache.has(key) || turnCompletionLoads.has(key)) return;
+    const operation = (async () => {
+      try {
+        const data = await gql(TRACE_SPANS_QUERY, {
+          projectId: s.projectId,
+          traceId: s.traceId,
+          first: TURN_TRACE_SPAN_LIMIT,
+        });
+        const trace = data.node && data.node.trace;
+        if (!trace) return;
+        const focused = ((((trace || {}).spans || {}).edges) || [])
+          .map((edge) => edge && edge.node)
+          .filter(Boolean);
+        turnCompletionCache.set(
+          key,
+          turnCompletionEvidence(focused, detail, {
+            truncated: focused.length >= TURN_TRACE_SPAN_LIMIT,
+          }),
+        );
+      } catch (_error) {
+        // Unknown is load-bearing: a failed focused read never enables Stop.
+      } finally {
+        turnCompletionLoads.delete(key);
+        if (activePopoverSpan === s && !popEl.hidden) syncPopoverStopActions();
       }
-      if (
-        TURN_SUMMARY_RE.test(String(candidate.name || "")) ||
-        (candidate.rSummary && candidate.rOpen === false)
-      ) {
-        return true;
-      }
-    }
-    return false;
+    })();
+    turnCompletionLoads.set(key, operation);
   }
 
   function stopTargetForSpan(s, detail = spanDetail(s)) {
-    const target = stopTargetFromDetail(detail, { completed: turnIsComplete(detail) });
+    const completion = knownTurnCompletion(s, detail);
+    const target = stopTargetFromDetail(detail, completion);
     if (stopController) stopController.observe(target);
     return target;
   }
@@ -3365,6 +3425,7 @@ export function mount(container, opts = {}) {
 
   function showPopover(s, clientX, clientY) {
     const detail = spanDetail(s);
+    loadTurnCompletion(s, detail);
     const stopTarget = stopTargetForSpan(s, detail);
     const stopModel = stopActionModel(stopTarget, stopController);
     const canNav = Boolean(

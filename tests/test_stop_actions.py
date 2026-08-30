@@ -326,6 +326,99 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_unknown_and_confirmed_targets_are_never_redispatched(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "stop-guards.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+let calls = 0;
+const api = {
+  async requestForAgent(_path, options) {
+    calls += 1;
+    const body = JSON.parse(options.body);
+    return {
+      turn_id: body.turn_id,
+      stop_outcomes: [{
+        scope: "turn", requested_target: body.turn_id,
+        resolved_target: "request-1", agent_id: "did:kestrel:emma",
+        disposition: "stopped", correlation_id: body.correlation_id,
+      }],
+    };
+  },
+};
+const controller = createStopController({ api, correlationIdFactory: () => "corr-one" });
+const unknown = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#unknown",
+}, { completionKnown: false });
+controller.select(unknown);
+const unknownOne = await controller.stopOne(unknown);
+const unknownBatch = await controller.stopSelected();
+const known = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#unknown",
+}, { completionKnown: true, completed: false });
+controller.observe(known);
+const first = await controller.stopSelected();
+const replay = await controller.stopOne(known);
+const terminalBatch = await controller.stopSelected();
+process.stdout.write(JSON.stringify({
+  calls, unknownOne, unknownBatch, first, replay, terminalBatch,
+  selected: controller.selected(),
+}));
+""",
+    )
+
+    assert result["calls"] == 1
+    assert result["unknownOne"] is None
+    assert result["unknownBatch"] == []
+    assert result["first"][0]["state"] == "stopped"
+    assert result["replay"]["state"] == "stopped"
+    assert result["terminalBatch"] == []
+    assert result["selected"][0]["completionKnown"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_timeline_partial_inventory_keeps_completion_unknown(tmp_path):
+    pkg = _module_dir(tmp_path)
+    (pkg / "timeline.js").write_text(
+        (STATIC / "timeline.js").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    result = _run(
+        pkg,
+        "turn-completion.mjs",
+        r"""
+import { turnCompletionEvidence } from "./timeline.js";
+const detail = { turnId: "turn-4", agentDid: "did:kestrel:emma" };
+const root = {
+  name: "Emma turn 4",
+  attributes: JSON.stringify({
+    "kestrel.turn_id": "turn-4",
+    "kestrel.agent_did": "did:kestrel:emma",
+  }),
+};
+const summary = {
+  name: "turn 4 summary",
+  attributes: root.attributes,
+};
+process.stdout.write(JSON.stringify({
+  partial: turnCompletionEvidence([root], detail, { truncated: true }),
+  full: turnCompletionEvidence([root], detail, { truncated: false }),
+  completedPartial: turnCompletionEvidence([root, summary], detail, { truncated: true }),
+}));
+""",
+    )
+
+    assert result["partial"] == {"completed": False, "completionKnown": False}
+    assert result["full"] == {"completed": False, "completionKnown": True}
+    assert result["completedPartial"] == {
+        "completed": True,
+        "completionKnown": True,
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_mismatched_server_identity_is_indeterminate(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
@@ -436,6 +529,7 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "data-pstop" in timeline
     assert "data-pselect" in timeline
     assert "stopController.stopOne(stopTargetForSpan(s))" in timeline
+    assert "loadTurnCompletion(s, detail)" in timeline
     assert "data-inspector-stop" in navigator
     assert "data-inspector-select" in navigator
     assert "stopController.stopOne(stopTargetForNode" in navigator

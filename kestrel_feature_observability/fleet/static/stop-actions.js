@@ -21,6 +21,7 @@ const TERMINAL_DISPOSITIONS = new Set([
   "refused",
   "unreachable",
 ]);
+const CONFIRMED_STOP_DISPOSITIONS = new Set(["stopped", "already_complete"]);
 
 function presentString(value) {
   if (typeof value !== "string") return null;
@@ -171,10 +172,22 @@ export function createStopController({
     const target = canonicalTarget(candidate);
     if (!target) return false;
     const existing = selected.get(target.key);
-    if (!existing || existing.completed || !target.completed) return false;
+    if (!existing) return false;
+    const completionKnown =
+      existing.completionKnown === true || target.completionKnown === true;
+    const completed = existing.completed === true || target.completed === true;
+    if (
+      completionKnown === existing.completionKnown &&
+      completed === existing.completed
+    ) {
+      return false;
+    }
     // Lifecycle may advance on a later poll, but routing and identity remain
     // the exact values selected originally.
-    selected.set(target.key, Object.freeze({ ...existing, completed: true }));
+    selected.set(
+      target.key,
+      Object.freeze({ ...existing, completionKnown, completed }),
+    );
     emit();
     return true;
   }
@@ -227,8 +240,13 @@ export function createStopController({
     if (!original) return null;
     const pendingOperation = pendingOperations.get(original.key);
     if (pendingOperation) return pendingOperation;
-    const observed = selected.get(original.key);
-    const target = observed?.completed && !original.completed ? observed : original;
+    if (selected.has(original.key)) observe(original);
+    const target = selected.get(original.key) || original;
+    if (target.completionKnown !== true) return null;
+    const priorResult = results.get(target.key);
+    if (CONFIRMED_STOP_DISPOSITIONS.has(priorResult?.state)) {
+      return priorResult;
+    }
     if (target.completed) {
       const complete = completedResult(target);
       results.set(target.key, complete);
@@ -317,7 +335,14 @@ export function createStopController({
     // Snapshot exact targets before the first await.  Redraws, deselection, and
     // sub-tab switches cannot retarget an in-flight multi-Stop operation.
     const targets = selectedTargets().filter(
-      (target) => results.get(target.key)?.state !== "submitting",
+      (target) => {
+        const state = results.get(target.key)?.state;
+        return (
+          target.completionKnown === true &&
+          state !== "submitting" &&
+          !CONFIRMED_STOP_DISPOSITIONS.has(state)
+        );
+      },
     );
     return Promise.all(targets.map((target) => stopOne(target)));
   }
@@ -383,7 +408,15 @@ export function mountStopActionBar(element, controller) {
     const selected = controller.selected();
     const resultByKey = new Map(controller.results().map((result) => [result.key, result]));
     const dispatchable = selected.filter(
-      (target) => resultByKey.get(target.key)?.state !== "submitting",
+      (target) => {
+        const state = resultByKey.get(target.key)?.state;
+        return (
+          target.completionKnown === true &&
+          target.completed !== true &&
+          state !== "submitting" &&
+          !CONFIRMED_STOP_DISPOSITIONS.has(state)
+        );
+      },
     );
     const rows = new Map(selected.map((target) => [target.key, { target, result: null }]));
     for (const result of resultByKey.values()) {

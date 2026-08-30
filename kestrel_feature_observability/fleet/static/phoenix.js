@@ -786,20 +786,28 @@ export function stopActionModel(target, controller) {
   );
   const result = addressable ? controller?.getResult?.(target) : null;
   const pending = result?.state === "submitting";
+  const confirmed = result?.state === "stopped" || result?.state === "already_complete";
   return Object.freeze({
     addressable,
     selected: addressable && Boolean(controller?.isSelected?.(target)),
     pending,
-    disabled: !addressable || target.completionKnown !== true || target.completed || pending,
+    disabled:
+      !addressable ||
+      target.completionKnown !== true ||
+      target.completed ||
+      pending ||
+      confirmed,
     stopLabel: !addressable
       ? `Stop unavailable — missing ${target?.missing?.join(", ") || "canonical address"}`
       : target.completionKnown !== true
         ? "Checking turn state…"
-        : target.completed
-        ? "Already complete"
-        : pending
-          ? "Stopping…"
-          : "Stop turn",
+        : result?.state === "stopped"
+          ? "Stopped"
+          : target.completed || confirmed
+            ? "Already complete"
+            : pending
+              ? "Stopping…"
+              : "Stop turn",
   });
 }
 
