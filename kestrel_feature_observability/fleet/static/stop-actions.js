@@ -44,6 +44,21 @@ function canonicalTarget(value) {
   return value;
 }
 
+function mergeCompletionEvidence(target, ...evidence) {
+  if (!target) return target;
+  let completionKnown = target.completionKnown === true;
+  let completed = target.completed === true;
+  for (const item of evidence) {
+    completionKnown = completionKnown || item?.completionKnown === true;
+    completed = completed || item?.completed === true;
+  }
+  if (
+    completionKnown === target.completionKnown &&
+    completed === target.completed
+  ) return target;
+  return Object.freeze({ ...target, completionKnown, completed });
+}
+
 function defaultCorrelationId() {
   const cryptoApi = globalThis.crypto;
   if (cryptoApi && typeof cryptoApi.randomUUID === "function") {
@@ -178,19 +193,12 @@ export function createStopController({
 
     function advance(existing) {
       if (!existing) return existing;
-      const completionKnown =
-        existing.completionKnown === true || target.completionKnown === true;
-      const completed = existing.completed === true || target.completed === true;
-      if (
-        completionKnown === existing.completionKnown &&
-        completed === existing.completed
-      ) {
-        return existing;
-      }
+      const advanced = mergeCompletionEvidence(existing, target);
+      if (advanced === existing) return existing;
       changed = true;
       // Lifecycle advances monotonically, while routing and identity remain
       // the exact values captured by the original selection/operation.
-      return Object.freeze({ ...existing, completionKnown, completed });
+      return advanced;
     }
 
     const existingSelection = selected.get(target.key);
@@ -259,10 +267,31 @@ export function createStopController({
   }
 
   function storeResult(result) {
-    results.set(result.key, result);
-    if (CONFIRMED_STOP_DISPOSITIONS.has(result.state)) {
-      confirmedResults.set(result.key, result);
+    // A summary may prove completion while the network request is pending.
+    // The response was constructed from the operation's earlier target
+    // snapshot, so merge the retained monotonic evidence before replacing it.
+    const priorTarget = storedResult(result.key)?.target;
+    const target = mergeCompletionEvidence(result.target, priorTarget);
+    const retained =
+      target === result.target ? result : Object.freeze({ ...result, target });
+    results.set(retained.key, retained);
+    if (CONFIRMED_STOP_DISPOSITIONS.has(retained.state)) {
+      confirmedResults.set(retained.key, retained);
     }
+  }
+
+  function knownTargets() {
+    const byKey = new Map();
+    const retain = (target) => {
+      if (!target) return;
+      const existing = byKey.get(target.key);
+      byKey.set(target.key, mergeCompletionEvidence(target, existing));
+    };
+    for (const target of selected.values()) retain(target);
+    for (const store of [confirmedResults, results]) {
+      for (const result of store.values()) retain(result.target);
+    }
+    return [...byKey.values()];
   }
 
   function targetForKey(key) {
@@ -402,6 +431,7 @@ export function createStopController({
       return Boolean(key && selected.has(key));
     },
     selected: selectedTargets,
+    knownTargets,
     results: resultValues,
     targetForKey,
     getResult(candidateOrKey) {

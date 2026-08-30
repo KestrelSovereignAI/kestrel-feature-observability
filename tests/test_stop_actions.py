@@ -695,6 +695,70 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_pending_stop_cannot_overwrite_late_completion_evidence(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "pending-completion-race.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+
+let releaseResponse;
+let calls = 0;
+const responseGate = new Promise((resolve) => { releaseResponse = resolve; });
+const controller = createStopController({
+  correlationIdFactory: () => "corr-race",
+  api: {
+    async requestForAgent(_path, options) {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      await responseGate;
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn",
+          requested_target: body.turn_id,
+          resolved_target: body.turn_id,
+          agent_id: "did:kestrel:emma",
+          disposition: "refused",
+          correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#race",
+});
+const pending = controller.stopOne(target);
+await Promise.resolve();
+controller.observe(stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#race",
+}, { completed: true, completionKnown: true }));
+releaseResponse();
+const refused = await pending;
+const retained = controller.getResult(target);
+const retry = await controller.stopOne(controller.targetForKey(target.key));
+process.stdout.write(JSON.stringify({
+  refused: refused.state,
+  retainedCompleted: retained.target.completed,
+  knownCompleted: controller.knownTargets()[0].completed,
+  retry: retry.state,
+  calls,
+}));
+""",
+    )
+
+    assert result == {
+        "refused": "refused",
+        "retainedCompleted": True,
+        "knownCompleted": True,
+        "retry": "already_complete",
+        "calls": 1,
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_action_bar_dispatches_snapshot_and_keeps_partial_outcomes_visible(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
@@ -776,6 +840,7 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "stopTargetForNode(node);" in navigator
     assert "reconcileSelectedTurnCompletions();" in timeline
     assert "const completedTurns = turnCompletionIndex(spans.values());" in timeline
+    assert "stopController.knownTargets()" in timeline
     assert "turnCompletionEvidence(spans.values(), target" not in timeline
     assert "turnCompletionCache.get(key)?.completed === true" in timeline
     assert "turnCompletionCache.delete(key);" in timeline

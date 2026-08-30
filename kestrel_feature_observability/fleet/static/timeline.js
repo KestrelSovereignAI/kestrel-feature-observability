@@ -3362,12 +3362,12 @@ export function mount(container, opts = {}) {
   }
 
   function reconcileSelectedTurnCompletions() {
-    if (!stopController || typeof stopController.selected !== "function") return;
-    // Selection can contain many turns while the store contains up to 60,000
-    // spans. Index summaries once per layout instead of rescanning and
-    // normalizing the entire inventory once per selected target.
+    if (!stopController || typeof stopController.knownTargets !== "function") return;
+    // Selection and inspector-only results can contain many turns while the
+    // store contains up to 60,000 spans. Index summaries once per layout
+    // instead of rescanning the inventory once per retained target.
     const completedTurns = turnCompletionIndex(spans.values());
-    for (const target of stopController.selected()) {
+    for (const target of stopController.knownTargets()) {
       if (!completedTurns.has(turnCompletionIdentityKey(target))) continue;
       stopController.observe(
         Object.freeze({
