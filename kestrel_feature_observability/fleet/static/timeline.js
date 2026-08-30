@@ -63,6 +63,8 @@ import {
   ATTR_TOOL_OUTCOME,
   ATTR_FEATURE_NAME,
   ATTR_ORCHESTRATOR,
+  ATTR_TURN_ID,
+  ATTR_AGENT_DID,
   OUTCOME_COMPLETED,
   OUTCOME_IDLE,
   mintPhoenixSession,
@@ -84,6 +86,8 @@ import {
   renderSpanDetail,
   spanTooltipLines,
   buildNavigatorRevealTarget,
+  stopActionModel,
+  stopTargetFromDetail,
 } from "./phoenix.js";
 
 // ── Tuning ────────────────────────────────────────────────────
@@ -1390,6 +1394,7 @@ export function mount(container, opts = {}) {
 
   const openTrace = typeof opts.openTrace === "function" ? opts.openTrace : null;
   const openNavigator = typeof opts.openNavigator === "function" ? opts.openNavigator : null;
+  const stopController = opts.stopController || null;
   const revealTarget = opts.revealTarget || null;
 
   let destroyed = false;
@@ -1471,6 +1476,10 @@ export function mount(container, opts = {}) {
   const liveBtn = container.querySelector("[data-live]");
   const windowEl = container.querySelector("[data-window]");
   const ctx = canvas.getContext("2d");
+  let activePopoverSpan = null;
+  const stopUnsubscribe = stopController
+    ? stopController.subscribe(() => syncPopoverStopActions())
+    : () => {};
 
   let cssW = 0;
   let cssH = 0;
@@ -3186,10 +3195,64 @@ export function mount(container, opts = {}) {
   }
 
   function spanDetail(s) {
+    const stopContext = resolveTurnAddressContext(s);
     return normalizeSpanDetail(s, {
       sessionId: resolveSessionId(s),
       members: memberRollupCached(s),
+      ...stopContext,
     });
+  }
+
+  function resolveTurnAddressContext(s) {
+    const context = {};
+    let current = s;
+    let guard = 0;
+    while (current && guard++ < 100000) {
+      const attrs = current.attrs || parseAttributes(current.attributes);
+      if (context.turnId == null) context.turnId = getAttr(attrs, ATTR_TURN_ID);
+      if (context.agentDid == null) context.agentDid = getAttr(attrs, ATTR_AGENT_DID);
+      if (
+        context.agentName == null &&
+        current.agent &&
+        current.agent !== UNKNOWN_AGENT
+      ) {
+        context.agentName = current.agent;
+      }
+      if (context.turnId && context.agentDid && context.agentName) break;
+      if (!current.parentId) break;
+      const parentNodeId = spanIdToId.get(current.parentId);
+      if (parentNodeId == null || parentNodeId === current.id) break;
+      current = spans.get(parentNodeId);
+    }
+    return context;
+  }
+
+  // A leaf tool's own closed span does not mean its owning turn is complete.
+  // Only the folded/actual turn summary closes the operator's Stop door.
+  function turnIsComplete(detail) {
+    if (!detail.turnId || !detail.agentDid) return false;
+    for (const candidate of spans.values()) {
+      const candidateDetail = normalizeSpanDetail(candidate);
+      if (
+        candidateDetail.turnId !== detail.turnId ||
+        candidateDetail.agentDid !== detail.agentDid
+      ) {
+        continue;
+      }
+      if (
+        TURN_SUMMARY_RE.test(String(candidate.name || "")) ||
+        (candidate.rSummary && candidate.rOpen === false)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function stopTargetForSpan(s, detail = spanDetail(s)) {
+    const target = stopTargetFromDetail(detail, { completed: turnIsComplete(detail) });
+    if (stopController) stopController.observe(target);
+    return target;
   }
 
   // The session band is not a span, but it answers the same questions — so it
@@ -3302,6 +3365,8 @@ export function mount(container, opts = {}) {
 
   function showPopover(s, clientX, clientY) {
     const detail = spanDetail(s);
+    const stopTarget = stopTargetForSpan(s, detail);
+    const stopModel = stopActionModel(stopTarget, stopController);
     const canNav = Boolean(
       openNavigator &&
         detail.projectId &&
@@ -3311,6 +3376,7 @@ export function mount(container, opts = {}) {
         detail.spanId,
     );
     const canPhx = Boolean(openTrace && s.traceId && s.projectId);
+    activePopoverSpan = s;
     popEl.innerHTML = `
       <div class="obs-tl__phead">
         <span class="obs-tl__ptitle" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
@@ -3318,6 +3384,8 @@ export function mount(container, opts = {}) {
       </div>
       <div class="obs-tl__pbody">${renderSpanDetail(detail, { rawAttributes: false })}</div>
       <div class="obs-tl__pfoot">
+        ${stopController ? `<button type="button" class="obs-tl__plink obs-tl__plink--stop" data-pstop title="${escapeHtml(stopModel.stopLabel)}" ${stopModel.disabled ? "disabled" : ""}>${escapeHtml(stopModel.stopLabel)}</button>` : ""}
+        ${stopController ? `<button type="button" class="obs-tl__plink" data-pselect ${stopModel.addressable ? "" : "disabled"}>${stopModel.selected ? "Remove from Stop selection" : "Add to Stop selection"}</button>` : ""}
         ${canNav ? `<button type="button" class="obs-tl__plink" data-pnav>Open in Navigator</button>` : ""}
         ${canPhx ? `<button type="button" class="obs-tl__plink" data-pphx>Open in Phoenix</button>` : ""}
       </div>`;
@@ -3348,8 +3416,36 @@ export function mount(container, opts = {}) {
         if (url && openTrace) openTrace(url);
       });
     }
+    const stopBtn = popEl.querySelector("[data-pstop]");
+    if (stopBtn && stopController) {
+      stopBtn.addEventListener("click", () => stopController.stopOne(stopTarget));
+    }
+    const selectBtn = popEl.querySelector("[data-pselect]");
+    if (selectBtn && stopController) {
+      selectBtn.addEventListener("click", () => stopController.toggle(stopTarget));
+    }
+  }
+
+  function syncPopoverStopActions() {
+    if (!stopController || !activePopoverSpan || popEl.hidden) return;
+    const target = stopTargetForSpan(activePopoverSpan);
+    const model = stopActionModel(target, stopController);
+    const stopBtn = popEl.querySelector("[data-pstop]");
+    if (stopBtn) {
+      stopBtn.disabled = model.disabled;
+      stopBtn.textContent = model.stopLabel;
+      stopBtn.title = model.stopLabel;
+    }
+    const selectBtn = popEl.querySelector("[data-pselect]");
+    if (selectBtn) {
+      selectBtn.disabled = !model.addressable;
+      selectBtn.textContent = model.selected
+        ? "Remove from Stop selection"
+        : "Add to Stop selection";
+    }
   }
   function hidePopover() {
+    activePopoverSpan = null;
     popEl.hidden = true;
     popEl.innerHTML = "";
   }
@@ -3723,6 +3819,7 @@ export function mount(container, opts = {}) {
 
   function teardown() {
     destroyed = true;
+    stopUnsubscribe();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -3810,11 +3907,13 @@ function ensureStyles() {
     .obs-tl__iopre { margin:0; max-height:150px; overflow:auto; white-space:pre-wrap; word-break:break-word;
                      font-family:ui-monospace,monospace; font-size:11px; background:var(--color-bg,#0b1120);
                      border:1px solid var(--color-border,#334155); border-radius:6px; padding:6px 8px; }
-    .obs-tl__pfoot { display:flex; gap:8px; padding:8px 10px; border-top:1px solid var(--color-border,#334155); }
+    .obs-tl__pfoot { display:flex; flex-wrap:wrap; gap:8px; padding:8px 10px; border-top:1px solid var(--color-border,#334155); }
     .obs-tl__plink { background:transparent; border:1px solid var(--color-border,#334155); border-radius:999px;
                      color:var(--color-accent,#818cf8); cursor:pointer; font-size:11px; font-weight:600;
                      padding:2px 10px; }
-    .obs-tl__plink:hover { background:var(--color-surface,#1e293b); }
+    .obs-tl__plink:hover:not(:disabled) { background:var(--color-surface,#1e293b); }
+    .obs-tl__plink--stop { color:var(--color-danger,#f87171); }
+    .obs-tl__plink:disabled { cursor:not-allowed; opacity:.45; }
     .obs-tl .obs-notice { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
                           justify-content:center; gap:8px; padding:24px; text-align:center;
                           color:var(--color-text-muted,#94a3b8); }

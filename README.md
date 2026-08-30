@@ -57,8 +57,18 @@ process boundaries):
   Timeline and Navigator links preserve the exact OTel span ID in both
   directions, visibly highlight it, and report an honest containing-Turn or
   no-highlight fallback when that exact span is unavailable. All three are pure
-  read-models over Phoenix's GraphQL through the same-origin
-  `/phoenix/graphql` proxy (no store or new host routes). The HostFeature lives
+  trace read-models over Phoenix's GraphQL through the same-origin
+  `/phoenix/graphql` proxy (no store or new host routes). Timeline popovers and
+  Navigator inspectors additionally expose Sovereign's cooperative **Stop**
+  door for a trace-stamped `(agent DID, turn ID)` and a shared multi-selection
+  bar. Selection survives polling and sub-view switches by that canonical pair,
+  never by a Phoenix row or `kestrel.orchestrator`; each request is routed to
+  the stamped agent name and its returned DID/turn/correlation are verified
+  before an outcome is trusted. Mixed `stopped` / `already_complete` / `refused`
+  / `unreachable` results remain visible per target, while a turn with a
+  terminal summary declines locally without sending a new Stop request. This is
+  the panel's only mutation and it calls the existing authenticated
+  `/api/agent/stop` endpoint. The HostFeature lives
   in the `kestrel_feature_observability.fleet` subpackage. Since the custom
   store/entities were retired, `fleet/feature.py` imports only the
   `HostFeature`/`UIContributions` contract from `kestrel_sdk`, so the host role

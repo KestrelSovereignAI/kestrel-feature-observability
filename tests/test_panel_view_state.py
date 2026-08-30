@@ -64,6 +64,10 @@ def _observability_module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
             'import { storeGet } from "./stub-ui-state.js";',
         ),
         ('import API from "/js/api.js";', 'import API from "./stub-api.js";'),
+        (
+            'import { createStopController, mountStopActionBar } from "./stop-actions.js";',
+            'import { createStopController, mountStopActionBar } from "./stub-stop-actions.js";',
+        ),
     ):
         assert original in source, f"observability.js import changed: {original}"
         source = source.replace(original, replacement)
@@ -80,6 +84,11 @@ def _observability_module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     )
     (pkg / "stub-api.js").write_text(
         'export default { requestHost: async () => { throw new Error("no phoenix"); } };\n',
+        encoding="utf-8",
+    )
+    (pkg / "stub-stop-actions.js").write_text(
+        "export function createStopController() { return {}; }\n"
+        "export function mountStopActionBar() { return { destroy() {} }; }\n",
         encoding="utf-8",
     )
     # Timeline double: records every mount, its opts, and the state handed to it,

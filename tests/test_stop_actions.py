@@ -1,0 +1,351 @@
+"""Executable contracts for Timeline/Navigator cooperative Stop actions (#115)."""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import shutil
+import subprocess
+
+import pytest
+
+
+STATIC = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "kestrel_feature_observability"
+    / "fleet"
+    / "static"
+)
+NODE = shutil.which("node")
+
+
+def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
+    pkg = tmp_path / "stop-actions"
+    pkg.mkdir()
+    (pkg / "package.json").write_text('{"type":"module"}', encoding="utf-8")
+    phoenix = (STATIC / "phoenix.js").read_text(encoding="utf-8").replace(
+        'import API from "/js/api.js";',
+        "const API = { requestHost: async () => ({}) };",
+    )
+    assert "const API" in phoenix
+    (pkg / "phoenix.js").write_text(phoenix, encoding="utf-8")
+    (pkg / "stop-actions.js").write_text(
+        (STATIC / "stop-actions.js").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    return pkg
+
+
+def _run(pkg: pathlib.Path, name: str, source: str) -> dict:
+    script = pkg / name
+    script.write_text(source, encoding="utf-8")
+    proc = subprocess.run(
+        [NODE, str(script)],
+        cwd=pkg,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_single_stop_pins_canonical_agent_route_and_verifies_receipt(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "single.mjs",
+        r"""
+import {
+  createStopController,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+
+const calls = [];
+const api = {
+  async requestForAgent(path, options, agent) {
+    calls.push({ path, options, agent, body: JSON.parse(options.body) });
+    return {
+      success: true,
+      turn_id: "session-a#7",
+      message: "Request cancelled",
+      stop_outcomes: [{
+        scope: "turn",
+        requested_target: "session-a#7",
+        resolved_target: "private-request-92",
+        agent_id: "did:kestrel:emma",
+        disposition: "stopped",
+        correlation_id: "corr-one",
+        receipt_id: "receipt-1",
+        detail: null,
+      }],
+    };
+  },
+};
+const controller = createStopController({ api, correlationIdFactory: () => "corr-one" });
+const target = stopTargetFromDetail({
+  agent: "Emma",
+  agentDid: "did:kestrel:emma",
+  turnId: "session-a#7",
+  traceId: "a".repeat(32),
+  spanId: "b".repeat(16),
+  orchestrator: "talon",
+});
+const outcome = await controller.stopOne(target);
+const redraw = stopTargetFromDetail({
+  agent: "Emma",
+  agentDid: "did:kestrel:emma",
+  turnId: "session-a#7",
+  orchestrator: "a-different-display-parent",
+});
+process.stdout.write(JSON.stringify({ calls, target, outcome, redrawKey: redraw.key }));
+""",
+    )
+
+    assert result["calls"] == [
+        {
+            "path": "/api/agent/stop",
+            "options": {
+                "method": "POST",
+                "headers": {"Content-Type": "application/json"},
+                "body": '{"turn_id":"session-a#7","correlation_id":"corr-one"}',
+            },
+            "agent": "Emma",
+            "body": {"turn_id": "session-a#7", "correlation_id": "corr-one"},
+        }
+    ]
+    assert result["target"]["key"] == json.dumps(
+        ["did:kestrel:emma", "session-a#7"], separators=(",", ":")
+    )
+    assert result["redrawKey"] == result["target"]["key"]
+    assert result["outcome"]["state"] == "stopped"
+    assert result["outcome"]["receiptId"] == "receipt-1"
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_multi_stop_preserves_success_and_typed_failure_per_exact_target(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "multi.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+
+let correlation = 0;
+const api = {
+  async requestForAgent(_path, options, agent) {
+    const body = JSON.parse(options.body);
+    const target = agent === "Emma"
+      ? { did: "did:kestrel:emma", disposition: "stopped" }
+      : { did: "did:kestrel:claw", disposition: "unreachable" };
+    const outcome = {
+      scope: "turn",
+      requested_target: body.turn_id,
+      resolved_target: `${agent}-request`,
+      agent_id: target.did,
+      disposition: target.disposition,
+      correlation_id: body.correlation_id,
+      detail: target.disposition === "unreachable" ? "owner lease unavailable" : null,
+      receipt_id: null,
+    };
+    if (target.disposition === "unreachable") {
+      throw {
+        status: 503,
+        code: "stop_not_confirmed",
+        message: "Cooperative Stop could not be confirmed.",
+        body: { error: { details: [outcome] } },
+      };
+    }
+    return { turn_id: body.turn_id, stop_outcomes: [outcome] };
+  },
+};
+const controller = createStopController({
+  api,
+  correlationIdFactory: () => `corr-${++correlation}`,
+});
+for (const detail of [
+  { agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#2" },
+  { agent: "Claw", agentDid: "did:kestrel:claw", turnId: "claw#9" },
+]) controller.select(stopTargetFromDetail(detail));
+const returned = await controller.stopSelected();
+process.stdout.write(JSON.stringify({
+  returned: returned.map((item) => item.state),
+  retained: controller.results().map((item) => ({
+    key: item.key,
+    state: item.state,
+    message: item.message,
+  })),
+}));
+""",
+    )
+
+    assert result["returned"] == ["stopped", "unreachable"]
+    assert [item["state"] for item in result["retained"]] == [
+        "stopped",
+        "unreachable",
+    ]
+    assert "owner lease unavailable" in result["retained"][1]["message"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_completed_turn_declines_locally_and_selection_survives_redraw(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "completed.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+
+let calls = 0;
+const controller = createStopController({
+  api: { async requestForAgent() { calls += 1; throw new Error("must not call"); } },
+  correlationIdFactory: () => "unused",
+});
+const first = stopTargetFromDetail({
+  agent: "Emma",
+  agentDid: "did:kestrel:emma",
+  turnId: "same#1",
+  orchestrator: "Direct",
+});
+controller.select(first);
+const reconciled = stopTargetFromDetail({
+  agent: "Renamed display value",
+  agentDid: "did:kestrel:emma",
+  turnId: "same#1",
+  orchestrator: "talon",
+}, { completed: true });
+controller.select(reconciled);
+const selected = controller.selected();
+const outcome = await controller.stopSelected();
+process.stdout.write(JSON.stringify({ calls, selected, outcome }));
+""",
+    )
+
+    assert result["calls"] == 0
+    assert len(result["selected"]) == 1
+    # Identity reconciliation may advance lifecycle state but never replaces
+    # the originally pinned route with redraw/display metadata.
+    assert result["selected"][0]["agentName"] == "Emma"
+    assert result["selected"][0]["completed"] is True
+    assert result["outcome"][0]["state"] == "already_complete"
+    assert result["outcome"][0]["local"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_mismatched_server_identity_is_indeterminate(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "mismatch.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+const controller = createStopController({
+  correlationIdFactory: () => "corr-mismatch",
+  api: {
+    async requestForAgent(_path, options) {
+      const body = JSON.parse(options.body);
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn",
+          requested_target: body.turn_id,
+          resolved_target: "request-1",
+          agent_id: "did:kestrel:someone-else",
+          disposition: "stopped",
+          correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#3",
+});
+const outcome = await controller.stopOne(target);
+process.stdout.write(JSON.stringify(outcome));
+""",
+    )
+
+    assert result["state"] == "indeterminate"
+    assert "did and turn id" in result["message"].lower()
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_action_bar_dispatches_snapshot_and_keeps_partial_outcomes_visible(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "action-bar.mjs",
+        r"""
+import {
+  createStopController,
+  mountStopActionBar,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+
+const calls = [];
+const controller = createStopController({
+  correlationIdFactory: () => `corr-${calls.length + 1}`,
+  api: {
+    async requestForAgent(_path, options, agent) {
+      const body = JSON.parse(options.body);
+      calls.push([agent, body.turn_id]);
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn", requested_target: body.turn_id,
+          resolved_target: `${agent}-request`,
+          agent_id: `did:kestrel:${agent.toLowerCase()}`,
+          disposition: agent === "Emma" ? "stopped" : "already_complete",
+          correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+for (const agent of ["Emma", "Claw"]) {
+  controller.select(stopTargetFromDetail({
+    agent, agentDid: `did:kestrel:${agent.toLowerCase()}`, turnId: `${agent}#1`,
+  }));
+}
+const listeners = new Map();
+const element = {
+  innerHTML: "",
+  addEventListener(name, fn) { listeners.set(name, fn); },
+  removeEventListener(name) { listeners.delete(name); },
+};
+const mounted = mountStopActionBar(element, controller);
+const before = element.innerHTML;
+listeners.get("click")({
+  target: { closest(selector) { return selector === "[data-stop-selected]" ? {} : null; } },
+});
+for (let i = 0; i < 20 && controller.results().some((r) => r.state === "submitting"); i++) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+const after = element.innerHTML;
+mounted.destroy();
+process.stdout.write(JSON.stringify({ before, after, calls }));
+""",
+    )
+
+    assert "2 turns selected" in result["before"]
+    assert result["calls"] == [["Emma", "Emma#1"], ["Claw", "Claw#1"]]
+    assert "Stopped" in result["after"]
+    assert "Already complete" in result["after"]
+
+
+def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
+    timeline = (STATIC / "timeline.js").read_text(encoding="utf-8")
+    navigator = (STATIC / "navigator.js").read_text(encoding="utf-8")
+    panel = (STATIC / "observability.js").read_text(encoding="utf-8")
+
+    assert "data-pstop" in timeline
+    assert "data-pselect" in timeline
+    assert "stopController.stopOne(stopTarget)" in timeline
+    assert "data-inspector-stop" in navigator
+    assert "data-inspector-select" in navigator
+    assert "stopController.stopOne(stopTargetForNode" in navigator
+    assert "createStopController({ api: API })" in panel
+    assert "mountStopActionBar(stopActionsEl, stopController)" in panel
+    assert "const opts = { project, stopController };" in panel

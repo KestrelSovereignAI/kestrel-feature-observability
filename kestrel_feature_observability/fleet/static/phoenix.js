@@ -678,7 +678,7 @@ export function normalizeSpanDetail(span, context = {}) {
   const turnId = firstPresent(context.turnId, getAttr(attrs, ATTR_TURN_ID));
   const turnIndex = numberValue(getAttr(attrs, ATTR_TURN_INDEX));
   const repo = getAttr(attrs, ATTR_REPO);
-  const agentDid = getAttr(attrs, ATTR_AGENT_DID);
+  const agentDid = firstPresent(context.agentDid, getAttr(attrs, ATTR_AGENT_DID));
 
   return {
     name: String(firstPresent(source.name, "(span)")),
@@ -728,6 +728,73 @@ export function normalizeSpanDetail(span, context = {}) {
     output: present(output) ? String(output) : null,
     attributes: attrs,
   };
+}
+
+// ── Canonical trace → cooperative Stop address ───────────────
+//
+// Kept with the shared normalized detail contract so Timeline and Navigator
+// can consume it without adding another dependency to their independently
+// executable read-model modules.  The mutating controller lives in
+// stop-actions.js; these exports only resolve and render trace identity.
+
+function canonicalStopText(value) {
+  if (typeof value !== "string") return null;
+  return value.trim() ? value : null;
+}
+
+/** Collision-free stable identity for one publicly addressable turn. */
+export function stopTargetKey(agentDid, turnId) {
+  const did = canonicalStopText(agentDid);
+  const turn = canonicalStopText(turnId);
+  return did && turn ? JSON.stringify([did, turn]) : null;
+}
+
+/** Resolve one normalized inspector detail into a canonical Stop target. */
+export function stopTargetFromDetail(detail, { completed = false } = {}) {
+  const source = detail && typeof detail === "object" ? detail : {};
+  const agentName = canonicalStopText(source.agent);
+  const agentDid = canonicalStopText(source.agentDid);
+  const turnId = canonicalStopText(source.turnId);
+  const missing = [];
+  if (!agentName) missing.push("agent route");
+  if (!agentDid) missing.push("agent DID");
+  if (!turnId) missing.push("turn ID");
+  const key = stopTargetKey(agentDid, turnId);
+  return Object.freeze({
+    key,
+    addressable: Boolean(key && agentName),
+    missing: Object.freeze(missing),
+    agentName,
+    agentDid,
+    turnId,
+    traceId: canonicalStopText(source.traceId),
+    spanId: canonicalStopText(source.spanId),
+    label: agentName && turnId ? `${agentName} · ${turnId}` : source.displayName || "Turn",
+    completed: completed === true,
+  });
+}
+
+/** Small view model used by both inspector surfaces. */
+export function stopActionModel(target, controller) {
+  const key = target && stopTargetKey(target.agentDid, target.turnId);
+  const addressable = Boolean(
+    target && target.addressable === true && key && key === target.key && target.agentName,
+  );
+  const result = addressable ? controller?.getResult?.(target) : null;
+  const pending = result?.state === "submitting";
+  return Object.freeze({
+    addressable,
+    selected: addressable && Boolean(controller?.isSelected?.(target)),
+    pending,
+    disabled: !addressable || target.completed || pending,
+    stopLabel: !addressable
+      ? `Stop unavailable — missing ${target?.missing?.join(", ") || "canonical address"}`
+      : target.completed
+        ? "Already complete"
+        : pending
+          ? "Stopping…"
+          : "Stop turn",
+  });
 }
 
 export function spanDetailFields(detail) {

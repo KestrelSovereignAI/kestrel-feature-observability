@@ -699,8 +699,16 @@ import { FakeElement, installFakeDom, waitFor } from "./fake-dom.mjs";
 installFakeDom();
 const fixture = JSON.parse(readFileSync(process.argv[2], "utf8"));
 const spans = fixture.talon_trace;
+for (const span of spans) {
+  const attributes = JSON.parse(span.attributes);
+  attributes.kestrel.agent_did = "did:kestrel:talon";
+  attributes.kestrel.turn_id = "talon-run#7";
+  span.attributes = JSON.stringify(attributes);
+}
 const root = spans[0];
 const spanPageCalls = [];
+const stopCalls = [];
+const selectionCalls = [];
 
 globalThis.fetch = async (_url, options) => {
   const { query, variables = {} } = JSON.parse(options.body);
@@ -749,13 +757,25 @@ const target = buildNavigatorRevealTarget(
   }),
 );
 const container = new FakeElement("div");
-const mounted = mount(container, { revealTarget: target });
+const stopController = {
+  subscribe() { return () => {}; },
+  observe() {},
+  getResult() { return null; },
+  isSelected() { return false; },
+  stopOne(stopTarget) { stopCalls.push(stopTarget); },
+  toggle(stopTarget) { selectionCalls.push(stopTarget); },
+};
+const mounted = mount(container, { revealTarget: target, stopController });
 const inspector = container.querySelector("[data-inspector]");
 const spacer = container.querySelector("[data-spacer]");
 await waitFor(
   () => inspector.innerHTML.includes("aaaa000000000001"),
   "workerless Talon root was not selected",
 );
+const stopButton = inspector.querySelector("[data-inspector-stop]");
+const selectButton = inspector.querySelector("[data-inspector-select]");
+inspector.dispatch("click", { target: stopButton });
+inspector.dispatch("click", { target: selectButton });
 mounted.destroy();
 
 process.stdout.write(JSON.stringify({
@@ -763,6 +783,8 @@ process.stdout.write(JSON.stringify({
   spanPageCalls,
   inspector: inspector.innerHTML,
   tree: spacer.innerHTML,
+  stopCalls,
+  selectionCalls,
 }));
 """,
         encoding="utf-8",
@@ -790,6 +812,10 @@ process.stdout.write(JSON.stringify({
     assert ">worker<" not in result["inspector"]
     assert "obs-nav__row--selected" in result["tree"]
     assert "UncleSaurus/widget#7" in result["tree"]
+    assert result["stopCalls"][0]["agentName"] == "talon"
+    assert result["stopCalls"][0]["agentDid"] == "did:kestrel:talon"
+    assert result["stopCalls"][0]["turnId"] == "talon-run#7"
+    assert result["selectionCalls"][0]["key"] == result["stopCalls"][0]["key"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
@@ -814,7 +840,12 @@ const orphan = {
   parentId: "not-loaded-parent",
   attributes: JSON.stringify({
     openinference: { span: { kind: "TOOL" } },
-    kestrel: { agent_name: "talon/implement", stage: "implement" },
+    kestrel: {
+      agent_name: "talon/implement",
+      agent_did: "did:kestrel:talon",
+      turn_id: "talon-session#4",
+      stage: "implement",
+    },
   }),
   context: { spanId: "orphan-span", traceId: "orphan-trace" },
 };
@@ -852,11 +883,22 @@ globalThis.fetch = async (_url, options) => {
 
 const { mount } = await import("./timeline.js");
 const container = new FakeElement("div");
+const stopCalls = [];
+const selectionCalls = [];
+const stopController = {
+  subscribe() { return () => {}; },
+  observe() {},
+  getResult() { return null; },
+  isSelected() { return false; },
+  stopOne(target) { stopCalls.push(target); },
+  toggle(target) { selectionCalls.push(target); },
+};
 const mounted = mount(container, {
   openNavigator() {
     throw new Error("unfulfillable Navigator action was invoked");
   },
   openTrace() {},
+  stopController,
   revealTarget: {
     projectId: "project-1",
     projectName: "owner/repo",
@@ -884,12 +926,20 @@ const pointer = {
 canvas.dispatch("pointerdown", pointer);
 canvas.dispatch("pointerup", pointer);
 await waitFor(() => popover.innerHTML.includes("orphan tool"), "popover did not open");
+const stopButton = popover.querySelector("[data-pstop]");
+const selectButton = popover.querySelector("[data-pselect]");
+stopButton.dispatch("click");
+selectButton.dispatch("click");
 mounted.destroy();
 
 process.stdout.write(JSON.stringify({
   popover: popover.innerHTML,
   hasNavigatorButton: Boolean(popover.querySelector("[data-pnav]")),
   hasPhoenixButton: Boolean(popover.querySelector("[data-pphx]")),
+  hasStopButton: Boolean(stopButton),
+  hasSelectButton: Boolean(selectButton),
+  stopCalls,
+  selectionCalls,
 }));
 """,
         encoding="utf-8",
@@ -907,6 +957,12 @@ process.stdout.write(JSON.stringify({
     assert "orphan tool" in result["popover"]
     assert result["hasNavigatorButton"] is False
     assert result["hasPhoenixButton"] is True
+    assert result["hasStopButton"] is True
+    assert result["hasSelectButton"] is True
+    assert result["stopCalls"][0]["agentName"] == "talon"
+    assert result["stopCalls"][0]["agentDid"] == "did:kestrel:talon"
+    assert result["stopCalls"][0]["turnId"] == "talon-session#4"
+    assert result["selectionCalls"][0]["key"] == result["stopCalls"][0]["key"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")

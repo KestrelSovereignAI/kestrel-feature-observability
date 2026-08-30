@@ -54,6 +54,8 @@ import {
   DEFAULT_PROJECT,
   ATTR_AGENT_NAME,
   ATTR_SESSION_ID,
+  ATTR_TURN_ID,
+  ATTR_AGENT_DID,
   mintPhoenixSession,
   gql,
   PROJECTS_QUERY,
@@ -79,6 +81,8 @@ import {
   normalizeSpanDetail,
   renderSpanDetail,
   buildTimelineRevealTarget,
+  stopActionModel,
+  stopTargetFromDetail,
 } from "./phoenix.js";
 
 // Keep the pure read-model exports available from navigator.js for callers
@@ -144,6 +148,7 @@ export function mount(container, opts = {}) {
   const openTrace = typeof opts.openTrace === "function" ? opts.openTrace : null;
   const openTimeline =
     typeof opts.openTimeline === "function" ? opts.openTimeline : null;
+  const stopController = opts.stopController || null;
   // A one-shot reveal target from the Timeline's "open in Navigator" (#54):
   // {projectId, projectName, agentName, worker, sessionId, traceId, spanId,
   // nodeId}. Consumed once on boot to select that exact span, best-effort.
@@ -606,6 +611,11 @@ export function mount(container, opts = {}) {
   let selectedNode = null;
   let revealFallback = null;
   let rebuildScheduled = false;
+  const stopUnsubscribe = stopController
+    ? stopController.subscribe(() => {
+        if (!destroyed && selectedNode) renderInspector();
+      })
+    : () => {};
 
   function rebuildRows() {
     rows = [];
@@ -783,6 +793,9 @@ export function mount(container, opts = {}) {
       if (context.agentName == null && data.agentName != null) context.agentName = data.agentName;
       if (context.sessionId == null && data.sessionId != null) context.sessionId = data.sessionId;
       if (context.traceId == null && data.traceId != null) context.traceId = data.traceId;
+      const attrs = parseAttributes(data.span?.attributes ?? data.span?.attrs);
+      if (context.turnId == null) context.turnId = getAttr(attrs, ATTR_TURN_ID);
+      if (context.agentDid == null) context.agentDid = getAttr(attrs, ATTR_AGENT_DID);
       cur = cur.parent;
     }
     if (node.kind === "turn" && node.data.summary) {
@@ -790,6 +803,21 @@ export function mount(container, opts = {}) {
       context.endMs = node.data.summaryEndMs;
     }
     return normalizeSpanDetail(node.data.span, context);
+  }
+
+  function owningTurn(node) {
+    let current = node;
+    while (current && current.kind !== "turn") current = current.parent;
+    return current || null;
+  }
+
+  function stopTargetForNode(node, detail = detailForNode(node)) {
+    const turn = owningTurn(node);
+    const target = stopTargetFromDetail(detail, {
+      completed: Boolean(turn && turn.data.summary),
+    });
+    if (stopController) stopController.observe(target);
+    return target;
   }
 
   function renderInspector() {
@@ -805,6 +833,8 @@ export function mount(container, opts = {}) {
       : "";
     const canPhx = Boolean(openTrace && detail.traceId && detail.projectId);
     const canTimeline = Boolean(openTimeline && detail.spanId);
+    const stopTarget = stopTargetForNode(selectedNode, detail);
+    const stopModel = stopActionModel(stopTarget, stopController);
     inspectorEl.innerHTML = `
       <div class="obs-nav__inspector-head">
         <span class="obs-nav__inspector-title" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
@@ -812,6 +842,8 @@ export function mount(container, opts = {}) {
       ${fallback}
       <div class="obs-nav__inspector-body">${renderSpanDetail(detail)}</div>
       <div class="obs-nav__inspector-actions">
+        ${stopController ? `<button type="button" class="obs-nav__action obs-nav__action--stop" data-inspector-stop title="${escapeHtml(stopModel.stopLabel)}" ${stopModel.disabled ? "disabled" : ""}>${escapeHtml(stopModel.stopLabel)}</button>` : ""}
+        ${stopController ? `<button type="button" class="obs-nav__action" data-inspector-select ${stopModel.addressable ? "" : "disabled"}>${stopModel.selected ? "Remove from Stop selection" : "Add to Stop selection"}</button>` : ""}
         ${canPhx ? `<button type="button" class="obs-nav__action" data-inspector-phoenix>Open in Phoenix</button>` : ""}
         ${canTimeline ? `<button type="button" class="obs-nav__action" data-inspector-timeline>Show in Timeline</button>` : ""}
       </div>`;
@@ -860,6 +892,10 @@ export function mount(container, opts = {}) {
         openTraceFor(selectedNode);
       } else if (e.target.closest("[data-inspector-timeline]") && openTimeline) {
         openTimeline(buildTimelineRevealTarget(detail));
+      } else if (e.target.closest("[data-inspector-stop]") && stopController) {
+        stopController.stopOne(stopTargetForNode(selectedNode, detail));
+      } else if (e.target.closest("[data-inspector-select]") && stopController) {
+        stopController.toggle(stopTargetForNode(selectedNode, detail));
       }
     });
   }
@@ -1168,6 +1204,7 @@ export function mount(container, opts = {}) {
 
   function teardown() {
     destroyed = true;
+    stopUnsubscribe();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -1305,7 +1342,9 @@ function ensureStyles() {
     .obs-nav__action { background:transparent; border:1px solid var(--color-border,#334155);
                        border-radius:999px; color:var(--color-accent,#818cf8); cursor:pointer;
                        font-size:11px; font-weight:600; padding:3px 10px; }
-    .obs-nav__action:hover { background:var(--color-surface,#1e293b); }
+    .obs-nav__action:hover:not(:disabled) { background:var(--color-surface,#1e293b); }
+    .obs-nav__action--stop { color:var(--color-danger,#f87171); }
+    .obs-nav__action:disabled { cursor:not-allowed; opacity:.45; }
     @media (max-width:760px) {
       .obs-nav__body { flex-direction:column; }
       .obs-nav__treepane { min-height:45%; }

@@ -64,6 +64,7 @@ import { storeGet } from "/js/ui_state.mjs";
 import API from "/js/api.js";
 import { mount as mountNavigator } from "./navigator.js";
 import { mount as mountTimeline } from "./timeline.js";
+import { createStopController, mountStopActionBar } from "./stop-actions.js";
 
 const PHOENIX_SESSION_PATH = "/api/host/phoenix/session";
 const PHOENIX_URL = "/phoenix/";
@@ -592,6 +593,9 @@ export function mount(container) {
   ensureStyles();
 
   const project = projectName(container);
+  // Shared across sub-view mounts so exact selections and partial outcomes
+  // survive redraws and Timeline/Navigator switches.
+  const stopController = createStopController({ api: API });
   // Sub-tab precedence: shareable hash → persisted state → Timeline. A hash hit
   // is PINNED: the framework's `setState` must not steer a shared link away.
   const pinnedId = hashViewId();
@@ -616,10 +620,13 @@ export function mount(container) {
           </button>`,
         ).join("")}
       </nav>
+      <div data-stop-actions></div>
       <div class="obs-content" data-obs-content></div>
     </div>`;
 
   const contentEl = container.querySelector("[data-obs-content]");
+  const stopActionsEl = container.querySelector("[data-stop-actions]");
+  const stopActionBar = mountStopActionBar(stopActionsEl, stopController);
 
   // Capture the live Timeline's view state before it stops being the source of
   // truth (a sub-tab switch, a panel teardown, or a provider snapshot). Keyed on
@@ -655,7 +662,7 @@ export function mount(container) {
     container.querySelectorAll("[data-view]").forEach((btn) => {
       btn.classList.toggle("obs-subnav__tab--active", btn.dataset.view === activeId);
     });
-    const opts = { project };
+    const opts = { project, stopController };
     if (view.id === "phoenix") {
       // One-shot: a pending navigator deep-link rides along on this mount only.
       opts.traceUrl = pendingTraceUrl;
@@ -783,6 +790,7 @@ export function mount(container) {
       if (activeInstance === statePort) activeInstance = null;
       destroyed = true;
       unmountActive();
+      stopActionBar.destroy();
     },
   };
 }
@@ -807,6 +815,32 @@ function ensureStyles() {
     .obs-subnav__tab--active { background:var(--color-accent,#818cf8); color:#0b1120;
                                border-color:var(--color-accent,#818cf8); }
     .obs-content { flex:1; min-height:0; overflow:hidden; }
+    .obs-stopbar { flex:none; border-bottom:1px solid var(--color-border,#334155);
+                   background:color-mix(in srgb, var(--color-surface,#1e293b) 42%, transparent);
+                   font-size:11px; }
+    .obs-stopbar__head { display:flex; align-items:center; gap:8px; min-height:34px;
+                         padding:4px 12px; }
+    .obs-stopbar__count, .obs-stopbar__empty { color:var(--color-text-muted,#94a3b8); }
+    .obs-stopbar__grow { flex:1; }
+    .obs-stopbar__button { background:transparent; color:var(--color-text-muted,#94a3b8);
+                           border:1px solid var(--color-border,#334155); border-radius:999px;
+                           padding:2px 9px; cursor:pointer; font:600 11px system-ui,sans-serif; }
+    .obs-stopbar__button:hover:not(:disabled) { color:var(--color-text,#e2e8f0);
+                                                background:var(--color-surface,#1e293b); }
+    .obs-stopbar__button--danger { color:var(--color-danger,#f87171); }
+    .obs-stopbar__button:disabled { cursor:not-allowed; opacity:.45; }
+    .obs-stopbar__list { display:flex; flex-direction:column; gap:2px; max-height:116px;
+                         overflow:auto; list-style:none; margin:0; padding:0 12px 6px; }
+    .obs-stopbar__item { display:flex; align-items:center; gap:8px; min-width:0; }
+    .obs-stopbar__target { display:flex; align-items:center; gap:7px; min-width:0; flex:1; }
+    .obs-stopbar__target code { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+                                color:var(--color-text-muted,#94a3b8); }
+    .obs-stopbar__outcome { flex:none; color:var(--color-text-muted,#94a3b8); font-weight:700; }
+    .obs-stopbar__outcome--stopped, .obs-stopbar__outcome--already_complete {
+      color:var(--color-success,#34d399); }
+    .obs-stopbar__outcome--refused, .obs-stopbar__outcome--unreachable,
+    .obs-stopbar__outcome--indeterminate { color:var(--color-danger,#f87171); }
+    .obs-stopbar__empty { padding:0 12px 7px; }
     .obs-detail { display:flex; flex-direction:column; gap:2px; }
     .obs-detail__row { display:flex; gap:9px; padding:1px 0; font-size:12px; }
     .obs-detail__key { flex:none; width:88px; padding-top:2px;
