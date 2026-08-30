@@ -186,6 +186,11 @@ export function createStopController({
   // replay without remaining visible after dismissal.
   const confirmedResults = new Map();
   const indeterminateResults = new Map();
+  // Completion is lifecycle evidence, not outcome presentation. A refusal,
+  // unreachable result, or submitting row may later be advanced by a trace
+  // summary; dismissing the visible outcome must not erase that permanent
+  // guard and let a stale inspector submit another Stop.
+  const completedTargets = new Map();
   const pendingOperations = new Map();
   const listeners = new Set();
 
@@ -200,9 +205,24 @@ export function createStopController({
   }
 
   function observe(candidate) {
-    const target = canonicalTarget(candidate);
-    if (!target) return false;
+    const observedTarget = canonicalTarget(candidate);
+    if (!observedTarget) return false;
+    const target = mergeCompletionEvidence(
+      observedTarget,
+      completedTargets.get(observedTarget.key),
+    );
     let changed = false;
+
+    if (target.completed === true) {
+      const retained = completedTargets.get(target.key);
+      const completed = retained
+        ? mergeCompletionEvidence(retained, target)
+        : target;
+      if (completed !== retained) {
+        completedTargets.set(target.key, completed);
+        changed = true;
+      }
+    }
 
     function advance(existing) {
       if (!existing) return existing;
@@ -303,6 +323,15 @@ export function createStopController({
     const target = mergeCompletionEvidence(result.target, priorTarget);
     const retained =
       target === result.target ? result : Object.freeze({ ...result, target });
+    if (retained.target.completed === true) {
+      const completed = completedTargets.get(retained.key);
+      completedTargets.set(
+        retained.key,
+        completed
+          ? mergeCompletionEvidence(completed, retained.target)
+          : retained.target,
+      );
+    }
     results.set(retained.key, retained);
     if (CONFIRMED_STOP_DISPOSITIONS.has(retained.state)) {
       confirmedResults.set(retained.key, retained);
@@ -322,6 +351,7 @@ export function createStopController({
       byKey.set(target.key, mergeCompletionEvidence(target, existing));
     };
     for (const target of selected.values()) retain(target);
+    for (const target of completedTargets.values()) retain(target);
     for (const store of [confirmedResults, indeterminateResults, results]) {
       for (const result of store.values()) retain(result.target);
     }
@@ -329,7 +359,11 @@ export function createStopController({
   }
 
   function targetForKey(key) {
-    return selected.get(key) || storedResult(key)?.target || null;
+    const target = selected.get(key) || storedResult(key)?.target;
+    const completed = completedTargets.get(key);
+    return target
+      ? mergeCompletionEvidence(target, completed)
+      : completed || null;
   }
 
   async function stopOne(candidate) {

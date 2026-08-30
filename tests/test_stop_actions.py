@@ -599,6 +599,51 @@ process.stdout.write(JSON.stringify({ calls, first, visible, retained, second })
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_dismissing_refusal_retains_later_completion_guard(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "dismiss-completion-guard.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+let calls = 0;
+const controller = createStopController({
+  correlationIdFactory: () => `corr-${calls + 1}`,
+  api: {
+    async requestForAgent(_path, options) {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn", requested_target: body.turn_id,
+          resolved_target: "request-1", agent_id: "did:kestrel:emma",
+          disposition: "refused", correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+const stale = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#completed",
+}, { completionKnown: true, completed: false });
+const first = await controller.stopOne(stale);
+controller.observe(stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#completed",
+}, { completionKnown: true, completed: true }));
+controller.clearResults();
+const second = await controller.stopOne(stale);
+process.stdout.write(JSON.stringify({ calls, first, second }));
+""",
+    )
+
+    assert result["first"]["state"] == "refused"
+    assert result["calls"] == 1
+    assert result["second"]["state"] == "already_complete"
+    assert result["second"]["local"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_inspector_retry_reuses_retained_route_and_completion_evidence(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
