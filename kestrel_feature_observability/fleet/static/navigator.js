@@ -60,7 +60,7 @@ import {
   gql,
   PROJECTS_QUERY,
   SPAN_PAGE_QUERY,
-  TRACE_SPANS_QUERY,
+  walkTraceSpans,
   escapeHtml,
   parseAttributes,
   getAttr,
@@ -118,7 +118,9 @@ export function navigatorTraceInventoryComplete(trace, spans) {
     connection &&
       Array.isArray(connection.edges) &&
       Array.isArray(spans) &&
-      spans.length < TRACE_SPAN_LIMIT,
+      (connection.pageInfo
+        ? connection.pageInfo.hasNextPage === false
+        : spans.length < TRACE_SPAN_LIMIT),
   );
 }
 
@@ -578,22 +580,15 @@ export function mount(container, opts = {}) {
   // span id and time-ordered — start/stop markers, hook events, tool calls
   // (TOOL), LLM calls (LLM), gates. Nested events expand locally (no query).
   async function loadEvents(node, mode) {
-    const data = await gql(TRACE_SPANS_QUERY, {
-      projectId: node.data.projectId,
-      traceId: node.data.traceId,
-      first: TRACE_SPAN_LIMIT,
-    });
-    const trace = data.node && data.node.trace;
-    const edges = trace && trace.spans && Array.isArray(trace.spans.edges)
-      ? trace.spans.edges
-      : [];
-    const spans = edges
-      .map((e) => e && e.node)
-      .filter(Boolean);
-    // TRACE_SPANS_QUERY is bounded and exposes no cursor in the pinned Phoenix
-    // schema. A full page is therefore possibly truncated, never proof that a
-    // missing summary means the turn is still active.
-    node.data.inventoryComplete = navigatorTraceInventoryComplete(trace, spans);
+    const inventory = await walkTraceSpans(
+      node.data.projectId,
+      node.data.traceId,
+    );
+    const trace = inventory.trace;
+    const spans = [...inventory.spans];
+    node.data.inventoryComplete = Boolean(
+      inventory.complete && navigatorTraceInventoryComplete(trace, spans)
+    );
 
     const bySpanId = new Map();
     for (const s of spans) {

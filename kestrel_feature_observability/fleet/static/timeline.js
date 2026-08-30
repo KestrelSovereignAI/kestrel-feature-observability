@@ -71,7 +71,7 @@ import {
   gql,
   PROJECTS_QUERY,
   SPAN_PAGE_QUERY,
-  TRACE_SPANS_QUERY,
+  walkTraceSpans,
   spanIdFilter,
   escapeHtml,
   parseAttributes,
@@ -107,7 +107,6 @@ const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 min visible window
 const MIN_WINDOW_MS = 60 * 1000; // 1 min (max zoom-in)
 const MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 h (max zoom-out)
 const PAGE_SIZE = 500; // spans per GraphQL page
-const TURN_TRACE_SPAN_LIMIT = 1000; // focused completion check; a full page is unknown
 const MAX_POLL_PAGES = 6; // per-project drain cap per tick (backlog catch-up)
 const MAX_HISTORY_ROUNDS = 4; // bounded walks per history pass (viewport moved mid-fetch)
 const SPAN_CAP = 60_000; // memory guard — evict oldest CLOSED SESSIONS beyond this (#111)
@@ -3364,18 +3363,11 @@ export function mount(container, opts = {}) {
     turnCompletionCache.delete(key);
     const operation = (async () => {
       try {
-        const data = await gql(TRACE_SPANS_QUERY, {
-          projectId: s.projectId,
-          traceId: s.traceId,
-          first: TURN_TRACE_SPAN_LIMIT,
-        });
-        const trace = data.node && data.node.trace;
+        const inventory = await walkTraceSpans(s.projectId, s.traceId);
+        const trace = inventory.trace;
         if (!trace) return;
-        const focused = ((((trace || {}).spans || {}).edges) || [])
-          .map((edge) => edge && edge.node)
-          .filter(Boolean);
-        const evidence = turnCompletionEvidence(focused, detail, {
-          truncated: focused.length >= TURN_TRACE_SPAN_LIMIT,
+        const evidence = turnCompletionEvidence(inventory.spans, detail, {
+          truncated: inventory.complete !== true,
         });
         turnCompletionCache.set(key, evidence);
         // The selection can outlive both the popover and this Timeline tab.

@@ -150,11 +150,12 @@ export const SPAN_PAGE_QUERY = `
 
 // Events level: the full span tree of one turn (= one trace).
 export const TRACE_SPANS_QUERY = `
-  query NavigatorTraceSpans($projectId: ID!, $traceId: ID!, $first: Int!) {
+  query NavigatorTraceSpans($projectId: ID!, $traceId: ID!, $first: Int!, $after: String) {
     node(id: $projectId) {
       ... on Project {
         trace(traceId: $traceId) {
-          spans(first: $first) {
+          spans(first: $first, after: $after) {
+            pageInfo { hasNextPage endCursor }
             edges {
               node {
                 id name spanKind startTime endTime latencyMs statusCode parentId attributes
@@ -166,6 +167,61 @@ export const TRACE_SPANS_QUERY = `
       }
     }
   }`;
+
+export const TRACE_SPAN_PAGE_SIZE = 1000;
+export const TRACE_SPAN_MAX_PAGES = 200;
+
+/** Walk one trace's cursor connection for an authoritative span inventory.
+ *
+ * The page ceiling is a UI resource rail, not evidence of completion. Hitting
+ * it, receiving no forward cursor, or seeing a repeated cursor returns
+ * ``complete:false`` so callers keep Stop disabled rather than infer liveness.
+ */
+export async function walkTraceSpans(
+  projectId,
+  traceId,
+  {
+    pageSize = TRACE_SPAN_PAGE_SIZE,
+    maxPages = TRACE_SPAN_MAX_PAGES,
+  } = {},
+) {
+  const spans = [];
+  const seenCursors = new Set();
+  let after = null;
+  let trace = null;
+  for (let page = 0; page < maxPages; page += 1) {
+    const data = await gql(TRACE_SPANS_QUERY, {
+      projectId,
+      traceId,
+      first: pageSize,
+      after,
+    });
+    trace = data.node && data.node.trace;
+    const connection = trace && trace.spans;
+    if (!connection || !Array.isArray(connection.edges)) {
+      return Object.freeze({ trace, spans: Object.freeze(spans), complete: false });
+    }
+    for (const edge of connection.edges) {
+      if (edge && edge.node) spans.push(edge.node);
+    }
+    const pageInfo = connection.pageInfo;
+    if (!pageInfo || pageInfo.hasNextPage !== true) {
+      return Object.freeze({ trace, spans: Object.freeze(spans), complete: true });
+    }
+    const next = pageInfo.endCursor;
+    if (
+      typeof next !== "string" ||
+      !next ||
+      next === after ||
+      seenCursors.has(next)
+    ) {
+      return Object.freeze({ trace, spans: Object.freeze(spans), complete: false });
+    }
+    seenCursors.add(next);
+    after = next;
+  }
+  return Object.freeze({ trace, spans: Object.freeze(spans), complete: false });
+}
 
 // ── Attribute / formatting helpers ────────────────────────────
 

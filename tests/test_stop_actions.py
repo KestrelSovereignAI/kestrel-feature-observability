@@ -51,6 +51,75 @@ def _run(pkg: pathlib.Path, name: str, source: str) -> dict:
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_trace_inventory_walks_past_first_thousand_and_fails_closed_on_bad_cursor(
+    tmp_path,
+):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "trace-pagination.mjs",
+        r"""
+const calls = [];
+let mode = "complete";
+globalThis.fetch = async (_url, options) => {
+  const { variables } = JSON.parse(options.body);
+  calls.push(variables.after ?? null);
+  const first = variables.after == null;
+  const nodes = first
+    ? Array.from({ length: 1000 }, (_unused, index) => ({ id: `span-${index}` }))
+    : [{ id: "turn-summary" }];
+  const pageInfo = first
+    ? { hasNextPage: true, endCursor: "cursor-1" }
+    : mode === "complete"
+      ? { hasNextPage: false, endCursor: null }
+      : { hasNextPage: true, endCursor: "cursor-1" };
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: {
+        node: {
+          trace: { spans: { edges: nodes.map((node) => ({ node })), pageInfo } },
+        },
+      },
+    }),
+  };
+};
+const { walkTraceSpans } = await import("./phoenix.js");
+const complete = await walkTraceSpans("project-1", "trace-1");
+const completeCalls = calls.splice(0);
+mode = "repeated";
+const repeated = await walkTraceSpans("project-1", "trace-1");
+process.stdout.write(JSON.stringify({
+  complete: {
+    complete: complete.complete,
+    count: complete.spans.length,
+    last: complete.spans.at(-1).id,
+    calls: completeCalls,
+  },
+  repeated: {
+    complete: repeated.complete,
+    count: repeated.spans.length,
+    calls,
+  },
+}));
+""",
+    )
+
+    assert result["complete"] == {
+        "complete": True,
+        "count": 1001,
+        "last": "turn-summary",
+        "calls": [None, "cursor-1"],
+    }
+    assert result["repeated"] == {
+        "complete": False,
+        "count": 1001,
+        "calls": [None, "cursor-1"],
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_single_stop_pins_canonical_agent_route_and_verifies_receipt(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
