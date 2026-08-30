@@ -750,7 +750,10 @@ export function stopTargetKey(agentDid, turnId) {
 }
 
 /** Resolve one normalized inspector detail into a canonical Stop target. */
-export function stopTargetFromDetail(detail, { completed = false } = {}) {
+export function stopTargetFromDetail(
+  detail,
+  { completed = false, completionKnown = true } = {},
+) {
   const source = detail && typeof detail === "object" ? detail : {};
   const agentName = canonicalStopText(source.agent);
   const agentDid = canonicalStopText(source.agentDid);
@@ -771,6 +774,7 @@ export function stopTargetFromDetail(detail, { completed = false } = {}) {
     spanId: canonicalStopText(source.spanId),
     label: agentName && turnId ? `${agentName} · ${turnId}` : source.displayName || "Turn",
     completed: completed === true,
+    completionKnown: completionKnown === true,
   });
 }
 
@@ -786,10 +790,12 @@ export function stopActionModel(target, controller) {
     addressable,
     selected: addressable && Boolean(controller?.isSelected?.(target)),
     pending,
-    disabled: !addressable || target.completed || pending,
+    disabled: !addressable || target.completionKnown !== true || target.completed || pending,
     stopLabel: !addressable
       ? `Stop unavailable — missing ${target?.missing?.join(", ") || "canonical address"}`
-      : target.completed
+      : target.completionKnown !== true
+        ? "Checking turn state…"
+        : target.completed
         ? "Already complete"
         : pending
           ? "Stopping…"

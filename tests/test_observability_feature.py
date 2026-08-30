@@ -958,6 +958,7 @@ class TestTurnSpans:
             attrs = spans[name].attributes
             assert attrs[KESTREL_TURN_ID] == "turn-test-1"
             assert attrs[KESTREL_TURN_INDEX] == 1
+            assert attrs["kestrel.agent_did"] == "did:agent:test"
 
     @pytest.mark.asyncio
     async def test_turn_root_binds_its_trace_to_the_host_stop_address(self):

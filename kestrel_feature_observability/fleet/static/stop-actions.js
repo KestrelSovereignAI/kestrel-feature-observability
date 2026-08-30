@@ -154,6 +154,7 @@ export function createStopController({
 
   const selected = new Map();
   const results = new Map();
+  const pendingOperations = new Map();
   const listeners = new Set();
 
   function emit() {
@@ -224,6 +225,8 @@ export function createStopController({
   async function stopOne(candidate) {
     const original = canonicalTarget(candidate);
     if (!original) return null;
+    const pendingOperation = pendingOperations.get(original.key);
+    if (pendingOperation) return pendingOperation;
     const observed = selected.get(original.key);
     const target = observed?.completed && !original.completed ? observed : original;
     if (target.completed) {
@@ -243,67 +246,79 @@ export function createStopController({
     results.set(target.key, pendingResult(target, correlationId));
     emit();
 
-    try {
-      const response = await api.requestForAgent(
-        STOP_PATH,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ turn_id: target.turnId, correlation_id: correlationId }),
-        },
-        target.agentName,
-      );
-      const outcomes = Array.isArray(response?.stop_outcomes) ? response.stop_outcomes : [];
-      const responseTurn = response?.turn_id == null ? target.turnId : response.turn_id;
-      let result;
-      if (
-        responseTurn !== target.turnId ||
-        outcomes.length !== 1 ||
-        !outcomeMatches(outcomes[0], target, correlationId)
-      ) {
-        result = indeterminateResult(
-          target,
-          "Stop response did not match the selected agent DID and turn ID.",
-          { correlationId },
-        );
-      } else {
-        result = resultFromOutcome(target, outcomes[0], { message: response?.message });
-      }
-      results.set(target.key, result);
-      emit();
-      return result;
-    } catch (error) {
-      const outcomes = structuredOutcomes(error);
-      let result;
-      if (outcomes.length === 1 && outcomeMatches(outcomes[0], target, correlationId)) {
-        result = resultFromOutcome(target, outcomes[0], {
-          message: error?.message,
-          status: Number.isInteger(error?.status) ? error.status : null,
-        });
-      } else {
-        const identityMismatch = outcomes.length > 0;
-        result = indeterminateResult(
-          target,
-          identityMismatch
-            ? "Stop error did not match the selected agent DID and turn ID."
-            : error?.message || "Stop request failed before an outcome was confirmed.",
+    const operation = (async () => {
+      try {
+        const response = await api.requestForAgent(
+          STOP_PATH,
           {
-            correlationId,
-            status: error?.status,
-            code: error?.code,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ turn_id: target.turnId, correlation_id: correlationId }),
           },
+          target.agentName,
         );
+        const outcomes = Array.isArray(response?.stop_outcomes) ? response.stop_outcomes : [];
+        const responseTurn = response?.turn_id == null ? target.turnId : response.turn_id;
+        let result;
+        if (
+          responseTurn !== target.turnId ||
+          outcomes.length !== 1 ||
+          !outcomeMatches(outcomes[0], target, correlationId)
+        ) {
+          result = indeterminateResult(
+            target,
+            "Stop response did not match the selected agent DID and turn ID.",
+            { correlationId },
+          );
+        } else {
+          result = resultFromOutcome(target, outcomes[0], { message: response?.message });
+        }
+        results.set(target.key, result);
+        emit();
+        return result;
+      } catch (error) {
+        const outcomes = structuredOutcomes(error);
+        let result;
+        if (outcomes.length === 1 && outcomeMatches(outcomes[0], target, correlationId)) {
+          result = resultFromOutcome(target, outcomes[0], {
+            message: error?.message,
+            status: Number.isInteger(error?.status) ? error.status : null,
+          });
+        } else {
+          const identityMismatch = outcomes.length > 0;
+          result = indeterminateResult(
+            target,
+            identityMismatch
+              ? "Stop error did not match the selected agent DID and turn ID."
+              : error?.message || "Stop request failed before an outcome was confirmed.",
+            {
+              correlationId,
+              status: error?.status,
+              code: error?.code,
+            },
+          );
+        }
+        results.set(target.key, result);
+        emit();
+        return result;
       }
-      results.set(target.key, result);
-      emit();
-      return result;
-    }
+    })();
+    pendingOperations.set(target.key, operation);
+    const forgetOperation = () => {
+      if (pendingOperations.get(target.key) === operation) {
+        pendingOperations.delete(target.key);
+      }
+    };
+    operation.then(forgetOperation, forgetOperation);
+    return operation;
   }
 
   async function stopSelected() {
     // Snapshot exact targets before the first await.  Redraws, deselection, and
     // sub-tab switches cannot retarget an in-flight multi-Stop operation.
-    const targets = selectedTargets();
+    const targets = selectedTargets().filter(
+      (target) => results.get(target.key)?.state !== "submitting",
+    );
     return Promise.all(targets.map((target) => stopOne(target)));
   }
 
@@ -367,6 +382,9 @@ export function mountStopActionBar(element, controller) {
   function render() {
     const selected = controller.selected();
     const resultByKey = new Map(controller.results().map((result) => [result.key, result]));
+    const dispatchable = selected.filter(
+      (target) => resultByKey.get(target.key)?.state !== "submitting",
+    );
     const rows = new Map(selected.map((target) => [target.key, { target, result: null }]));
     for (const result of resultByKey.values()) {
       rows.set(result.key, { target: result.target, result });
@@ -377,7 +395,7 @@ export function mountStopActionBar(element, controller) {
           <strong>Cooperative Stop</strong>
           <span class="obs-stopbar__count">${selected.length} turn${selected.length === 1 ? "" : "s"} selected</span>
           <span class="obs-stopbar__grow"></span>
-          <button type="button" class="obs-stopbar__button obs-stopbar__button--danger" data-stop-selected ${selected.length ? "" : "disabled"}>Stop selected</button>
+          <button type="button" class="obs-stopbar__button obs-stopbar__button--danger" data-stop-selected ${dispatchable.length ? "" : "disabled"}>Stop selected</button>
           <button type="button" class="obs-stopbar__button" data-clear-selection ${selected.length ? "" : "disabled"}>Clear selection</button>
           <button type="button" class="obs-stopbar__button" data-clear-results ${resultByKey.size ? "" : "disabled"}>Dismiss outcomes</button>
         </div>

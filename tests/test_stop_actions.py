@@ -233,6 +233,99 @@ process.stdout.write(JSON.stringify({ calls, selected, outcome }));
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_unknown_completion_disables_stop_until_turn_events_are_loaded(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "completion-unknown.mjs",
+        r"""
+import { stopActionModel, stopTargetFromDetail } from "./stop-actions.js";
+const controller = { getResult() { return null; }, isSelected() { return false; } };
+const unknown = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#4",
+}, { completionKnown: false });
+const checked = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#4",
+}, { completionKnown: true, completed: false });
+process.stdout.write(JSON.stringify({
+  unknown: stopActionModel(unknown, controller),
+  checked: stopActionModel(checked, controller),
+}));
+""",
+    )
+
+    assert result["unknown"]["disabled"] is True
+    assert result["unknown"]["stopLabel"] == "Checking turn state…"
+    assert result["checked"]["disabled"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_pending_target_is_submitted_once_across_single_and_batch_actions(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "pending-dedupe.mjs",
+        r"""
+import {
+  createStopController,
+  mountStopActionBar,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+let calls = 0;
+let release;
+const controller = createStopController({
+  correlationIdFactory: () => `corr-${calls + 1}`,
+  api: {
+    async requestForAgent(_path, options) {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      await new Promise((resolve) => { release = resolve; });
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn", requested_target: body.turn_id,
+          resolved_target: "request-1", agent_id: "did:kestrel:emma",
+          disposition: "stopped", correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#pending",
+});
+controller.select(target);
+const listeners = new Map();
+const element = {
+  innerHTML: "",
+  addEventListener(name, fn) { listeners.set(name, fn); },
+  removeEventListener(name) { listeners.delete(name); },
+};
+const mounted = mountStopActionBar(element, controller);
+const first = controller.stopOne(target);
+const second = controller.stopOne(target);
+const batch = controller.stopSelected();
+const pendingHtml = element.innerHTML;
+release();
+const outcomes = await Promise.all([first, second]);
+const batchOutcomes = await batch;
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  calls,
+  pendingHtml,
+  states: outcomes.map((item) => item.state),
+  batchCount: batchOutcomes.length,
+}));
+""",
+    )
+
+    assert result["calls"] == 1
+    assert "data-stop-selected disabled" in result["pendingHtml"]
+    assert result["states"] == ["stopped", "stopped"]
+    assert result["batchCount"] == 0
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_mismatched_server_identity_is_indeterminate(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
@@ -342,10 +435,11 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
 
     assert "data-pstop" in timeline
     assert "data-pselect" in timeline
-    assert "stopController.stopOne(stopTarget)" in timeline
+    assert "stopController.stopOne(stopTargetForSpan(s))" in timeline
     assert "data-inspector-stop" in navigator
     assert "data-inspector-select" in navigator
     assert "stopController.stopOne(stopTargetForNode" in navigator
+    assert "completionKnown: Boolean(turn && turn.loaded)" in navigator
     assert "createStopController({ api: API })" in panel
     assert "mountStopActionBar(stopActionsEl, stopController)" in panel
     assert "const opts = { project, stopController };" in panel

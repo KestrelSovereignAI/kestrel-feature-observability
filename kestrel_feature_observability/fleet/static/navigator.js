@@ -815,6 +815,7 @@ export function mount(container, opts = {}) {
     const turn = owningTurn(node);
     const target = stopTargetFromDetail(detail, {
       completed: Boolean(turn && turn.data.summary),
+      completionKnown: Boolean(turn && turn.loaded),
     });
     if (stopController) stopController.observe(target);
     return target;

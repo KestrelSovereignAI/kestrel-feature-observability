@@ -544,6 +544,12 @@ class ObservabilityHook(Hook):
         tool with its OWN turn rather than the live one (#84).
         """
         attrs = _session_attrs(session_id)
+        agent_did = self._agent_did()
+        if agent_did:
+            # Turn traces are deliberately separate roots from the session
+            # marker, so parent traversal cannot recover session-only identity.
+            # Stamp the public Stop routing identity on every turn span.
+            attrs["kestrel.agent_did"] = agent_did
         if turn is not None:
             if turn.turn_id is not None:
                 attrs[KESTREL_TURN_ID] = turn.turn_id
@@ -626,6 +632,9 @@ class ObservabilityHook(Hook):
         # current_turn isn't set yet, so stamp the turn identity explicitly here
         # (every span of the turn carries session id + turn id + turn index).
         attributes = _session_attrs(session_id)
+        agent_did = self._agent_did()
+        if agent_did:
+            attributes["kestrel.agent_did"] = agent_did
         attributes.update(
             {
                 KESTREL_TURN_INDEX: index,

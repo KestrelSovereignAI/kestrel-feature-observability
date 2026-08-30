@@ -3418,11 +3418,18 @@ export function mount(container, opts = {}) {
     }
     const stopBtn = popEl.querySelector("[data-pstop]");
     if (stopBtn && stopController) {
-      stopBtn.addEventListener("click", () => stopController.stopOne(stopTarget));
+      // Polling can fold a turn summary while this popover stays open. Resolve
+      // lifecycle state at dispatch time rather than retaining the target from
+      // when the popover was first rendered.
+      stopBtn.addEventListener("click", () =>
+        stopController.stopOne(stopTargetForSpan(s)),
+      );
     }
     const selectBtn = popEl.querySelector("[data-pselect]");
     if (selectBtn && stopController) {
-      selectBtn.addEventListener("click", () => stopController.toggle(stopTarget));
+      selectBtn.addEventListener("click", () =>
+        stopController.toggle(stopTargetForSpan(s)),
+      );
     }
   }
 
