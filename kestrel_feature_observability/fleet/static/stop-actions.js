@@ -171,8 +171,11 @@ export function createStopController({
   const selected = new Map();
   const results = new Map();
   // Dismissing visible outcomes is presentation state, not authorization to
-  // repeat a mutation. Confirmed terminal receipts remain as local Stop guards.
+  // repeat a mutation. Confirmed terminal receipts remain as local Stop guards;
+  // indeterminate attempts retain the operation identity needed for an exact
+  // replay without remaining visible after dismissal.
   const confirmedResults = new Map();
+  const indeterminateResults = new Map();
   const pendingOperations = new Map();
   const listeners = new Set();
 
@@ -207,7 +210,7 @@ export function createStopController({
     // A single-inspector outcome can exist without any selection. Preserve its
     // operation evidence, but advance the retained target so a later turn
     // summary disables Retry locally instead of issuing another Stop.
-    for (const store of [results, confirmedResults]) {
+    for (const store of [results, confirmedResults, indeterminateResults]) {
       const existingResult = store.get(target.key);
       if (!existingResult) continue;
       const advancedTarget = advance(existingResult.target);
@@ -263,7 +266,12 @@ export function createStopController({
   }
 
   function storedResult(key) {
-    return results.get(key) || confirmedResults.get(key) || null;
+    return (
+      results.get(key) ||
+      confirmedResults.get(key) ||
+      indeterminateResults.get(key) ||
+      null
+    );
   }
 
   function storeResult(result) {
@@ -278,6 +286,11 @@ export function createStopController({
     if (CONFIRMED_STOP_DISPOSITIONS.has(retained.state)) {
       confirmedResults.set(retained.key, retained);
     }
+    if (retained.state === "indeterminate") {
+      indeterminateResults.set(retained.key, retained);
+    } else if (TERMINAL_DISPOSITIONS.has(retained.state)) {
+      indeterminateResults.delete(retained.key);
+    }
   }
 
   function knownTargets() {
@@ -288,7 +301,7 @@ export function createStopController({
       byKey.set(target.key, mergeCompletionEvidence(target, existing));
     };
     for (const target of selected.values()) retain(target);
-    for (const store of [confirmedResults, results]) {
+    for (const store of [confirmedResults, indeterminateResults, results]) {
       for (const result of store.values()) retain(result.target);
     }
     return [...byKey.values()];

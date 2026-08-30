@@ -91,6 +91,12 @@ import {
   stopTargetFromDetail,
 } from "./phoenix.js";
 
+/** Advance retained Stop targets from a focused full-trace completion read. */
+export function observeFocusedTurnCompletion(controller, detail, evidence) {
+  if (!controller || typeof controller.observe !== "function") return false;
+  return controller.observe(stopTargetFromDetail(detail, evidence));
+}
+
 // ── Tuning ────────────────────────────────────────────────────
 const POLL_MS = 5_000; // live-follow poll cadence
 const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 min visible window
@@ -3338,12 +3344,14 @@ export function mount(container, opts = {}) {
         const focused = ((((trace || {}).spans || {}).edges) || [])
           .map((edge) => edge && edge.node)
           .filter(Boolean);
-        turnCompletionCache.set(
-          key,
-          turnCompletionEvidence(focused, detail, {
-            truncated: focused.length >= TURN_TRACE_SPAN_LIMIT,
-          }),
-        );
+        const evidence = turnCompletionEvidence(focused, detail, {
+          truncated: focused.length >= TURN_TRACE_SPAN_LIMIT,
+        });
+        turnCompletionCache.set(key, evidence);
+        // The selection can outlive both the popover and this Timeline tab.
+        // Publish focused evidence to the shared controller immediately; the
+        // active-popover repaint below is presentation only.
+        observeFocusedTurnCompletion(stopController, detail, evidence);
       } catch (_error) {
         // Unknown is load-bearing: a failed focused read never enables Stop.
       } finally {

@@ -123,7 +123,10 @@ export function navigatorTurnCompletionEvidence(turn) {
 }
 
 /** A loaded turn gets only a bounded number of late-summary refreshes. */
-export function navigatorTurnNeedsCompletionRefresh(turn) {
+export function navigatorTurnNeedsCompletionRefresh(
+  turn,
+  { manual = false } = {},
+) {
   return Boolean(
     turn &&
       turn.kind === "turn" &&
@@ -132,7 +135,7 @@ export function navigatorTurnNeedsCompletionRefresh(turn) {
       !turn.data.summary &&
       turn.data.inventoryComplete === true &&
       Number.isInteger(turn.data.completionRefreshesRemaining) &&
-      turn.data.completionRefreshesRemaining > 0,
+      (manual || turn.data.completionRefreshesRemaining > 0),
   );
 }
 const POLL_MS = 10_000; // live-follow cadence
@@ -1092,7 +1095,7 @@ export function mount(container, opts = {}) {
       const targets = [];
       (function collect(node) {
         if (node.kind === "turn") {
-          if (navigatorTurnNeedsCompletionRefresh(node)) targets.push(node);
+          if (navigatorTurnNeedsCompletionRefresh(node, { manual })) targets.push(node);
         } else if (
           node.expanded &&
           node.loaded &&

@@ -444,6 +444,53 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_dismissing_indeterminate_outcome_preserves_replay_identity(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "dismiss-indeterminate.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+const correlations = ["corr-first", "corr-second"];
+const calls = [];
+const controller = createStopController({
+  correlationIdFactory: () => correlations.shift(),
+  api: {
+    async requestForAgent(_path, options) {
+      const body = JSON.parse(options.body);
+      calls.push(body.correlation_id);
+      if (calls.length === 1) throw new Error("timeout after possible commit");
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn", requested_target: body.turn_id,
+          resolved_target: "request-1", agent_id: "did:kestrel:emma",
+          disposition: "stopped", correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#ambiguous",
+}, { completionKnown: true, completed: false });
+const first = await controller.stopOne(target);
+controller.clearResults();
+const visible = controller.results();
+const retained = controller.getResult(target);
+const second = await controller.stopOne(target);
+process.stdout.write(JSON.stringify({ calls, first, visible, retained, second }));
+""",
+    )
+
+    assert result["first"]["state"] == "indeterminate"
+    assert result["visible"] == []
+    assert result["retained"]["state"] == "indeterminate"
+    assert result["calls"] == ["corr-first", "corr-first"]
+    assert result["second"]["state"] == "stopped"
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_navigator_completion_requires_untruncated_refreshable_inventory(tmp_path):
     pkg = _module_dir(tmp_path)
     (pkg / "navigator.js").write_text(
@@ -496,6 +543,10 @@ process.stdout.write(JSON.stringify({
       ...refreshable,
       data: { ...refreshable.data, summary: { status: "ok" } },
     }),
+    manualExhausted: navigatorTurnNeedsCompletionRefresh({
+      ...refreshable,
+      data: { ...refreshable.data, completionRefreshesRemaining: 0 },
+    }, { manual: true }),
   },
 }));
 """,
@@ -515,7 +566,43 @@ process.stdout.write(JSON.stringify({
         "live": True,
         "exhausted": False,
         "summarized": False,
+        "manualExhausted": True,
     }
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_focused_completion_updates_retained_selection_without_open_popover(tmp_path):
+    pkg = _module_dir(tmp_path)
+    (pkg / "timeline.js").write_text(
+        (STATIC / "timeline.js").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    result = _run(
+        pkg,
+        "focused-completion-selection.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import { observeFocusedTurnCompletion } from "./timeline.js";
+const controller = createStopController({
+  api: { async requestForAgent() { throw new Error("must not call"); } },
+});
+const detail = {
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#focused",
+};
+controller.select(stopTargetFromDetail(detail, {
+  completionKnown: false,
+  completed: false,
+}));
+observeFocusedTurnCompletion(controller, detail, {
+  completionKnown: true,
+  completed: true,
+});
+process.stdout.write(JSON.stringify(controller.selected()[0]));
+""",
+    )
+
+    assert result["completionKnown"] is True
+    assert result["completed"] is True
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
@@ -836,7 +923,7 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "stopController.stopOne(stopTargetForNode" in navigator
     assert "navigatorTurnCompletionEvidence(turn)" in navigator
     assert "navigatorTraceInventoryComplete(trace, spans)" in navigator
-    assert "navigatorTurnNeedsCompletionRefresh(node)" in navigator
+    assert "navigatorTurnNeedsCompletionRefresh(node, { manual })" in navigator
     assert "stopTargetForNode(node);" in navigator
     assert "reconcileSelectedTurnCompletions();" in timeline
     assert "const completedTurns = turnCompletionIndex(spans.values());" in timeline
@@ -844,6 +931,7 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "turnCompletionEvidence(spans.values(), target" not in timeline
     assert "turnCompletionCache.get(key)?.completed === true" in timeline
     assert "turnCompletionCache.delete(key);" in timeline
+    assert "observeFocusedTurnCompletion(stopController, detail, evidence);" in timeline
     assert "needsFocusedTurnCompletion(spans.values(), detail" in timeline
     load_children = navigator[
         navigator.index("async function loadChildren") : navigator.index(
