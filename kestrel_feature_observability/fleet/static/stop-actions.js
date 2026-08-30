@@ -423,7 +423,11 @@ export function mountStopActionBar(element, controller) {
     const resultByKey = new Map(controller.results().map((result) => [result.key, result]));
     const dispatchable = selected.filter(
       (target) => {
-        const state = resultByKey.get(target.key)?.state;
+        // Visible results are presentation state: "Dismiss outcomes" clears
+        // them while the controller deliberately retains a confirmed terminal
+        // receipt as a replay guard.  Derive dispatchability from that retained
+        // state or the bar offers a Stop action which stopSelected must ignore.
+        const state = controller.getResult(target)?.state;
         return (
           target.completionKnown === true &&
           target.completed !== true &&

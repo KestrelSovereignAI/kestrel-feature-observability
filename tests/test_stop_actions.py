@@ -387,6 +387,7 @@ def test_dismissing_outcome_preserves_confirmed_terminal_guard(tmp_path):
         r"""
 import {
   createStopController,
+  mountStopActionBar,
   stopActionModel,
   stopTargetFromDetail,
 } from "./stop-actions.js";
@@ -412,15 +413,23 @@ const target = stopTargetFromDetail({
   agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#dismiss",
 });
 controller.select(target);
+const element = {
+  innerHTML: "",
+  addEventListener() {},
+  removeEventListener() {},
+};
+const mounted = mountStopActionBar(element, controller);
 const first = await controller.stopOne(target);
 controller.clearResults();
 const visibleAfterDismiss = controller.results();
 const remembered = controller.getResult(target);
 const model = stopActionModel(target, controller);
+const barAfterDismiss = element.innerHTML;
 const second = await controller.stopOne(target);
 const batch = await controller.stopSelected();
+mounted.destroy();
 process.stdout.write(JSON.stringify({
-  calls, first, visibleAfterDismiss, remembered, model, second, batch,
+  calls, first, visibleAfterDismiss, remembered, model, barAfterDismiss, second, batch,
 }));
 """,
     )
@@ -429,6 +438,7 @@ process.stdout.write(JSON.stringify({
     assert result["visibleAfterDismiss"] == []
     assert result["remembered"]["state"] == "stopped"
     assert result["model"]["disabled"] is True
+    assert "data-stop-selected disabled" in result["barAfterDismiss"]
     assert result["second"]["state"] == "stopped"
     assert result["batch"] == []
 
@@ -444,8 +454,21 @@ def test_navigator_completion_requires_untruncated_refreshable_inventory(tmp_pat
         pkg,
         "navigator-completion.mjs",
         r"""
-import { navigatorTurnCompletionEvidence } from "./navigator.js";
+import {
+  navigatorTraceInventoryComplete,
+  navigatorTurnCompletionEvidence,
+  navigatorTurnNeedsCompletionRefresh,
+} from "./navigator.js";
 const turn = (data, loaded = true) => ({ data, loaded });
+const refreshable = {
+  kind: "turn",
+  loaded: true,
+  data: {
+    inventoryComplete: true,
+    completionRefreshesRemaining: 2,
+    summary: null,
+  },
+};
 process.stdout.write(JSON.stringify({
   initial: navigatorTurnCompletionEvidence(turn({}, false)),
   truncated: navigatorTurnCompletionEvidence(turn({ inventoryComplete: false })),
@@ -454,6 +477,26 @@ process.stdout.write(JSON.stringify({
     inventoryComplete: false,
     summary: { status: "ok" },
   })),
+  inventories: {
+    absentTrace: navigatorTraceInventoryComplete(null, []),
+    absentConnection: navigatorTraceInventoryComplete({}, []),
+    emptyTrace: navigatorTraceInventoryComplete({ spans: { edges: [] } }, []),
+    fullPage: navigatorTraceInventoryComplete(
+      { spans: { edges: [] } },
+      Array.from({ length: 1000 }, () => ({})),
+    ),
+  },
+  refresh: {
+    live: navigatorTurnNeedsCompletionRefresh(refreshable),
+    exhausted: navigatorTurnNeedsCompletionRefresh({
+      ...refreshable,
+      data: { ...refreshable.data, completionRefreshesRemaining: 0 },
+    }),
+    summarized: navigatorTurnNeedsCompletionRefresh({
+      ...refreshable,
+      data: { ...refreshable.data, summary: { status: "ok" } },
+    }),
+  },
 }));
 """,
     )
@@ -462,6 +505,17 @@ process.stdout.write(JSON.stringify({
     assert result["truncated"] == {"completed": False, "completionKnown": False}
     assert result["active"] == {"completed": False, "completionKnown": True}
     assert result["summarized"] == {"completed": True, "completionKnown": True}
+    assert result["inventories"] == {
+        "absentTrace": False,
+        "absentConnection": False,
+        "emptyTrace": True,
+        "fullPage": False,
+    }
+    assert result["refresh"] == {
+        "live": True,
+        "exhausted": False,
+        "summarized": False,
+    }
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
@@ -475,8 +529,15 @@ def test_timeline_partial_inventory_keeps_completion_unknown(tmp_path):
         pkg,
         "turn-completion.mjs",
         r"""
-import { turnCompletionEvidence } from "./timeline.js";
-const detail = { turnId: "turn-4", agentDid: "did:kestrel:emma" };
+import {
+  needsFocusedTurnCompletion,
+  turnCompletionEvidence,
+} from "./timeline.js";
+const detail = {
+  agent: "Emma",
+  turnId: "turn-4",
+  agentDid: "did:kestrel:emma",
+};
 const root = {
   name: "Emma turn 4",
   attributes: JSON.stringify({
@@ -492,6 +553,12 @@ process.stdout.write(JSON.stringify({
   partial: turnCompletionEvidence([root], detail, { truncated: true }),
   full: turnCompletionEvidence([root], detail, { truncated: false }),
   completedPartial: turnCompletionEvidence([root, summary], detail, { truncated: true }),
+  focused: {
+    active: needsFocusedTurnCompletion([root], detail),
+    completed: needsFocusedTurnCompletion([root, summary], detail),
+    noController: needsFocusedTurnCompletion([root], detail, { stopAvailable: false }),
+    unaddressable: needsFocusedTurnCompletion([root], { turnId: "turn-4" }),
+  },
 }));
 """,
     )
@@ -501,6 +568,12 @@ process.stdout.write(JSON.stringify({
     assert result["completedPartial"] == {
         "completed": True,
         "completionKnown": True,
+    }
+    assert result["focused"] == {
+        "active": True,
+        "completed": False,
+        "noController": False,
+        "unaddressable": False,
     }
 
 
@@ -620,9 +693,11 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "data-inspector-select" in navigator
     assert "stopController.stopOne(stopTargetForNode" in navigator
     assert "navigatorTurnCompletionEvidence(turn)" in navigator
-    assert "node.data.inventoryComplete = spans.length < TRACE_SPAN_LIMIT" in navigator
-    assert 'node.kind === "turn" &&' in navigator
-    assert "!node.data.summary" in navigator
+    assert "navigatorTraceInventoryComplete(trace, spans)" in navigator
+    assert "navigatorTurnNeedsCompletionRefresh(node)" in navigator
+    assert "if (stopController) stopTargetForNode(node);" in navigator
+    assert "reconcileSelectedTurnCompletions();" in timeline
+    assert "needsFocusedTurnCompletion(spans.values(), detail" in timeline
     assert "createStopController({ api: API })" in panel
     assert "mountStopActionBar(stopActionsEl, stopController)" in panel
     assert "const opts = { project, stopController };" in panel

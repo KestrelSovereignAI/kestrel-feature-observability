@@ -99,6 +99,18 @@ export {
 
 const PAGE_SIZE = 100; // root spans per lazy page (client-side aggregation window)
 const TRACE_SPAN_LIMIT = 1000; // events per turn (one trace)
+const TURN_COMPLETION_REFRESH_LIMIT = 6; // bounded late-summary checks per loaded turn
+
+/** Whether a Phoenix trace response proves its returned span inventory complete. */
+export function navigatorTraceInventoryComplete(trace, spans) {
+  const connection = trace && trace.spans;
+  return Boolean(
+    connection &&
+      Array.isArray(connection.edges) &&
+      Array.isArray(spans) &&
+      spans.length < TRACE_SPAN_LIMIT,
+  );
+}
 
 export function navigatorTurnCompletionEvidence(turn) {
   const completed = Boolean(turn && turn.data && turn.data.summary);
@@ -108,6 +120,20 @@ export function navigatorTurnCompletionEvidence(turn) {
       completed || (turn && turn.loaded && turn.data && turn.data.inventoryComplete),
     ),
   };
+}
+
+/** A loaded turn gets only a bounded number of late-summary refreshes. */
+export function navigatorTurnNeedsCompletionRefresh(turn) {
+  return Boolean(
+    turn &&
+      turn.kind === "turn" &&
+      turn.loaded &&
+      turn.data &&
+      !turn.data.summary &&
+      turn.data.inventoryComplete === true &&
+      Number.isInteger(turn.data.completionRefreshesRemaining) &&
+      turn.data.completionRefreshesRemaining > 0,
+  );
 }
 const POLL_MS = 10_000; // live-follow cadence
 
@@ -259,7 +285,7 @@ export function mount(container, opts = {}) {
           await loadTurns(node, mode);
           break;
         case "turn":
-          await loadEvents(node);
+          await loadEvents(node, mode);
           break;
         default:
           break; // event children are pre-loaded
@@ -531,20 +557,23 @@ export function mount(container, opts = {}) {
   // Events level: the turn's whole span tree in one query, nested by parent
   // span id and time-ordered — start/stop markers, hook events, tool calls
   // (TOOL), LLM calls (LLM), gates. Nested events expand locally (no query).
-  async function loadEvents(node) {
+  async function loadEvents(node, mode) {
     const data = await gql(TRACE_SPANS_QUERY, {
       projectId: node.data.projectId,
       traceId: node.data.traceId,
       first: TRACE_SPAN_LIMIT,
     });
     const trace = data.node && data.node.trace;
-    const spans = (((trace && trace.spans) || {}).edges || [])
+    const edges = trace && trace.spans && Array.isArray(trace.spans.edges)
+      ? trace.spans.edges
+      : [];
+    const spans = edges
       .map((e) => e && e.node)
       .filter(Boolean);
     // TRACE_SPANS_QUERY is bounded and exposes no cursor in the pinned Phoenix
     // schema. A full page is therefore possibly truncated, never proof that a
     // missing summary means the turn is still active.
-    node.data.inventoryComplete = spans.length < TRACE_SPAN_LIMIT;
+    node.data.inventoryComplete = navigatorTraceInventoryComplete(trace, spans);
 
     const bySpanId = new Map();
     for (const s of spans) {
@@ -585,6 +614,27 @@ export function mount(container, opts = {}) {
     );
     node.data.summary = turnSummary ? spanSummaryOf(turnSummary) : null;
     node.data.summaryEndMs = turnSummary ? ts(turnSummary.endTime) : null;
+    if (turnSummary || node.data.inventoryComplete !== true) {
+      node.data.completionRefreshesRemaining = 0;
+    } else if (mode === "refresh") {
+      node.data.completionRefreshesRemaining = Math.max(
+        0,
+        (node.data.completionRefreshesRemaining || 0) - 1,
+      );
+    } else if (node.data.completionRefreshesRemaining == null) {
+      // Only canonical Kestrel turn addresses can benefit from polling for a
+      // late summary. Talon traces and session markers do not emit one and must
+      // not become permanent polling obligations merely because they were read.
+      const stopTarget = stopTargetFromDetail(detailForNode(node));
+      node.data.completionRefreshesRemaining = stopTarget.addressable
+        ? TURN_COMPLETION_REFRESH_LIMIT
+        : 0;
+    }
+
+    // Selection may outlive the inspector that created it. Reconcile every
+    // refreshed owning turn so a late summary disables batch Stop even while a
+    // different node is selected.
+    if (stopController) stopTargetForNode(node);
 
     function eventNode(parent, span) {
       const key = `event:${span.id}`;
@@ -1039,14 +1089,8 @@ export function mount(container, opts = {}) {
     try {
       const targets = [];
       (function collect(node) {
-        if (
-          node.kind === "turn" &&
-          node.loaded &&
-          !node.data.summary
-        ) {
-          // A turn loaded while active must remain refreshable until its late
-          // summary appears. Excluding turns made the first snapshot permanent.
-          targets.push(node);
+        if (node.kind === "turn") {
+          if (navigatorTurnNeedsCompletionRefresh(node)) targets.push(node);
         } else if (
           node.expanded &&
           node.loaded &&

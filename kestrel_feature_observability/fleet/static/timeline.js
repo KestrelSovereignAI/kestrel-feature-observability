@@ -844,6 +844,16 @@ export function turnCompletionEvidence(
   });
 }
 
+/** Whether a popover needs the bounded focused trace read used only by Stop. */
+export function needsFocusedTurnCompletion(
+  spanIter,
+  detail,
+  { stopAvailable = true } = {},
+) {
+  if (!stopAvailable || !stopTargetFromDetail(detail).addressable) return false;
+  return !turnCompletionEvidence(spanIter, detail, { truncated: true }).completed;
+}
+
 // ── Ancestor backfill (#108) ──────────────────────────────────
 //
 // Every paged fetch is windowed on `startTime`, and Phoenix's `timeRange` filters
@@ -2721,6 +2731,7 @@ export function mount(container, opts = {}) {
       }
     }
     layout = { rows, contentH: y };
+    reconcileSelectedTurnCompletions();
     clampScroll();
   }
 
@@ -3279,7 +3290,14 @@ export function mount(container, opts = {}) {
 
   function loadTurnCompletion(s, detail) {
     const key = turnCompletionKey(s);
-    if (!key || turnCompletionCache.has(key) || turnCompletionLoads.has(key)) return;
+    if (
+      !key ||
+      turnCompletionCache.has(key) ||
+      turnCompletionLoads.has(key) ||
+      !needsFocusedTurnCompletion(spans.values(), detail, {
+        stopAvailable: Boolean(stopController),
+      })
+    ) return;
     const operation = (async () => {
       try {
         const data = await gql(TRACE_SPANS_QUERY, {
@@ -3313,6 +3331,19 @@ export function mount(container, opts = {}) {
     const target = stopTargetFromDetail(detail, completion);
     if (stopController) stopController.observe(target);
     return target;
+  }
+
+  function reconcileSelectedTurnCompletions() {
+    if (!stopController || typeof stopController.selected !== "function") return;
+    for (const target of stopController.selected()) {
+      const completion = turnCompletionEvidence(spans.values(), target, {
+        truncated: true,
+      });
+      if (!completion.completed) continue;
+      stopController.observe(
+        Object.freeze({ ...target, ...completion }),
+      );
+    }
   }
 
   // The session band is not a span, but it answers the same questions — so it
