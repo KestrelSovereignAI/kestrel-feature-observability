@@ -1413,6 +1413,10 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "turnCompletionCache.get(key)?.completed === true" in timeline
     assert "turnCompletionCache.delete(key);" in timeline
     assert "observeFocusedTurnCompletion(stopController, detail, evidence);" in timeline
+    refresh_wiring = timeline[
+        timeline.index("// Toolbar.") : timeline.index("// ── Live render loop")
+    ]
+    assert "retryActivePopoverTurnCompletion();" in refresh_wiring
     assert "needsFocusedTurnCompletion(spans.values(), detail" not in timeline
     load_children = navigator[
         navigator.index("async function loadChildren") : navigator.index(

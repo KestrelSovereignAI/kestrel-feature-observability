@@ -3387,6 +3387,15 @@ export function mount(container, opts = {}) {
     turnCompletionLoads.set(key, operation);
   }
 
+  function retryActivePopoverTurnCompletion() {
+    if (!activePopoverSpan || popEl.hidden) return;
+    // The viewport poll and this authoritative full-trace read are separate
+    // queries. A transient failure in the focused read leaves completion
+    // unknown by design, so the operator's explicit Refresh must retry it too
+    // instead of only refreshing the visible span window.
+    loadTurnCompletion(activePopoverSpan, spanDetail(activePopoverSpan));
+  }
+
   function stopTargetForSpan(s, detail = spanDetail(s)) {
     const completion = knownTurnCompletion(s, detail);
     const target = stopTargetFromDetail(detail, completion);
@@ -3801,7 +3810,10 @@ export function mount(container, opts = {}) {
   liveBtn.addEventListener("click", () => setLive(!live));
   container.querySelector("[data-zoomin]").addEventListener("click", () => zoomAt(1 / 1.6, null));
   container.querySelector("[data-zoomout]").addEventListener("click", () => zoomAt(1.6, null));
-  container.querySelector("[data-refresh]").addEventListener("click", () => pollTick(true));
+  container.querySelector("[data-refresh]").addEventListener("click", () => {
+    pollTick(true);
+    retryActivePopoverTurnCompletion();
+  });
 
   bodyEl.addEventListener("keydown", (e) => {
     if (e.key === "Escape") hidePopover();
