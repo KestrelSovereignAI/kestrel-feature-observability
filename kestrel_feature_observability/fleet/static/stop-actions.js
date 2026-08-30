@@ -174,25 +174,45 @@ export function createStopController({
   function observe(candidate) {
     const target = canonicalTarget(candidate);
     if (!target) return false;
-    const existing = selected.get(target.key);
-    if (!existing) return false;
-    const completionKnown =
-      existing.completionKnown === true || target.completionKnown === true;
-    const completed = existing.completed === true || target.completed === true;
-    if (
-      completionKnown === existing.completionKnown &&
-      completed === existing.completed
-    ) {
-      return false;
+    let changed = false;
+
+    function advance(existing) {
+      if (!existing) return existing;
+      const completionKnown =
+        existing.completionKnown === true || target.completionKnown === true;
+      const completed = existing.completed === true || target.completed === true;
+      if (
+        completionKnown === existing.completionKnown &&
+        completed === existing.completed
+      ) {
+        return existing;
+      }
+      changed = true;
+      // Lifecycle advances monotonically, while routing and identity remain
+      // the exact values captured by the original selection/operation.
+      return Object.freeze({ ...existing, completionKnown, completed });
     }
-    // Lifecycle may advance on a later poll, but routing and identity remain
-    // the exact values selected originally.
-    selected.set(
-      target.key,
-      Object.freeze({ ...existing, completionKnown, completed }),
-    );
-    emit();
-    return true;
+
+    const existingSelection = selected.get(target.key);
+    if (existingSelection) selected.set(target.key, advance(existingSelection));
+
+    // A single-inspector outcome can exist without any selection. Preserve its
+    // operation evidence, but advance the retained target so a later turn
+    // summary disables Retry locally instead of issuing another Stop.
+    for (const store of [results, confirmedResults]) {
+      const existingResult = store.get(target.key);
+      if (!existingResult) continue;
+      const advancedTarget = advance(existingResult.target);
+      if (advancedTarget !== existingResult.target) {
+        store.set(
+          target.key,
+          Object.freeze({ ...existingResult, target: advancedTarget }),
+        );
+      }
+    }
+
+    if (changed) emit();
+    return changed;
   }
 
   function select(candidate) {
@@ -268,7 +288,13 @@ export function createStopController({
       return complete;
     }
 
-    const correlationId = presentString(correlationIdFactory());
+    // An ambiguous response may have followed a committed server mutation.
+    // Retry that exact durable operation identity; only a typed terminal
+    // refusal/unreachable outcome starts a genuinely new operation.
+    const correlationId =
+      (priorResult?.state === "indeterminate" &&
+        presentString(priorResult.correlationId)) ||
+      presentString(correlationIdFactory());
     if (!correlationId) {
       const invalid = indeterminateResult(target, "Stop correlation ID could not be created.");
       storeResult(invalid);

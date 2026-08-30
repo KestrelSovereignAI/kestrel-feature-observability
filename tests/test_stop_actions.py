@@ -624,6 +624,77 @@ process.stdout.write(JSON.stringify(outcome));
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_indeterminate_retry_replays_operation_and_completion_disables_it(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "indeterminate-replay.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+let calls = 0;
+let factoryCalls = 0;
+const bodies = [];
+const controller = createStopController({
+  correlationIdFactory: () => `corr-${++factoryCalls}`,
+  api: {
+    async requestForAgent(_path, options) {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      bodies.push(body);
+      if (calls === 1 || calls === 3) throw new Error("response lost");
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn", requested_target: body.turn_id,
+          resolved_target: "request-1", agent_id: "did:kestrel:emma",
+          disposition: "already_complete", correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#replay",
+});
+const first = await controller.stopOne(target);
+const second = await controller.stopOne(controller.targetForKey(target.key));
+
+const separate = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#complete",
+});
+const ambiguous = await controller.stopOne(separate);
+const completed = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#complete",
+}, { completed: true, completionKnown: true });
+controller.observe(completed);
+const retainedAfterSummary = controller.getResult(separate);
+const declined = await controller.stopOne(controller.targetForKey(separate.key));
+process.stdout.write(JSON.stringify({
+  first: first.state,
+  second: second.state,
+  ambiguous: ambiguous.state,
+  retainedCompleted: retainedAfterSummary.target.completed,
+  declined: declined.state,
+  calls,
+  factoryCalls,
+  correlationIds: bodies.map((body) => body.correlation_id),
+}));
+""",
+    )
+
+    assert result == {
+        "first": "indeterminate",
+        "second": "already_complete",
+        "ambiguous": "indeterminate",
+        "retainedCompleted": True,
+        "declined": "already_complete",
+        "calls": 3,
+        "factoryCalls": 2,
+        "correlationIds": ["corr-1", "corr-1", "corr-2"],
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_action_bar_dispatches_snapshot_and_keeps_partial_outcomes_visible(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
@@ -702,11 +773,26 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "navigatorTurnCompletionEvidence(turn)" in navigator
     assert "navigatorTraceInventoryComplete(trace, spans)" in navigator
     assert "navigatorTurnNeedsCompletionRefresh(node)" in navigator
-    assert "if (stopController) stopTargetForNode(node);" in navigator
+    assert "stopTargetForNode(node);" in navigator
     assert "reconcileSelectedTurnCompletions();" in timeline
     assert "const completedTurns = turnCompletionIndex(spans.values());" in timeline
     assert "turnCompletionEvidence(spans.values(), target" not in timeline
+    assert "turnCompletionCache.get(key)?.completed === true" in timeline
+    assert "turnCompletionCache.delete(key);" in timeline
     assert "needsFocusedTurnCompletion(spans.values(), detail" in timeline
+    load_children = navigator[
+        navigator.index("async function loadChildren") : navigator.index(
+            "async function loadProjects"
+        )
+    ]
+    assert load_children.index("node.loaded = true") < load_children.index(
+        "stopTargetForNode(node)"
+    )
+    assert "if (stopController) stopTargetForNode(node);" not in navigator[
+        navigator.index("async function loadEvents") : navigator.index(
+            "// ── Virtualized rows"
+        )
+    ]
     assert "createStopController({ api: API })" in panel
     assert "mountStopActionBar(stopActionsEl, stopController)" in panel
     assert "const opts = { project, stopController };" in panel

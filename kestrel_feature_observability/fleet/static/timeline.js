@@ -3314,12 +3314,18 @@ export function mount(container, opts = {}) {
     const key = turnCompletionKey(s);
     if (
       !key ||
-      turnCompletionCache.has(key) ||
       turnCompletionLoads.has(key) ||
       !needsFocusedTurnCompletion(spans.values(), detail, {
         stopAvailable: Boolean(stopController),
       })
     ) return;
+    // Positive completion is permanent. A negative focused snapshot describes
+    // only that instant: a paused view may receive no local summary afterward,
+    // so reopening the popover must revalidate instead of treating "active"
+    // as immutable. Remove it before the request so Stop stays disabled while
+    // that revalidation is in flight.
+    if (turnCompletionCache.get(key)?.completed === true) return;
+    turnCompletionCache.delete(key);
     const operation = (async () => {
       try {
         const data = await gql(TRACE_SPANS_QUERY, {

@@ -291,6 +291,13 @@ export function mount(container, opts = {}) {
           break; // event children are pre-loaded
       }
       node.loaded = true;
+      if (node.kind === "turn" && stopController) {
+        // Completion knowledge depends on `loaded`: reconcile only after the
+        // just-fetched inventory becomes authoritative, then refresh a retained
+        // inspector even when live-follow is off and observe() is a no-op.
+        stopTargetForNode(node);
+        if (owningTurn(selectedNode) === node) renderInspector();
+      }
       if (mode !== "refresh") node.error = null;
     } catch (e) {
       if (mode !== "refresh") node.error = (e && e.message) || "query failed";
@@ -630,11 +637,6 @@ export function mount(container, opts = {}) {
         ? TURN_COMPLETION_REFRESH_LIMIT
         : 0;
     }
-
-    // Selection may outlive the inspector that created it. Reconcile every
-    // refreshed owning turn so a late summary disables batch Stop even while a
-    // different node is selected.
-    if (stopController) stopTargetForNode(node);
 
     function eventNode(parent, span) {
       const key = `event:${span.id}`;
