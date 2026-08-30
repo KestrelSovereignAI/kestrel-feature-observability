@@ -255,7 +255,7 @@ process.stdout.write(JSON.stringify({ calls, outcome }));
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
-def test_stop_negotiates_once_per_agent_route_before_posting(tmp_path):
+def test_stop_revalidates_agent_route_before_each_separate_operation(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
         pkg,
@@ -267,6 +267,8 @@ const api = {
   async requestForAgent(path, options, agent) {
     calls.push({ path, method: options.method, agent });
     if (options.method === "GET") {
+      const capabilityAttempt = calls.filter((call) => call.method === "GET").length;
+      if (capabilityAttempt > 1) return { protocol: "legacy.stop", version: 0 };
       return {
         protocol: "kestrel.cooperative_stop",
         version: 1,
@@ -295,24 +297,132 @@ const controller = createStopController({
   api,
   correlationIdFactory: () => `corr-${++correlation}`,
 });
+const outcomes = [];
 for (const turnId of ["emma#one", "emma#two"]) {
-  await controller.stopOne(stopTargetFromDetail({
+  outcomes.push(await controller.stopOne(stopTargetFromDetail({
     agent: "Emma", agentDid: "did:kestrel:emma", turnId,
-  }, { completionKnown: true, completed: false }));
+  }, { completionKnown: true, completed: false })));
 }
-process.stdout.write(JSON.stringify(calls));
+process.stdout.write(JSON.stringify({ calls, outcomes: outcomes.map((item) => item.state) }));
 """,
     )
 
-    assert result == [
+    assert result["calls"] == [
         {
             "path": "/api/agent/stop/capabilities",
             "method": "GET",
             "agent": "Emma",
         },
         {"path": "/api/agent/stop", "method": "POST", "agent": "Emma"},
-        {"path": "/api/agent/stop", "method": "POST", "agent": "Emma"},
+        {
+            "path": "/api/agent/stop/capabilities",
+            "method": "GET",
+            "agent": "Emma",
+        },
     ]
+    assert result["outcomes"] == ["stopped", "indeterminate"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_stop_rechecks_completion_after_capability_negotiation(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "stop-completion-during-negotiation.mjs",
+        r"""
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+
+let releaseCapability;
+const capabilityGate = new Promise((resolve) => { releaseCapability = resolve; });
+let posts = 0;
+const controller = createStopController({
+  api: {
+    async requestForAgent(_path, options) {
+      if (options.method === "POST") posts += 1;
+      throw new Error("Stop POST must not follow known completion");
+    },
+  },
+  capabilityLoader: async () => {
+    await capabilityGate;
+    return REQUIRED_TURN_STOP_CAPABILITY_V1;
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#during-probe",
+}, { completionKnown: true, completed: false });
+const pending = controller.stopOne(target);
+await Promise.resolve();
+controller.observe(stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#during-probe",
+}, { completionKnown: true, completed: true }));
+releaseCapability();
+const outcome = await pending;
+process.stdout.write(JSON.stringify({ posts, state: outcome.state }));
+""",
+    )
+
+    assert result == {"posts": 0, "state": "already_complete"}
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_concurrent_same_route_stops_share_capability_probe(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "stop-concurrent-capability-probe.mjs",
+        r"""
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+
+let releaseProbe;
+const probeGate = new Promise((resolve) => { releaseProbe = resolve; });
+let gets = 0;
+let posts = 0;
+const controller = createStopController({
+  api: {
+    async requestForAgent(path, options) {
+      if (options.method === "GET") {
+        gets += 1;
+        await probeGate;
+        return REQUIRED_TURN_STOP_CAPABILITY_V1;
+      }
+      posts += 1;
+      const body = JSON.parse(options.body);
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn",
+          requested_target: body.turn_id,
+          resolved_target: body.turn_id,
+          agent_id: "did:kestrel:emma",
+          disposition: "stopped",
+          correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+for (const turnId of ["emma#batch-one", "emma#batch-two"]) {
+  controller.select(stopTargetFromDetail({
+    agent: "Emma", agentDid: "did:kestrel:emma", turnId,
+  }, { completionKnown: true, completed: false }));
+}
+const pending = controller.stopSelected();
+await Promise.resolve();
+releaseProbe();
+const outcomes = await pending;
+process.stdout.write(JSON.stringify({ gets, posts, states: outcomes.map((item) => item.state) }));
+""",
+    )
+
+    assert result == {"gets": 1, "posts": 2, "states": ["stopped", "stopped"]}
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
@@ -1557,7 +1667,7 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
-def test_pending_stop_cannot_overwrite_late_completion_evidence(tmp_path):
+def test_pending_stop_declines_when_completion_arrives_before_post(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
         pkg,
@@ -1603,7 +1713,7 @@ controller.observe(stopTargetFromDetail({
   agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#race",
 }, { completed: true, completionKnown: true }));
 releaseResponse();
-const refused = await pending;
+    const refused = await pending;
 const retained = controller.getResult(target);
 const retry = await controller.stopOne(controller.targetForKey(target.key));
 process.stdout.write(JSON.stringify({
@@ -1617,11 +1727,11 @@ process.stdout.write(JSON.stringify({
     )
 
     assert result == {
-        "refused": "refused",
+        "refused": "already_complete",
         "retainedCompleted": True,
         "knownCompleted": True,
         "retry": "already_complete",
-        "calls": 1,
+        "calls": 0,
     }
 
 

@@ -221,29 +221,37 @@ export function createStopController({
   const completedTargets = new Map();
   const pendingOperations = new Map();
   // Capability is route-scoped, not global: a mixed-version fleet may contain
-  // a new host beside an old one. Cache only a positively validated contract;
-  // a failed lookup remains retryable after an upgrade or transient outage.
-  const stopCapabilities = new Map();
+  // a new host beside an old one. Share only an in-flight probe. A completed
+  // probe cannot authorize a later operation because the route may have been
+  // restarted or replaced by a host implementing the legacy broad Stop door.
+  const stopCapabilityProbes = new Map();
   const listeners = new Set();
 
   async function requireTurnStopCapability(target) {
     const route = target.agentName;
-    if (stopCapabilities.has(route)) return stopCapabilities.get(route);
-    let capabilities;
-    if (capabilityLoader) {
-      capabilities = await capabilityLoader(target);
-    } else {
-      capabilities = await api.requestForAgent(
-        STOP_CAPABILITIES_PATH,
-        { method: "GET" },
-        route,
-      );
-    }
-    if (!supportsTurnStop(capabilities)) {
-      throw new Error("The target host did not advertise the turn-scoped Stop contract.");
-    }
-    stopCapabilities.set(route, capabilities);
-    return capabilities;
+    const existing = stopCapabilityProbes.get(route);
+    if (existing) return existing;
+    const probe = (async () => {
+      const capabilities = capabilityLoader
+        ? await capabilityLoader(target)
+        : await api.requestForAgent(
+            STOP_CAPABILITIES_PATH,
+            { method: "GET" },
+            route,
+          );
+      if (!supportsTurnStop(capabilities)) {
+        throw new Error("The target host did not advertise the turn-scoped Stop contract.");
+      }
+      return capabilities;
+    })();
+    stopCapabilityProbes.set(route, probe);
+    const forgetProbe = () => {
+      if (stopCapabilityProbes.get(route) === probe) {
+        stopCapabilityProbes.delete(route);
+      }
+    };
+    probe.then(forgetProbe, forgetProbe);
+    return probe;
   }
 
   function emit() {
@@ -471,6 +479,13 @@ export function createStopController({
             code: "turn_stop_not_advertised",
           },
         );
+        storeResult(result);
+        emit();
+        return result;
+      }
+      const currentTarget = targetForKey(target.key) || target;
+      if (currentTarget.completed) {
+        const result = completedResult(currentTarget);
         storeResult(result);
         emit();
         return result;
