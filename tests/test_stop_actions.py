@@ -124,8 +124,8 @@ process.stdout.write(JSON.stringify({ calls, target, outcome, redrawKey: redraw.
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
-def test_single_stop_accepts_the_canonical_endpoint_operation_identity(tmp_path):
-    """Older hosts mint the Stop operation ID instead of echoing the client hint."""
+def test_single_stop_rejects_a_different_endpoint_operation_identity(tmp_path):
+    """A stale same-target receipt cannot confirm this durable operation."""
 
     pkg = _module_dir(tmp_path)
     result = _run(
@@ -157,9 +157,9 @@ process.stdout.write(JSON.stringify(await controller.stopOne(target)));
 """,
     )
 
-    assert result["state"] == "stopped"
-    assert result["correlationId"] == "server-correlation"
-    assert result["receiptId"] == "receipt-server"
+    assert result["state"] == "indeterminate"
+    assert result["correlationId"] == "client-correlation"
+    assert result["receiptId"] is None
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
@@ -842,23 +842,47 @@ const detail = {
 };
 const root = {
   name: "Emma turn 4",
+  spanKind: "AGENT",
+  context: { spanId: "turn-root-span" },
   attributes: JSON.stringify({
     "kestrel.turn_id": "turn-4",
     "kestrel.agent_did": "did:kestrel:emma",
+    "kestrel.marker": "start",
   }),
 };
 const summary = {
   name: "turn 4 summary",
   spanKind: "CHAIN",
+  parentId: "turn-root-span",
   attributes: root.attributes,
 };
 const toolNamedSummary = {
   name: "turn 4 summary",
   spanKind: "TOOL",
+  parentId: "turn-root-span",
   attributes: root.attributes,
+};
+const nestedChain = {
+  name: "nested chain",
+  spanKind: "CHAIN",
+  context: { spanId: "nested-chain-span" },
+  parentId: "turn-root-span",
+  attributes: JSON.stringify({
+    "kestrel.turn_id": "turn-4",
+    "kestrel.agent_did": "did:kestrel:emma",
+  }),
+};
+const nestedNamedSummary = {
+  name: "turn 4 summary",
+  spanKind: "CHAIN",
+  parentId: "nested-chain-span",
+  attributes: nestedChain.attributes,
 };
 const completionIndex = turnCompletionIndex([root, summary]);
 const impostorIndex = turnCompletionIndex([root, toolNamedSummary]);
+const nestedImpostorIndex = turnCompletionIndex([
+  root, nestedChain, nestedNamedSummary,
+]);
 process.stdout.write(JSON.stringify({
   partial: turnCompletionEvidence([root], detail, { truncated: true }),
   full: turnCompletionEvidence([root], detail, { truncated: false }),
@@ -866,15 +890,22 @@ process.stdout.write(JSON.stringify({
   toolNamedSummary: turnCompletionEvidence(
     [root, toolNamedSummary], detail, { truncated: true },
   ),
+  nestedNamedSummary: turnCompletionEvidence(
+    [root, nestedChain, nestedNamedSummary], detail, { truncated: true },
+  ),
   indexed: {
     completed: completionIndex.has("did:kestrel:emma\u0000turn-4"),
     unrelated: completionIndex.has("did:kestrel:claw\u0000turn-4"),
     toolNamedSummary: impostorIndex.has("did:kestrel:emma\u0000turn-4"),
+    nestedNamedSummary: nestedImpostorIndex.has("did:kestrel:emma\u0000turn-4"),
   },
   focused: {
     active: needsFocusedTurnCompletion([root], detail),
     completed: needsFocusedTurnCompletion([root, summary], detail),
     toolNamedSummary: needsFocusedTurnCompletion([root, toolNamedSummary], detail),
+    nestedNamedSummary: needsFocusedTurnCompletion(
+      [root, nestedChain, nestedNamedSummary], detail,
+    ),
     noController: needsFocusedTurnCompletion([root], detail, { stopAvailable: false }),
     unaddressable: needsFocusedTurnCompletion([root], { turnId: "turn-4" }),
   },
@@ -892,15 +923,21 @@ process.stdout.write(JSON.stringify({
         "completed": False,
         "completionKnown": False,
     }
+    assert result["nestedNamedSummary"] == {
+        "completed": False,
+        "completionKnown": False,
+    }
     assert result["indexed"] == {
         "completed": True,
         "unrelated": False,
         "toolNamedSummary": False,
+        "nestedNamedSummary": False,
     }
     assert result["focused"] == {
         "active": True,
         "completed": False,
         "toolNamedSummary": True,
+        "nestedNamedSummary": True,
         "noController": False,
         "unaddressable": False,
     }

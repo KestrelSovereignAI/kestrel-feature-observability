@@ -84,6 +84,8 @@ import {
   spanKindOf,
   isTurnSummarySpan,
   isSessionSummarySpan,
+  ROLE_TURN_ROOT,
+  spanRoleOf,
   spanSummaryOf,
   normalizeSpanDetail,
   renderSpanDetail,
@@ -818,6 +820,40 @@ export function openStartFloors(spanIter) {
   return floors;
 }
 
+// A summary closes a turn only when it is the direct child of that turn's
+// stamped root. Name, kind, DID, and turn attributes are not enough: nested
+// workflow spans legitimately inherit all of them and may use the same name.
+// Materialize and index once so both the focused read and loaded-inventory
+// index retain linear complexity.
+function completedTurnIdentityKeys(spanIter) {
+  const spans = [...(spanIter || [])];
+  const rootsBySpanId = new Map();
+  const completed = new Set();
+
+  for (const candidate of spans) {
+    if (spanRoleOf(candidate) !== ROLE_TURN_ROOT) continue;
+    const detail = normalizeSpanDetail(candidate);
+    const key = turnCompletionIdentityKey(detail);
+    if (candidate.rSummary && candidate.rOpen === false && key) {
+      completed.add(key);
+    }
+    if (detail.spanId && key) rootsBySpanId.set(detail.spanId, key);
+  }
+
+  for (const candidate of spans) {
+    if (!isTurnSummarySpan(candidate)) continue;
+    const detail = normalizeSpanDetail(candidate);
+    const parentKey = detail.parentSpanId
+      ? rootsBySpanId.get(detail.parentSpanId)
+      : null;
+    if (!parentKey) continue;
+    const summaryKey = turnCompletionIdentityKey(detail);
+    if (summaryKey && summaryKey !== parentKey) continue;
+    completed.add(parentKey);
+  }
+  return completed;
+}
+
 /** Resolve completion only when the supplied turn inventory is authoritative. */
 export function turnCompletionEvidence(
   spanIter,
@@ -825,25 +861,10 @@ export function turnCompletionEvidence(
   { truncated = false } = {},
 ) {
   const target = detail && typeof detail === "object" ? detail : {};
-  let completed = false;
-  if (target.turnId && target.agentDid) {
-    for (const candidate of spanIter || []) {
-      const candidateDetail = normalizeSpanDetail(candidate);
-      if (
-        candidateDetail.turnId !== target.turnId ||
-        candidateDetail.agentDid !== target.agentDid
-      ) {
-        continue;
-      }
-      if (
-        isTurnSummarySpan(candidate) ||
-        (candidate.rSummary && candidate.rOpen === false)
-      ) {
-        completed = true;
-        break;
-      }
-    }
-  }
+  const targetKey = turnCompletionIdentityKey(target);
+  const completed = targetKey
+    ? completedTurnIdentityKeys(spanIter).has(targetKey)
+    : false;
   return Object.freeze({
     completed,
     completionKnown: completed || truncated !== true,
@@ -872,18 +893,7 @@ export function sameTimelineTurnCompletion(left, right) {
 
 /** Index every completed turn in one pass over a loaded span inventory. */
 export function turnCompletionIndex(spanIter) {
-  const completed = new Set();
-  for (const candidate of spanIter || []) {
-    if (
-      !isTurnSummarySpan(candidate) &&
-      !(candidate.rSummary && candidate.rOpen === false)
-    ) {
-      continue;
-    }
-    const key = turnCompletionIdentityKey(normalizeSpanDetail(candidate));
-    if (key) completed.add(key);
-  }
-  return completed;
+  return completedTurnIdentityKeys(spanIter);
 }
 
 /** Whether a popover needs the bounded focused trace read used only by Stop. */

@@ -90,13 +90,13 @@ function structuredOutcomes(error) {
   return [];
 }
 
-function outcomeMatches(outcome, target) {
+function outcomeMatches(outcome, target, correlationId) {
   return (
     outcome &&
     outcome.scope === "turn" &&
     outcome.requested_target === target.turnId &&
     outcome.agent_id === target.agentDid &&
-    presentString(outcome.correlation_id) !== null &&
+    presentString(outcome.correlation_id) === correlationId &&
     TERMINAL_DISPOSITIONS.has(outcome.disposition)
   );
 }
@@ -379,7 +379,7 @@ export function createStopController({
         if (
           responseTurn !== target.turnId ||
           outcomes.length !== 1 ||
-          !outcomeMatches(outcomes[0], target)
+          !outcomeMatches(outcomes[0], target, correlationId)
         ) {
           result = indeterminateResult(
             target,
@@ -395,7 +395,10 @@ export function createStopController({
       } catch (error) {
         const outcomes = structuredOutcomes(error);
         let result;
-        if (outcomes.length === 1 && outcomeMatches(outcomes[0], target)) {
+        if (
+          outcomes.length === 1 &&
+          outcomeMatches(outcomes[0], target, correlationId)
+        ) {
           result = resultFromOutcome(target, outcomes[0], {
             message: error?.message,
             status: Number.isInteger(error?.status) ? error.status : null,
