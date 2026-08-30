@@ -21,7 +21,8 @@ no held-open spans; every span exports immediately — #42, #55):
   starts: a monotonic turn counter is bumped and an immediately-ended ``AGENT``
   turn-root span (``<agent> turn <n>``, ``kestrel.marker=start``) is emitted as a
   **new trace root**; its ``SpanContext`` is kept in session state. Every span of
-  the turn also carries ``kestrel.turn_id`` (``<session_id>#<n>``) and
+  the turn also carries the host lifecycle's canonical cooperative-Stop
+  address as ``kestrel.turn_id`` and the display-only ordinal as
   ``kestrel.turn_index`` (n).
 - On ``PreToolUse`` an instant tool-start marker (``<tool> (started)``,
   ``kestrel.marker=start``) is emitted, parented to the current turn — the
@@ -396,7 +397,7 @@ class _TurnState:
 
     root: Any            # the ended turn-root span (holds the turn trace root SpanContext)
     index: int           # monotonic turn number (1-based) within the session
-    turn_id: str         # ``<session_id>#<index>``
+    turn_id: Optional[str]  # host-owned canonical cooperative-Stop address
     started_ns: int      # turn start (turn-root marker) — for the summary duration
     tool_count: int = 0
     success_count: int = 0
@@ -490,6 +491,36 @@ class ObservabilityHook(Hook):
         """Resolve the agent's DID (falls back to None)."""
         return getattr(self.agent, "agent_id", None) or getattr(self.agent, "did", None)
 
+    def _canonical_turn_id(self) -> Optional[str]:
+        """Read the host lifecycle's Stop address without deriving one here."""
+
+        accessor = getattr(self.agent, "get_current_turn_id", None)
+        if not callable(accessor):
+            return None
+        try:
+            value = accessor()
+        except Exception:  # noqa: BLE001 - observability must never break work
+            logger.debug("Failed to read canonical turn id", exc_info=True)
+            return None
+        return value if isinstance(value, str) and value.strip() else None
+
+    def _bind_turn_trace_identity(self, root: Any) -> None:
+        """Offer the emitted root's identity to the host as optional evidence."""
+
+        binder = getattr(self.agent, "bind_current_turn_trace_identity", None)
+        if not callable(binder):
+            return
+        try:
+            context = root.get_span_context()
+            if context is None or not context.is_valid:
+                return
+            binder(
+                f"{context.trace_id:032x}",
+                f"{context.span_id:016x}",
+            )
+        except Exception:  # noqa: BLE001 - tracing never weakens the turn
+            logger.debug("Failed to bind turn trace identity", exc_info=True)
+
     def _driving_parent(self, input: HookInput) -> Optional[str]:
         """The agent/session driving this agent, if any (else None → self-driven)."""
         return (
@@ -514,7 +545,8 @@ class ObservabilityHook(Hook):
         """
         attrs = _session_attrs(session_id)
         if turn is not None:
-            attrs[KESTREL_TURN_ID] = turn.turn_id
+            if turn.turn_id is not None:
+                attrs[KESTREL_TURN_ID] = turn.turn_id
             attrs[KESTREL_TURN_INDEX] = turn.index
         return attrs
 
@@ -589,18 +621,19 @@ class ObservabilityHook(Hook):
         """
         session.turn_count += 1
         index = session.turn_count
-        turn_id = f"{session_id}#{index}" if session_id else f"#{index}"
+        turn_id = self._canonical_turn_id()
 
         # current_turn isn't set yet, so stamp the turn identity explicitly here
         # (every span of the turn carries session id + turn id + turn index).
         attributes = _session_attrs(session_id)
         attributes.update(
             {
-                KESTREL_TURN_ID: turn_id,
                 KESTREL_TURN_INDEX: index,
                 KESTREL_MARKER: _MARKER_START,
             }
         )
+        if turn_id is not None:
+            attributes[KESTREL_TURN_ID] = turn_id
 
         # Opt-in (KESTREL_OTEL_CAPTURE_PROMPTS=1): stamp the user prompt on the
         # turn root as OpenInference ``input.value``, truncated to the IO cap. Off
@@ -618,6 +651,7 @@ class ObservabilityHook(Hook):
             agent_name=agent_name,
             attributes=attributes,
         )
+        self._bind_turn_trace_identity(root)
         session.current_turn = _TurnState(
             root=root, index=index, turn_id=turn_id, started_ns=turn_marker_ns
         )
