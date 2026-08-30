@@ -531,6 +531,7 @@ def test_timeline_partial_inventory_keeps_completion_unknown(tmp_path):
         r"""
 import {
   needsFocusedTurnCompletion,
+  turnCompletionIndex,
   turnCompletionEvidence,
 } from "./timeline.js";
 const detail = {
@@ -549,10 +550,15 @@ const summary = {
   name: "turn 4 summary",
   attributes: root.attributes,
 };
+const completionIndex = turnCompletionIndex([root, summary]);
 process.stdout.write(JSON.stringify({
   partial: turnCompletionEvidence([root], detail, { truncated: true }),
   full: turnCompletionEvidence([root], detail, { truncated: false }),
   completedPartial: turnCompletionEvidence([root, summary], detail, { truncated: true }),
+  indexed: {
+    completed: completionIndex.has("did:kestrel:emma\u0000turn-4"),
+    unrelated: completionIndex.has("did:kestrel:claw\u0000turn-4"),
+  },
   focused: {
     active: needsFocusedTurnCompletion([root], detail),
     completed: needsFocusedTurnCompletion([root, summary], detail),
@@ -569,6 +575,7 @@ process.stdout.write(JSON.stringify({
         "completed": True,
         "completionKnown": True,
     }
+    assert result["indexed"] == {"completed": True, "unrelated": False}
     assert result["focused"] == {
         "active": True,
         "completed": False,
@@ -697,6 +704,8 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "navigatorTurnNeedsCompletionRefresh(node)" in navigator
     assert "if (stopController) stopTargetForNode(node);" in navigator
     assert "reconcileSelectedTurnCompletions();" in timeline
+    assert "const completedTurns = turnCompletionIndex(spans.values());" in timeline
+    assert "turnCompletionEvidence(spans.values(), target" not in timeline
     assert "needsFocusedTurnCompletion(spans.values(), detail" in timeline
     assert "createStopController({ api: API })" in panel
     assert "mountStopActionBar(stopActionsEl, stopController)" in panel

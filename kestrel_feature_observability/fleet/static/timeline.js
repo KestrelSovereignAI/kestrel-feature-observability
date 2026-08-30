@@ -844,6 +844,28 @@ export function turnCompletionEvidence(
   });
 }
 
+function turnCompletionIdentityKey(detail) {
+  return detail?.turnId && detail?.agentDid
+    ? `${detail.agentDid}\u0000${detail.turnId}`
+    : null;
+}
+
+/** Index every completed turn in one pass over a loaded span inventory. */
+export function turnCompletionIndex(spanIter) {
+  const completed = new Set();
+  for (const candidate of spanIter || []) {
+    if (
+      !TURN_SUMMARY_RE.test(String(candidate.name || "")) &&
+      !(candidate.rSummary && candidate.rOpen === false)
+    ) {
+      continue;
+    }
+    const key = turnCompletionIdentityKey(normalizeSpanDetail(candidate));
+    if (key) completed.add(key);
+  }
+  return completed;
+}
+
 /** Whether a popover needs the bounded focused trace read used only by Stop. */
 export function needsFocusedTurnCompletion(
   spanIter,
@@ -3335,13 +3357,18 @@ export function mount(container, opts = {}) {
 
   function reconcileSelectedTurnCompletions() {
     if (!stopController || typeof stopController.selected !== "function") return;
+    // Selection can contain many turns while the store contains up to 60,000
+    // spans. Index summaries once per layout instead of rescanning and
+    // normalizing the entire inventory once per selected target.
+    const completedTurns = turnCompletionIndex(spans.values());
     for (const target of stopController.selected()) {
-      const completion = turnCompletionEvidence(spans.values(), target, {
-        truncated: true,
-      });
-      if (!completion.completed) continue;
+      if (!completedTurns.has(turnCompletionIdentityKey(target))) continue;
       stopController.observe(
-        Object.freeze({ ...target, ...completion }),
+        Object.freeze({
+          ...target,
+          completed: true,
+          completionKnown: true,
+        }),
       );
     }
   }
