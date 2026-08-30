@@ -792,6 +792,14 @@ process.stdout.write(JSON.stringify({
       ...refreshable,
       data: { ...refreshable.data, completionRefreshesRemaining: 0 },
     }, { manual: true }),
+    manualIncomplete: navigatorTurnNeedsCompletionRefresh({
+      ...refreshable,
+      data: {
+        ...refreshable.data,
+        inventoryComplete: false,
+        completionRefreshesRemaining: 0,
+      },
+    }, { manual: true }),
   },
 }));
 """,
@@ -812,6 +820,7 @@ process.stdout.write(JSON.stringify({
         "exhausted": False,
         "summarized": False,
         "manualExhausted": True,
+        "manualIncomplete": True,
     }
 
 

@@ -145,9 +145,10 @@ export function navigatorTurnNeedsCompletionRefresh(
       turn.loaded &&
       turn.data &&
       !turn.data.summary &&
-      turn.data.inventoryComplete === true &&
-      Number.isInteger(turn.data.completionRefreshesRemaining) &&
-      (manual || turn.data.completionRefreshesRemaining > 0),
+      (manual ||
+        (turn.data.inventoryComplete === true &&
+          Number.isInteger(turn.data.completionRefreshesRemaining) &&
+          turn.data.completionRefreshesRemaining > 0)),
   );
 }
 const POLL_MS = 10_000; // live-follow cadence
