@@ -183,6 +183,7 @@ export async function walkTraceSpans(
   {
     pageSize = TRACE_SPAN_PAGE_SIZE,
     maxPages = TRACE_SPAN_MAX_PAGES,
+    signal = undefined,
   } = {},
 ) {
   const spans = [];
@@ -190,12 +191,16 @@ export async function walkTraceSpans(
   let after = null;
   let trace = null;
   for (let page = 0; page < maxPages; page += 1) {
-    const data = await gql(TRACE_SPANS_QUERY, {
-      projectId,
-      traceId,
-      first: pageSize,
-      after,
-    });
+    const data = await gql(
+      TRACE_SPANS_QUERY,
+      {
+        projectId,
+        traceId,
+        first: pageSize,
+        after,
+      },
+      { signal },
+    );
     trace = data.node && data.node.trace;
     const connection = trace && trace.spans;
     if (!connection || !Array.isArray(connection.edges)) {

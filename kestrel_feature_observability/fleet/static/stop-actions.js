@@ -15,6 +15,17 @@ import {
 export { stopActionModel, stopTargetFromDetail, stopTargetKey } from "./phoenix.js";
 
 const STOP_PATH = "/api/agent/stop";
+const STOP_CAPABILITIES_PATH = "/api/agent/stop/capabilities";
+const STOP_PROTOCOL = "kestrel.cooperative_stop";
+const STOP_PROTOCOL_VERSION = 1;
+export const REQUIRED_TURN_STOP_CAPABILITY_V1 = Object.freeze({
+  protocol: STOP_PROTOCOL,
+  version: STOP_PROTOCOL_VERSION,
+  scopes: Object.freeze(["agent", "turn"]),
+  turn_address: "turn_id",
+  typed_outcomes: true,
+  durable_receipts: true,
+});
 const TERMINAL_DISPOSITIONS = new Set([
   "stopped",
   "already_complete",
@@ -166,16 +177,33 @@ function pendingResult(target, correlationId) {
   });
 }
 
+function supportsTurnStop(capabilities) {
+  return Boolean(
+    capabilities &&
+      capabilities.protocol === STOP_PROTOCOL &&
+      capabilities.version === STOP_PROTOCOL_VERSION &&
+      Array.isArray(capabilities.scopes) &&
+      capabilities.scopes.includes("turn") &&
+      capabilities.turn_address === "turn_id" &&
+      capabilities.typed_outcomes === true &&
+      capabilities.durable_receipts === true,
+  );
+}
+
 /** Shared selection/result controller retained across Timeline/Navigator mounts. */
 export function createStopController({
   api = null,
   correlationIdFactory = defaultCorrelationId,
+  capabilityLoader = null,
 } = {}) {
   if (!api || typeof api.requestForAgent !== "function") {
     throw new TypeError("Stop controller requires requestForAgent");
   }
   if (typeof correlationIdFactory !== "function") {
     throw new TypeError("correlationIdFactory must be callable");
+  }
+  if (capabilityLoader != null && typeof capabilityLoader !== "function") {
+    throw new TypeError("capabilityLoader must be callable");
   }
 
   const selected = new Map();
@@ -192,7 +220,31 @@ export function createStopController({
   // guard and let a stale inspector submit another Stop.
   const completedTargets = new Map();
   const pendingOperations = new Map();
+  // Capability is route-scoped, not global: a mixed-version fleet may contain
+  // a new host beside an old one. Cache only a positively validated contract;
+  // a failed lookup remains retryable after an upgrade or transient outage.
+  const stopCapabilities = new Map();
   const listeners = new Set();
+
+  async function requireTurnStopCapability(target) {
+    const route = target.agentName;
+    if (stopCapabilities.has(route)) return stopCapabilities.get(route);
+    let capabilities;
+    if (capabilityLoader) {
+      capabilities = await capabilityLoader(target);
+    } else {
+      capabilities = await api.requestForAgent(
+        STOP_CAPABILITIES_PATH,
+        { method: "GET" },
+        route,
+      );
+    }
+    if (!supportsTurnStop(capabilities)) {
+      throw new Error("The target host did not advertise the turn-scoped Stop contract.");
+    }
+    stopCapabilities.set(route, capabilities);
+    return capabilities;
+  }
 
   function emit() {
     for (const listener of [...listeners]) {
@@ -407,6 +459,22 @@ export function createStopController({
     emit();
 
     const operation = (async () => {
+      try {
+        await requireTurnStopCapability(target);
+      } catch (error) {
+        const result = indeterminateResult(
+          target,
+          "Turn-scoped Stop is not advertised by this agent host; no Stop request was sent.",
+          {
+            correlationId,
+            status: error?.status,
+            code: "turn_stop_not_advertised",
+          },
+        );
+        storeResult(result);
+        emit();
+        return result;
+      }
       try {
         const response = await api.requestForAgent(
           STOP_PATH,

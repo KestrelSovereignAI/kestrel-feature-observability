@@ -210,6 +210,7 @@ export function mount(container, opts = {}) {
   let liveFollow = false; // off by default — noise-free
   let pollTimer = null;
   let polling = false;
+  const traceWalkControllers = new Set();
 
   // ── Tree model ──
   //
@@ -581,10 +582,19 @@ export function mount(container, opts = {}) {
   // span id and time-ordered — start/stop markers, hook events, tool calls
   // (TOOL), LLM calls (LLM), gates. Nested events expand locally (no query).
   async function loadEvents(node, mode) {
-    const inventory = await walkTraceSpans(
-      node.data.projectId,
-      node.data.traceId,
-    );
+    const traceWalkAbort = new AbortController();
+    traceWalkControllers.add(traceWalkAbort);
+    let inventory;
+    try {
+      inventory = await walkTraceSpans(
+        node.data.projectId,
+        node.data.traceId,
+        { signal: traceWalkAbort.signal },
+      );
+    } finally {
+      traceWalkControllers.delete(traceWalkAbort);
+    }
+    if (destroyed) return;
     const trace = inventory.trace;
     const spans = [...inventory.spans];
     node.data.inventoryComplete = Boolean(
@@ -1284,6 +1294,14 @@ export function mount(container, opts = {}) {
   function teardown() {
     destroyed = true;
     stopUnsubscribe();
+    for (const traceWalkAbort of traceWalkControllers) {
+      try {
+        traceWalkAbort.abort();
+      } catch (_e) {
+        /* aborting is best-effort */
+      }
+    }
+    traceWalkControllers.clear();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;

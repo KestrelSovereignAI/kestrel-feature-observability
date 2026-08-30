@@ -1544,6 +1544,7 @@ export function mount(container, opts = {}) {
   const rollupCache = new Map(); // spanId → memberRollup (invalidated by buildLayout)
   const turnCompletionCache = new Map(); // project+trace → authoritative focused read
   const turnCompletionLoads = new Map(); // same key → one in-flight GraphQL read
+  const turnCompletionAborts = new Map(); // same key → owned trace-walk abort
   let completedTurnKeys = new Set(); // rebuilt once with the render model/layout
 
   // ── DOM scaffold ──
@@ -3361,9 +3362,16 @@ export function mount(container, opts = {}) {
     // that revalidation is in flight.
     if (turnCompletionCache.get(key)?.completed === true) return;
     turnCompletionCache.delete(key);
+    const traceWalkAbort = new AbortController();
+    turnCompletionAborts.set(key, traceWalkAbort);
     const operation = (async () => {
       try {
-        const inventory = await walkTraceSpans(s.projectId, s.traceId);
+        const inventory = await walkTraceSpans(
+          s.projectId,
+          s.traceId,
+          { signal: traceWalkAbort.signal },
+        );
+        if (destroyed) return;
         const trace = inventory.trace;
         if (!trace) return;
         const evidence = turnCompletionEvidence(inventory.spans, detail, {
@@ -3378,7 +3386,9 @@ export function mount(container, opts = {}) {
         // Unknown is load-bearing: a failed focused read never enables Stop.
       } finally {
         turnCompletionLoads.delete(key);
+        turnCompletionAborts.delete(key);
         if (
+          !destroyed &&
           sameTimelineTurnCompletion(activePopoverSpan, s) &&
           !popEl.hidden
         ) syncPopoverStopActions();
@@ -3995,6 +4005,14 @@ export function mount(container, opts = {}) {
   function teardown() {
     destroyed = true;
     stopUnsubscribe();
+    for (const traceWalkAbort of turnCompletionAborts.values()) {
+      try {
+        traceWalkAbort.abort();
+      } catch (_e) {
+        /* aborting is best-effort */
+      }
+    }
+    turnCompletionAborts.clear();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;

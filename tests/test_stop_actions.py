@@ -120,6 +120,240 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_trace_inventory_walk_forwards_abort_signal_across_pages(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "trace-pagination-abort.mjs",
+        r"""
+const calls = [];
+let releaseSecond;
+globalThis.fetch = async (_url, options) => {
+  const { variables } = JSON.parse(options.body);
+  calls.push({ after: variables.after ?? null, signal: Boolean(options.signal) });
+  if (variables.after != null) {
+    return new Promise((_resolve, reject) => {
+      releaseSecond = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      options.signal.addEventListener("abort", releaseSecond, { once: true });
+    });
+  }
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: {
+        node: {
+          trace: {
+            spans: {
+              edges: [{ node: { id: "span-1" } }],
+              pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+            },
+          },
+        },
+      },
+    }),
+  };
+};
+const { walkTraceSpans } = await import("./phoenix.js");
+const abort = new AbortController();
+const pending = walkTraceSpans("project-1", "trace-1", { signal: abort.signal });
+while (calls.length < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+abort.abort();
+let errorName = null;
+try {
+  await pending;
+} catch (error) {
+  errorName = error.name;
+}
+process.stdout.write(JSON.stringify({ calls, errorName, secondReleased: Boolean(releaseSecond) }));
+""",
+    )
+
+    assert result == {
+        "calls": [
+            {"after": None, "signal": True},
+            {"after": "cursor-1", "signal": True},
+        ],
+        "errorName": "AbortError",
+        "secondReleased": True,
+    }
+
+
+def test_views_abort_their_focused_trace_inventory_walks_on_teardown():
+    navigator = (STATIC / "navigator.js").read_text(encoding="utf-8")
+    timeline = (STATIC / "timeline.js").read_text(encoding="utf-8")
+
+    navigator_load = navigator[
+        navigator.index("async function loadEvents") : navigator.index(
+            "// ── Virtualized rows"
+        )
+    ]
+    navigator_teardown = navigator[
+        navigator.index("function teardown()") : navigator.index(
+            "function renderNotice()"
+        )
+    ]
+    assert "new AbortController()" in navigator_load
+    assert "{ signal: traceWalkAbort.signal }" in navigator_load
+    assert "traceWalkControllers.add(traceWalkAbort)" in navigator_load
+    assert "traceWalkControllers.delete(traceWalkAbort)" in navigator_load
+    assert "traceWalkAbort.abort()" in navigator_teardown
+
+    timeline_load = timeline[
+        timeline.index("function loadTurnCompletion") : timeline.index(
+            "function retryActivePopoverTurnCompletion"
+        )
+    ]
+    timeline_teardown = timeline[
+        timeline.index("function teardown()") : timeline.index("boot();")
+    ]
+    assert "new AbortController()" in timeline_load
+    assert "{ signal: traceWalkAbort.signal }" in timeline_load
+    assert "turnCompletionAborts.set(key, traceWalkAbort)" in timeline_load
+    assert "turnCompletionAborts.delete(key)" in timeline_load
+    assert "traceWalkAbort.abort()" in timeline_teardown
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_stop_fails_closed_when_turn_stop_capability_is_not_advertised(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "stop-capability-negotiation.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+const calls = [];
+const controller = createStopController({
+  api: {
+    async requestForAgent(path, options, agent) {
+      calls.push({ path, method: options.method, agent });
+      if (options.method === "GET") {
+        throw Object.assign(new Error("not found"), { status: 404 });
+      }
+      throw new Error("unsafe Stop POST reached an older host");
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#legacy",
+}, { completionKnown: true, completed: false });
+const outcome = await controller.stopOne(target);
+process.stdout.write(JSON.stringify({ calls, outcome }));
+""",
+    )
+
+    assert result["calls"] == [
+        {
+            "path": "/api/agent/stop/capabilities",
+            "method": "GET",
+            "agent": "Emma",
+        }
+    ]
+    assert result["outcome"]["state"] == "indeterminate"
+    assert result["outcome"]["code"] == "turn_stop_not_advertised"
+    assert "no stop request was sent" in result["outcome"]["message"].lower()
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_stop_negotiates_once_per_agent_route_before_posting(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "stop-capability-positive.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+const calls = [];
+const api = {
+  async requestForAgent(path, options, agent) {
+    calls.push({ path, method: options.method, agent });
+    if (options.method === "GET") {
+      return {
+        protocol: "kestrel.cooperative_stop",
+        version: 1,
+        scopes: ["agent", "turn"],
+        turn_address: "turn_id",
+        typed_outcomes: true,
+        durable_receipts: true,
+      };
+    }
+    const body = JSON.parse(options.body);
+    return {
+      turn_id: body.turn_id,
+      stop_outcomes: [{
+        scope: "turn",
+        requested_target: body.turn_id,
+        resolved_target: body.turn_id,
+        agent_id: "did:kestrel:emma",
+        disposition: "stopped",
+        correlation_id: body.correlation_id,
+      }],
+    };
+  },
+};
+let correlation = 0;
+const controller = createStopController({
+  api,
+  correlationIdFactory: () => `corr-${++correlation}`,
+});
+for (const turnId of ["emma#one", "emma#two"]) {
+  await controller.stopOne(stopTargetFromDetail({
+    agent: "Emma", agentDid: "did:kestrel:emma", turnId,
+  }, { completionKnown: true, completed: false }));
+}
+process.stdout.write(JSON.stringify(calls));
+""",
+    )
+
+    assert result == [
+        {
+            "path": "/api/agent/stop/capabilities",
+            "method": "GET",
+            "agent": "Emma",
+        },
+        {"path": "/api/agent/stop", "method": "POST", "agent": "Emma"},
+        {"path": "/api/agent/stop", "method": "POST", "agent": "Emma"},
+    ]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_stop_rejects_an_unrecognized_capability_version_without_posting(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "stop-capability-version.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+const calls = [];
+const controller = createStopController({
+  api: {
+    async requestForAgent(path, options) {
+      calls.push({ path, method: options.method });
+      if (options.method === "POST") throw new Error("incompatible Stop POST sent");
+      return {
+        protocol: "kestrel.cooperative_stop",
+        version: 2,
+        scopes: ["agent", "turn"],
+        turn_address: "turn_id",
+        typed_outcomes: true,
+        durable_receipts: true,
+      };
+    },
+  },
+});
+const outcome = await controller.stopOne(stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#future",
+}, { completionKnown: true, completed: false }));
+process.stdout.write(JSON.stringify({ calls, outcome }));
+""",
+    )
+
+    assert result["calls"] == [
+        {"path": "/api/agent/stop/capabilities", "method": "GET"}
+    ]
+    assert result["outcome"]["code"] == "turn_stop_not_advertised"
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_single_stop_pins_canonical_agent_route_and_verifies_receipt(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
@@ -128,6 +362,7 @@ def test_single_stop_pins_canonical_agent_route_and_verifies_receipt(tmp_path):
         r"""
 import {
   createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
   stopTargetFromDetail,
 } from "./stop-actions.js";
 
@@ -152,7 +387,11 @@ const api = {
     };
   },
 };
-const controller = createStopController({ api, correlationIdFactory: () => "corr-one" });
+const controller = createStopController({
+  api,
+  correlationIdFactory: () => "corr-one",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
+});
 const target = stopTargetFromDetail({
   agent: "Emma",
   agentDid: "did:kestrel:emma",
@@ -201,9 +440,14 @@ def test_single_stop_rejects_a_different_endpoint_operation_identity(tmp_path):
         pkg,
         "server-correlation.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 const controller = createStopController({
   correlationIdFactory: () => "client-correlation",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       const body = JSON.parse(options.body);
@@ -238,7 +482,11 @@ def test_multi_stop_preserves_success_and_typed_failure_per_exact_target(tmp_pat
         pkg,
         "multi.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 
 let correlation = 0;
 const api = {
@@ -271,6 +519,7 @@ const api = {
 const controller = createStopController({
   api,
   correlationIdFactory: () => `corr-${++correlation}`,
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
 });
 for (const detail of [
   { agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#2" },
@@ -377,12 +626,14 @@ def test_pending_target_is_submitted_once_across_single_and_batch_actions(tmp_pa
 import {
   createStopController,
   mountStopActionBar,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
   stopTargetFromDetail,
 } from "./stop-actions.js";
 let calls = 0;
 let release;
 const controller = createStopController({
   correlationIdFactory: () => `corr-${calls + 1}`,
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       calls += 1;
@@ -414,6 +665,7 @@ const first = controller.stopOne(target);
 const second = controller.stopOne(target);
 const batch = controller.stopSelected();
 const pendingHtml = element.innerHTML;
+while (!release) await Promise.resolve();
 release();
 const outcomes = await Promise.all([first, second]);
 const batchOutcomes = await batch;
@@ -440,7 +692,11 @@ def test_unknown_and_confirmed_targets_are_never_redispatched(tmp_path):
         pkg,
         "stop-guards.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 let calls = 0;
 const api = {
   async requestForAgent(_path, options) {
@@ -456,7 +712,11 @@ const api = {
     };
   },
 };
-const controller = createStopController({ api, correlationIdFactory: () => "corr-one" });
+const controller = createStopController({
+  api,
+  correlationIdFactory: () => "corr-one",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
+});
 const unknown = stopTargetFromDetail({
   agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#unknown",
 }, { completionKnown: false });
@@ -496,12 +756,14 @@ def test_dismissing_outcome_preserves_confirmed_terminal_guard(tmp_path):
 import {
   createStopController,
   mountStopActionBar,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
   stopActionModel,
   stopTargetFromDetail,
 } from "./stop-actions.js";
 let calls = 0;
 const controller = createStopController({
   correlationIdFactory: () => "corr-dismiss",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       calls += 1;
@@ -558,11 +820,16 @@ def test_dismissing_indeterminate_outcome_preserves_replay_identity(tmp_path):
         pkg,
         "dismiss-indeterminate.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 const correlations = ["corr-first", "corr-second"];
 const calls = [];
 const controller = createStopController({
   correlationIdFactory: () => correlations.shift(),
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       const body = JSON.parse(options.body);
@@ -605,10 +872,15 @@ def test_dismissing_refusal_retains_later_completion_guard(tmp_path):
         pkg,
         "dismiss-completion-guard.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 let calls = 0;
 const controller = createStopController({
   correlationIdFactory: () => `corr-${calls + 1}`,
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       calls += 1;
@@ -652,12 +924,14 @@ def test_inspector_retry_reuses_retained_route_and_completion_evidence(tmp_path)
         r"""
 import {
   createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
   stopActionModel,
   stopTargetFromDetail,
 } from "./stop-actions.js";
 const calls = [];
 const controller = createStopController({
   correlationIdFactory: () => "corr-retained",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, _options, agent) {
       calls.push(agent);
@@ -696,10 +970,15 @@ def test_reselection_keeps_indeterminate_route_and_late_completion(tmp_path):
         pkg,
         "retained-reselection.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 const routes = [];
 const controller = createStopController({
   correlationIdFactory: () => "corr-retained-reselection",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, _options, agent) {
       routes.push(agent);
@@ -1164,9 +1443,14 @@ def test_mismatched_server_identity_is_indeterminate(tmp_path):
         pkg,
         "mismatch.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 const controller = createStopController({
   correlationIdFactory: () => "corr-mismatch",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       const body = JSON.parse(options.body);
@@ -1203,12 +1487,17 @@ def test_indeterminate_retry_replays_operation_and_completion_disables_it(tmp_pa
         pkg,
         "indeterminate-replay.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 let calls = 0;
 let factoryCalls = 0;
 const bodies = [];
 const controller = createStopController({
   correlationIdFactory: () => `corr-${++factoryCalls}`,
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       calls += 1;
@@ -1274,13 +1563,18 @@ def test_pending_stop_cannot_overwrite_late_completion_evidence(tmp_path):
         pkg,
         "pending-completion-race.mjs",
         r"""
-import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+import {
+  createStopController,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
 
 let releaseResponse;
 let calls = 0;
 const responseGate = new Promise((resolve) => { releaseResponse = resolve; });
 const controller = createStopController({
   correlationIdFactory: () => "corr-race",
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options) {
       calls += 1;
@@ -1341,12 +1635,14 @@ def test_action_bar_dispatches_snapshot_and_keeps_partial_outcomes_visible(tmp_p
 import {
   createStopController,
   mountStopActionBar,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
   stopTargetFromDetail,
 } from "./stop-actions.js";
 
 const calls = [];
 const controller = createStopController({
   correlationIdFactory: () => `corr-${calls.length + 1}`,
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: {
     async requestForAgent(_path, options, agent) {
       const body = JSON.parse(options.body);
@@ -1405,9 +1701,11 @@ def test_action_bar_hides_retry_while_completion_is_unknown(tmp_path):
 import {
   createStopController,
   mountStopActionBar,
+  REQUIRED_TURN_STOP_CAPABILITY_V1,
   stopTargetFromDetail,
 } from "./stop-actions.js";
 const controller = createStopController({
+  capabilityLoader: async () => REQUIRED_TURN_STOP_CAPABILITY_V1,
   api: { async requestForAgent() { throw new Error("response lost"); } },
 });
 const target = stopTargetFromDetail({
