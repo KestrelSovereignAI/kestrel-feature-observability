@@ -90,13 +90,13 @@ function structuredOutcomes(error) {
   return [];
 }
 
-function outcomeMatches(outcome, target, correlationId) {
+function outcomeMatches(outcome, target) {
   return (
     outcome &&
     outcome.scope === "turn" &&
     outcome.requested_target === target.turnId &&
     outcome.agent_id === target.agentDid &&
-    outcome.correlation_id === correlationId &&
+    presentString(outcome.correlation_id) !== null &&
     TERMINAL_DISPOSITIONS.has(outcome.disposition)
   );
 }
@@ -327,8 +327,13 @@ export function createStopController({
     if (!original) return null;
     const pendingOperation = pendingOperations.get(original.key);
     if (pendingOperation) return pendingOperation;
-    if (selected.has(original.key)) observe(original);
-    const target = selected.get(original.key) || original;
+    // Inspector actions are not necessarily selected. Reconcile every redraw
+    // observation into retained lifecycle evidence, then keep using the route
+    // captured by the original selection/attempt. A stale inspector object must
+    // neither bypass a newly observed completion nor retarget an idempotent
+    // retry through a different display route.
+    observe(original);
+    const target = targetForKey(original.key) || original;
     if (target.completionKnown !== true) return null;
     const priorResult = storedResult(target.key);
     if (CONFIRMED_STOP_DISPOSITIONS.has(priorResult?.state)) {
@@ -374,7 +379,7 @@ export function createStopController({
         if (
           responseTurn !== target.turnId ||
           outcomes.length !== 1 ||
-          !outcomeMatches(outcomes[0], target, correlationId)
+          !outcomeMatches(outcomes[0], target)
         ) {
           result = indeterminateResult(
             target,
@@ -390,7 +395,7 @@ export function createStopController({
       } catch (error) {
         const outcomes = structuredOutcomes(error);
         let result;
-        if (outcomes.length === 1 && outcomeMatches(outcomes[0], target, correlationId)) {
+        if (outcomes.length === 1 && outcomeMatches(outcomes[0], target)) {
           result = resultFromOutcome(target, outcomes[0], {
             message: error?.message,
             status: Number.isInteger(error?.status) ? error.status : null,

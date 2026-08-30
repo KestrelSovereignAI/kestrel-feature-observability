@@ -124,6 +124,45 @@ process.stdout.write(JSON.stringify({ calls, target, outcome, redrawKey: redraw.
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_single_stop_accepts_the_canonical_endpoint_operation_identity(tmp_path):
+    """Older hosts mint the Stop operation ID instead of echoing the client hint."""
+
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "server-correlation.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+const controller = createStopController({
+  correlationIdFactory: () => "client-correlation",
+  api: {
+    async requestForAgent(_path, options) {
+      const body = JSON.parse(options.body);
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn", requested_target: body.turn_id,
+          resolved_target: "private-request-92", agent_id: "did:kestrel:emma",
+          disposition: "stopped", correlation_id: "server-correlation",
+          receipt_id: "receipt-server",
+        }],
+      };
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "session-a#server",
+});
+process.stdout.write(JSON.stringify(await controller.stopOne(target)));
+""",
+    )
+
+    assert result["state"] == "stopped"
+    assert result["correlationId"] == "server-correlation"
+    assert result["receiptId"] == "receipt-server"
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_multi_stop_preserves_success_and_typed_failure_per_exact_target(tmp_path):
     pkg = _module_dir(tmp_path)
     result = _run(
@@ -488,6 +527,52 @@ process.stdout.write(JSON.stringify({ calls, first, visible, retained, second })
     assert result["retained"]["state"] == "indeterminate"
     assert result["calls"] == ["corr-first", "corr-first"]
     assert result["second"]["state"] == "stopped"
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_inspector_retry_reuses_retained_route_and_completion_evidence(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "retained-inspector-retry.mjs",
+        r"""
+import {
+  createStopController,
+  stopActionModel,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+const calls = [];
+const controller = createStopController({
+  correlationIdFactory: () => "corr-retained",
+  api: {
+    async requestForAgent(_path, _options, agent) {
+      calls.push(agent);
+      throw new Error("timeout after possible commit");
+    },
+  },
+});
+const canonical = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#retained",
+}, { completionKnown: true, completed: false });
+const first = await controller.stopOne(canonical);
+controller.observe(stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#retained",
+}, { completionKnown: true, completed: true }));
+const staleInspector = stopTargetFromDetail({
+  agent: "Wrong redraw route", agentDid: "did:kestrel:emma", turnId: "emma#retained",
+}, { completionKnown: true, completed: false });
+const model = stopActionModel(staleInspector, controller);
+const second = await controller.stopOne(staleInspector);
+process.stdout.write(JSON.stringify({ calls, first, model, second }));
+""",
+    )
+
+    assert result["first"]["state"] == "indeterminate"
+    assert result["calls"] == ["Emma"]
+    assert result["model"]["disabled"] is True
+    assert result["model"]["stopLabel"] == "Already complete"
+    assert result["second"]["state"] == "already_complete"
+    assert result["second"]["target"]["agentName"] == "Emma"
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")

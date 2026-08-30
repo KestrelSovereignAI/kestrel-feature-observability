@@ -802,6 +802,12 @@ export function stopActionModel(target, controller) {
     target && target.addressable === true && key && key === target.key && target.agentName,
   );
   const result = addressable ? controller?.getResult?.(target) : null;
+  // Completion is shared lifecycle evidence. Timeline and Navigator can render
+  // from different Phoenix snapshots, so prefer the controller's monotonic
+  // retained target when one exists instead of re-enabling Stop from a stale
+  // local inspector object.
+  const effectiveTarget =
+    (addressable && controller?.targetForKey?.(key)) || target;
   const pending = result?.state === "submitting";
   const confirmed = result?.state === "stopped" || result?.state === "already_complete";
   return Object.freeze({
@@ -810,17 +816,17 @@ export function stopActionModel(target, controller) {
     pending,
     disabled:
       !addressable ||
-      target.completionKnown !== true ||
-      target.completed ||
+      effectiveTarget.completionKnown !== true ||
+      effectiveTarget.completed ||
       pending ||
       confirmed,
     stopLabel: !addressable
       ? `Stop unavailable — missing ${target?.missing?.join(", ") || "canonical address"}`
-      : target.completionKnown !== true
+      : effectiveTarget.completionKnown !== true
         ? "Checking turn state…"
         : result?.state === "stopped"
           ? "Stopped"
-          : target.completed || confirmed
+          : effectiveTarget.completed || confirmed
             ? "Already complete"
             : pending
               ? "Stopping…"
