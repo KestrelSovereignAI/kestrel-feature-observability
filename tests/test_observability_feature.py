@@ -59,7 +59,18 @@ from kestrel_feature_observability.tracing import (
 
 def _make_agent(agent_name="test-agent", agent_id="did:agent:test"):
     """Create a stand-in agent with an identity (no auto-created attrs)."""
-    return SimpleNamespace(agent_name=agent_name, agent_id=agent_id)
+    turn_number = 0
+
+    def get_current_turn_id():
+        nonlocal turn_number
+        turn_number += 1
+        return f"turn-test-{turn_number}"
+
+    return SimpleNamespace(
+        agent_name=agent_name,
+        agent_id=agent_id,
+        get_current_turn_id=get_current_turn_id,
+    )
 
 
 def _make_input(event_name="PreToolUse", **overrides):
@@ -803,7 +814,7 @@ class TestTurnSpans:
         assert turn.attributes["openinference.span.kind"] == "AGENT"
         assert turn.attributes[KESTREL_MARKER] == "start"
         assert turn.attributes[KESTREL_SESSION_ID] == "sess-1"
-        assert turn.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        assert turn.attributes[KESTREL_TURN_ID] == "turn-test-1"
         assert turn.attributes[KESTREL_TURN_INDEX] == 1
 
     @pytest.mark.asyncio
@@ -845,7 +856,7 @@ class TestTurnSpans:
         assert marker.attributes["openinference.span.kind"] == "TOOL"
         assert marker.attributes[KESTREL_MARKER] == "start"
         assert marker.attributes["tool.name"] == "Bash"
-        assert marker.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        assert marker.attributes[KESTREL_TURN_ID] == "turn-test-1"
         # Point span (instant), parented to the current turn.
         assert marker.end_time == marker.start_time
         assert marker.parent.span_id == turn_root.context.span_id
@@ -945,8 +956,45 @@ class TestTurnSpans:
         # Every span EXCEPT the pre-turn session-marker root carries turn ids.
         for name in ("test-agent turn 1", "Bash (started)", "Bash", "turn 1 summary"):
             attrs = spans[name].attributes
-            assert attrs[KESTREL_TURN_ID] == "sess-1#1"
+            assert attrs[KESTREL_TURN_ID] == "turn-test-1"
             assert attrs[KESTREL_TURN_INDEX] == 1
+
+    @pytest.mark.asyncio
+    async def test_turn_root_binds_its_trace_to_the_host_stop_address(self):
+        bound = []
+        agent = _make_agent()
+        agent.bind_current_turn_trace_identity = (
+            lambda trace_id, span_id: bound.append((trace_id, span_id))
+        )
+        hook, exporter = _memory_hook(agent=agent)
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+
+        root = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert root.attributes[KESTREL_TURN_ID] == "turn-test-1"
+        assert bound == [
+            (
+                f"{root.context.trace_id:032x}",
+                f"{root.context.span_id:016x}",
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_missing_host_turn_identity_omits_authority_address_only(self):
+        hook, exporter = _memory_hook(
+            agent=SimpleNamespace(
+                agent_name="test-agent",
+                agent_id="did:agent:test",
+            )
+        )
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("Stop"))
+
+        spans = _by_name(exporter.get_finished_spans())
+        assert KESTREL_TURN_ID not in spans["test-agent turn 1"].attributes
+        assert spans["test-agent turn 1"].attributes[KESTREL_TURN_INDEX] == 1
+        assert "turn 1 summary" in spans
 
     @pytest.mark.asyncio
     async def test_stop_emits_turn_summary_not_session_summary(self):
@@ -966,7 +1014,9 @@ class TestTurnSpans:
         await hook.execute(_make_input("UserPromptSubmit"))
         await hook.execute(_make_input("Stop"))
         spans = _by_name(exporter.get_finished_spans())
-        assert spans["test-agent turn 2"].attributes[KESTREL_TURN_ID] == "sess-1#2"
+        assert spans["test-agent turn 2"].attributes[KESTREL_TURN_ID] == (
+            "turn-test-2"
+        )
         assert spans["test-agent turn 2"].attributes[KESTREL_TURN_INDEX] == 2
         # Two distinct per-turn traces.
         assert (
@@ -1139,7 +1189,7 @@ class TestToolOutcomes:
         incomplete = spans["Bash"]
         turn1, turn2 = spans["test-agent turn 1"], spans["test-agent turn 2"]
         assert incomplete.attributes[KESTREL_TOOL_OUTCOME] == "incomplete"
-        assert incomplete.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        assert incomplete.attributes[KESTREL_TURN_ID] == "turn-test-1"
         assert incomplete.parent.span_id == turn1.context.span_id
         assert incomplete.context.trace_id == turn1.context.trace_id
         assert incomplete.context.trace_id != turn2.context.trace_id
@@ -1258,7 +1308,7 @@ class TestToolOutcomes:
         assert completed.parent.span_id == turn1.context.span_id
         assert completed.context.trace_id == turn1.context.trace_id
         assert completed.context.trace_id != turn2.context.trace_id
-        assert completed.attributes[KESTREL_TURN_ID] == "sess-1#1"
+        assert completed.attributes[KESTREL_TURN_ID] == "turn-test-1"
         # Counted against its own turn, never the live one.
         assert turn_one.tool_count == 1
         assert session.current_turn.tool_count == 0
