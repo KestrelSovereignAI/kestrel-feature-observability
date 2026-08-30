@@ -606,6 +606,55 @@ process.stdout.write(JSON.stringify(controller.selected()[0]));
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_revalidation_invalidates_stale_negative_completion_evidence(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "completion-revalidation.mjs",
+        r"""
+import { createStopController, stopTargetFromDetail } from "./stop-actions.js";
+let calls = 0;
+const controller = createStopController({
+  api: { async requestForAgent() { calls += 1; return {}; } },
+});
+const detail = {
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#revalidate",
+};
+controller.select(stopTargetFromDetail(detail, {
+  completionKnown: true,
+  completed: false,
+}));
+// A prior focused "active" snapshot expires before the replacement trace read.
+controller.observe(stopTargetFromDetail(detail, {
+  completionKnown: false,
+  completed: false,
+}));
+const selected = controller.selected()[0];
+const batch = await controller.stopSelected();
+process.stdout.write(JSON.stringify({ selected, batch, calls }));
+""",
+    )
+
+    assert result["selected"]["completionKnown"] is False
+    assert result["selected"]["completed"] is False
+    assert result["batch"] == []
+    assert result["calls"] == 0
+
+
+def test_active_turn_popover_uses_layout_completion_index_not_full_store_scans():
+    timeline = (STATIC / "timeline.js").read_text(encoding="utf-8")
+    hot_path = timeline[
+        timeline.index("function knownTurnCompletion") : timeline.index(
+            "function reconcileSelectedTurnCompletions"
+        )
+    ]
+
+    assert "spans.values()" not in hot_path
+    assert "completedTurnKeys" in hot_path
+    assert "completedTurnKeys = turnCompletionIndex(spans.values())" in timeline
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_timeline_partial_inventory_keeps_completion_unknown(tmp_path):
     pkg = _module_dir(tmp_path)
     (pkg / "timeline.js").write_text(
@@ -926,13 +975,13 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "navigatorTurnNeedsCompletionRefresh(node, { manual })" in navigator
     assert "stopTargetForNode(node);" in navigator
     assert "reconcileSelectedTurnCompletions();" in timeline
-    assert "const completedTurns = turnCompletionIndex(spans.values());" in timeline
+    assert "completedTurnKeys = turnCompletionIndex(spans.values());" in timeline
     assert "stopController.knownTargets()" in timeline
     assert "turnCompletionEvidence(spans.values(), target" not in timeline
     assert "turnCompletionCache.get(key)?.completed === true" in timeline
     assert "turnCompletionCache.delete(key);" in timeline
     assert "observeFocusedTurnCompletion(stopController, detail, evidence);" in timeline
-    assert "needsFocusedTurnCompletion(spans.values(), detail" in timeline
+    assert "needsFocusedTurnCompletion(spans.values(), detail" not in timeline
     load_children = navigator[
         navigator.index("async function loadChildren") : navigator.index(
             "async function loadProjects"

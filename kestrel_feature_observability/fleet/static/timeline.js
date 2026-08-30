@@ -1521,6 +1521,7 @@ export function mount(container, opts = {}) {
   const rollupCache = new Map(); // spanId → memberRollup (invalidated by buildLayout)
   const turnCompletionCache = new Map(); // project+trace → authoritative focused read
   const turnCompletionLoads = new Map(); // same key → one in-flight GraphQL read
+  let completedTurnKeys = new Set(); // rebuilt once with the render model/layout
 
   // ── DOM scaffold ──
   container.innerHTML = `
@@ -2713,6 +2714,10 @@ export function mount(container, opts = {}) {
     // close turn bands at their summary/next-turn, fold summaries. rHide spans
     // (paired markers, summary bars) are then excluded from every lane (#62).
     annotateRenderModel(spans.values(), nowMs);
+    // Completion is part of the render model. Index it once per rebuild while
+    // the store is already being traversed; a popover click must stay O(1) at
+    // the supported 60k-span cap instead of normalizing the whole inventory.
+    completedTurnKeys = turnCompletionIndex(spans.values());
     // Recompute the live re-fetch floors from the just-resolved openness so the
     // next poll pulls backdated closes for still-open work (#62 P1).
     openFloors.clear();
@@ -3309,11 +3314,16 @@ export function mount(container, opts = {}) {
   }
 
   function knownTurnCompletion(s, detail) {
-    // The windowed store can prove completion when it contains the summary, but
-    // absence is not proof of liveness. A focused full-trace read supplies that.
-    const local = turnCompletionEvidence(spans.values(), detail, { truncated: true });
-    if (local.completed) return local;
-    return turnCompletionCache.get(turnCompletionKey(s)) || local;
+    // The layout's one-pass index can prove completion in O(1). Absence is not
+    // proof of liveness; only a focused full-trace read can make that negative
+    // claim authoritative.
+    if (completedTurnKeys.has(turnCompletionIdentityKey(detail))) {
+      return Object.freeze({ completed: true, completionKnown: true });
+    }
+    return (
+      turnCompletionCache.get(turnCompletionKey(s)) ||
+      Object.freeze({ completed: false, completionKnown: false })
+    );
   }
 
   function loadTurnCompletion(s, detail) {
@@ -3321,9 +3331,9 @@ export function mount(container, opts = {}) {
     if (
       !key ||
       turnCompletionLoads.has(key) ||
-      !needsFocusedTurnCompletion(spans.values(), detail, {
-        stopAvailable: Boolean(stopController),
-      })
+      !stopController ||
+      !stopTargetFromDetail(detail).addressable ||
+      completedTurnKeys.has(turnCompletionIdentityKey(detail))
     ) return;
     // Positive completion is permanent. A negative focused snapshot describes
     // only that instant: a paused view may receive no local summary afterward,
@@ -3371,12 +3381,10 @@ export function mount(container, opts = {}) {
 
   function reconcileSelectedTurnCompletions() {
     if (!stopController || typeof stopController.knownTargets !== "function") return;
-    // Selection and inspector-only results can contain many turns while the
-    // store contains up to 60,000 spans. Index summaries once per layout
-    // instead of rescanning the inventory once per retained target.
-    const completedTurns = turnCompletionIndex(spans.values());
+    // Selection and inspector-only results can contain many turns. Reuse the
+    // one index built with this layout instead of scanning per retained target.
     for (const target of stopController.knownTargets()) {
-      if (!completedTurns.has(turnCompletionIdentityKey(target))) continue;
+      if (!completedTurnKeys.has(turnCompletionIdentityKey(target))) continue;
       stopController.observe(
         Object.freeze({
           ...target,

@@ -49,9 +49,19 @@ function mergeCompletionEvidence(target, ...evidence) {
   let completionKnown = target.completionKnown === true;
   let completed = target.completed === true;
   for (const item of evidence) {
-    completionKnown = completionKnown || item?.completionKnown === true;
     completed = completed || item?.completed === true;
+    // Positive completion is permanent. Negative "still active" knowledge is
+    // a snapshot, however: the last observation may deliberately invalidate it
+    // while a focused trace is re-read. Never OR that freshness bit or a stale
+    // active snapshot re-enables Stop behind an inspector saying "Checking…".
+    if (
+      item &&
+      Object.prototype.hasOwnProperty.call(item, "completionKnown")
+    ) {
+      completionKnown = item.completionKnown === true;
+    }
   }
+  completionKnown = completed || completionKnown;
   if (
     completionKnown === target.completionKnown &&
     completed === target.completed
@@ -199,8 +209,9 @@ export function createStopController({
       const advanced = mergeCompletionEvidence(existing, target);
       if (advanced === existing) return existing;
       changed = true;
-      // Lifecycle advances monotonically, while routing and identity remain
-      // the exact values captured by the original selection/operation.
+      // Completed lifecycle advances monotonically; negative-completion
+      // freshness may be invalidated. Routing and identity remain the exact
+      // values captured by the original selection/operation.
       return advanced;
     }
 
