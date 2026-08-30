@@ -417,19 +417,36 @@ const TURN_SUMMARY_NAME_RE = /^turn\s+\d+\s+summary$/i;
 const SESSION_SUMMARY_NAME_RE = /^session\s+summary$/i;
 const STARTED_NAME_RE = /\(started\)\s*$/i;
 
+/** Exact emitter summary roles; tool names alone are never lifecycle evidence. */
+export function isTurnSummarySpan(span) {
+  return Boolean(
+    span &&
+      spanKindOf(span) === "CHAIN" &&
+      TURN_SUMMARY_NAME_RE.test(String(span.name || "")),
+  );
+}
+
+export function isSessionSummarySpan(span) {
+  return Boolean(
+    span &&
+      spanKindOf(span) === "CHAIN" &&
+      SESSION_SUMMARY_NAME_RE.test(String(span.name || "")),
+  );
+}
+
 export function spanRoleOf(span, context = {}) {
   const source = span || {};
   const attrs = context.attrs || parseAttributes(source.attributes ?? source.attrs);
   const name = String(source.name ?? "");
-  if (SESSION_SUMMARY_NAME_RE.test(name)) return ROLE_SESSION_SUMMARY;
-  if (TURN_SUMMARY_NAME_RE.test(name)) return ROLE_TURN_SUMMARY;
+  const kind = spanKindOf(source);
+  if (isSessionSummarySpan(source)) return ROLE_SESSION_SUMMARY;
+  if (isTurnSummarySpan(source)) return ROLE_TURN_SUMMARY;
   const marker = firstPresent(source.marker, getAttr(attrs, ATTR_MARKER));
   if (present(marker) && String(marker) === MARKER_START) {
     // A "(started)" marker twins a real tool span; any other start marker IS the
     // turn's start (the Timeline's own turn-root rule).
     return STARTED_NAME_RE.test(name) ? ROLE_TOOL_START : ROLE_TURN_ROOT;
   }
-  const kind = spanKindOf(source);
   if (present(getAttr(attrs, ATTR_TOOL_OUTCOME)) || kind === "TOOL") return ROLE_TOOL_SPAN;
   const parentSpanId = firstPresent(
     context.parentSpanId,

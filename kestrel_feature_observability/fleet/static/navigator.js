@@ -77,6 +77,7 @@ import {
   createAgg,
   mergeSpansIntoAgg,
   spanKindOf,
+  isTurnSummarySpan,
   spanSummaryOf,
   normalizeSpanDetail,
   renderSpanDetail,
@@ -100,15 +101,13 @@ export {
 const PAGE_SIZE = 100; // root spans per lazy page (client-side aggregation window)
 const TRACE_SPAN_LIMIT = 1000; // events per turn (one trace)
 const TURN_COMPLETION_REFRESH_LIMIT = 6; // bounded late-summary checks per loaded turn
-const CANONICAL_TURN_SUMMARY_RE = /^turn\s+\d+\s+summary$/i;
-
 /** Only the emitter's exact direct-child summary role proves turn completion. */
 export function isCanonicalTurnSummarySpan(span, rootSpanId) {
   return Boolean(
     rootSpanId &&
       span &&
       span.parentId === rootSpanId &&
-      CANONICAL_TURN_SUMMARY_RE.test(String(span.name || "")),
+      isTurnSummarySpan(span),
   );
 }
 

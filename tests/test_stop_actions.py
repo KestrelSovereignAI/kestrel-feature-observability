@@ -582,12 +582,18 @@ def test_navigator_only_canonical_direct_turn_summary_closes_stop(tmp_path):
         "navigator-canonical-summary.mjs",
         r"""
 import { isCanonicalTurnSummarySpan } from "./navigator.js";
-const span = (name, parentId = "turn-root") => ({ name, parentId });
+const span = (name, parentId = "turn-root", spanKind = "CHAIN") => ({
+  name, parentId, spanKind,
+});
 process.stdout.write(JSON.stringify({
   canonical: isCanonicalTurnSummarySpan(span("turn 12 summary"), "turn-root"),
   planning: isCanonicalTurnSummarySpan(span("turn planning summary"), "turn-root"),
   decorated: isCanonicalTurnSummarySpan(span("agent turn 12 summary done"), "turn-root"),
   wrongParent: isCanonicalTurnSummarySpan(span("turn 12 summary", "tool-root"), "turn-root"),
+  toolNamedSummary: isCanonicalTurnSummarySpan(
+    span("turn 12 summary", "turn-root", "TOOL"),
+    "turn-root",
+  ),
 }));
 """,
     )
@@ -597,6 +603,7 @@ process.stdout.write(JSON.stringify({
         "planning": False,
         "decorated": False,
         "wrongParent": False,
+        "toolNamedSummary": False,
     }
     navigator = (STATIC / "navigator.js").read_text(encoding="utf-8")
     load_events = navigator[
@@ -757,20 +764,32 @@ const root = {
 };
 const summary = {
   name: "turn 4 summary",
+  spanKind: "CHAIN",
+  attributes: root.attributes,
+};
+const toolNamedSummary = {
+  name: "turn 4 summary",
+  spanKind: "TOOL",
   attributes: root.attributes,
 };
 const completionIndex = turnCompletionIndex([root, summary]);
+const impostorIndex = turnCompletionIndex([root, toolNamedSummary]);
 process.stdout.write(JSON.stringify({
   partial: turnCompletionEvidence([root], detail, { truncated: true }),
   full: turnCompletionEvidence([root], detail, { truncated: false }),
   completedPartial: turnCompletionEvidence([root, summary], detail, { truncated: true }),
+  toolNamedSummary: turnCompletionEvidence(
+    [root, toolNamedSummary], detail, { truncated: true },
+  ),
   indexed: {
     completed: completionIndex.has("did:kestrel:emma\u0000turn-4"),
     unrelated: completionIndex.has("did:kestrel:claw\u0000turn-4"),
+    toolNamedSummary: impostorIndex.has("did:kestrel:emma\u0000turn-4"),
   },
   focused: {
     active: needsFocusedTurnCompletion([root], detail),
     completed: needsFocusedTurnCompletion([root, summary], detail),
+    toolNamedSummary: needsFocusedTurnCompletion([root, toolNamedSummary], detail),
     noController: needsFocusedTurnCompletion([root], detail, { stopAvailable: false }),
     unaddressable: needsFocusedTurnCompletion([root], { turnId: "turn-4" }),
   },
@@ -784,10 +803,19 @@ process.stdout.write(JSON.stringify({
         "completed": True,
         "completionKnown": True,
     }
-    assert result["indexed"] == {"completed": True, "unrelated": False}
+    assert result["toolNamedSummary"] == {
+        "completed": False,
+        "completionKnown": False,
+    }
+    assert result["indexed"] == {
+        "completed": True,
+        "unrelated": False,
+        "toolNamedSummary": False,
+    }
     assert result["focused"] == {
         "active": True,
         "completed": False,
+        "toolNamedSummary": True,
         "noController": False,
         "unaddressable": False,
     }

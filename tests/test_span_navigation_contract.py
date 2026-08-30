@@ -987,10 +987,11 @@ const makeSpan = ({
   duration = 10_000,
   parentId = null,
   attributes = null,
+  spanKind = "TOOL",
 }) => ({
   id,
   name,
-  spanKind: "TOOL",
+  spanKind,
   startTime: iso(start),
   endTime: iso(start + duration),
   latencyMs: duration,
@@ -998,7 +999,7 @@ const makeSpan = ({
   parentId,
   attributes: JSON.stringify(
     attributes || {
-      openinference: { span: { kind: "TOOL" } },
+      openinference: { span: { kind: spanKind } },
       kestrel: { agent_name: agent },
     },
   ),
@@ -1204,6 +1205,7 @@ const foldedSummary = makeSpan({
   spanId: "summary-span",
   agent: "agent-summary",
   name: "session summary",
+  spanKind: "CHAIN",
   duration: 12_000,
 });
 const foldedResult = await mountFallback(

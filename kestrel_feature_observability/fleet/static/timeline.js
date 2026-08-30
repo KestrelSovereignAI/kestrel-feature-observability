@@ -82,6 +82,8 @@ import {
   workerOf,
   sessionKeyOf,
   spanKindOf,
+  isTurnSummarySpan,
+  isSessionSummarySpan,
   spanSummaryOf,
   normalizeSpanDetail,
   renderSpanDetail,
@@ -346,8 +348,6 @@ function labelBase(s) {
 //                reconcile grace that keeps anchoring the live re-fetch floor so
 //                a late backdated twin/summary can still be pulled (#67 P1). NOT
 //                read by the draw layer — purely a poll-floor signal.
-const TURN_SUMMARY_RE = /^turn\s+\d+\s+summary$/i;
-const SESSION_SUMMARY_RE = /^session\s+summary$/i;
 const STARTED_RE = /\(started\)\s*$/i;
 
 function isMarker(s) {
@@ -362,10 +362,10 @@ function isTurnRoot(s) {
   return isMarker(s) && !isNamedStartMarker(s);
 }
 function isTurnSummary(s) {
-  return TURN_SUMMARY_RE.test(String(s.name || ""));
+  return isTurnSummarySpan(s);
 }
 function isSessionSummary(s) {
-  return SESSION_SUMMARY_RE.test(String(s.name || ""));
+  return isSessionSummarySpan(s);
 }
 function isSummary(s) {
   return isTurnSummary(s) || isSessionSummary(s);
@@ -836,7 +836,7 @@ export function turnCompletionEvidence(
         continue;
       }
       if (
-        TURN_SUMMARY_RE.test(String(candidate.name || "")) ||
+        isTurnSummarySpan(candidate) ||
         (candidate.rSummary && candidate.rOpen === false)
       ) {
         completed = true;
@@ -875,7 +875,7 @@ export function turnCompletionIndex(spanIter) {
   const completed = new Set();
   for (const candidate of spanIter || []) {
     if (
-      !TURN_SUMMARY_RE.test(String(candidate.name || "")) &&
+      !isTurnSummarySpan(candidate) &&
       !(candidate.rSummary && candidate.rOpen === false)
     ) {
       continue;
