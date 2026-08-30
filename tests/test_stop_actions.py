@@ -379,6 +379,92 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_dismissing_outcome_preserves_confirmed_terminal_guard(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "dismiss-guard.mjs",
+        r"""
+import {
+  createStopController,
+  stopActionModel,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+let calls = 0;
+const controller = createStopController({
+  correlationIdFactory: () => "corr-dismiss",
+  api: {
+    async requestForAgent(_path, options) {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      return {
+        turn_id: body.turn_id,
+        stop_outcomes: [{
+          scope: "turn", requested_target: body.turn_id,
+          resolved_target: "request-1", agent_id: "did:kestrel:emma",
+          disposition: "stopped", correlation_id: body.correlation_id,
+        }],
+      };
+    },
+  },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "emma#dismiss",
+});
+controller.select(target);
+const first = await controller.stopOne(target);
+controller.clearResults();
+const visibleAfterDismiss = controller.results();
+const remembered = controller.getResult(target);
+const model = stopActionModel(target, controller);
+const second = await controller.stopOne(target);
+const batch = await controller.stopSelected();
+process.stdout.write(JSON.stringify({
+  calls, first, visibleAfterDismiss, remembered, model, second, batch,
+}));
+""",
+    )
+
+    assert result["calls"] == 1
+    assert result["visibleAfterDismiss"] == []
+    assert result["remembered"]["state"] == "stopped"
+    assert result["model"]["disabled"] is True
+    assert result["second"]["state"] == "stopped"
+    assert result["batch"] == []
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_navigator_completion_requires_untruncated_refreshable_inventory(tmp_path):
+    pkg = _module_dir(tmp_path)
+    (pkg / "navigator.js").write_text(
+        (STATIC / "navigator.js").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    result = _run(
+        pkg,
+        "navigator-completion.mjs",
+        r"""
+import { navigatorTurnCompletionEvidence } from "./navigator.js";
+const turn = (data, loaded = true) => ({ data, loaded });
+process.stdout.write(JSON.stringify({
+  initial: navigatorTurnCompletionEvidence(turn({}, false)),
+  truncated: navigatorTurnCompletionEvidence(turn({ inventoryComplete: false })),
+  active: navigatorTurnCompletionEvidence(turn({ inventoryComplete: true })),
+  summarized: navigatorTurnCompletionEvidence(turn({
+    inventoryComplete: false,
+    summary: { status: "ok" },
+  })),
+}));
+""",
+    )
+
+    assert result["initial"] == {"completed": False, "completionKnown": False}
+    assert result["truncated"] == {"completed": False, "completionKnown": False}
+    assert result["active"] == {"completed": False, "completionKnown": True}
+    assert result["summarized"] == {"completed": True, "completionKnown": True}
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_timeline_partial_inventory_keeps_completion_unknown(tmp_path):
     pkg = _module_dir(tmp_path)
     (pkg / "timeline.js").write_text(
@@ -533,7 +619,10 @@ def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():
     assert "data-inspector-stop" in navigator
     assert "data-inspector-select" in navigator
     assert "stopController.stopOne(stopTargetForNode" in navigator
-    assert "completionKnown: Boolean(turn && turn.loaded)" in navigator
+    assert "navigatorTurnCompletionEvidence(turn)" in navigator
+    assert "node.data.inventoryComplete = spans.length < TRACE_SPAN_LIMIT" in navigator
+    assert 'node.kind === "turn" &&' in navigator
+    assert "!node.data.summary" in navigator
     assert "createStopController({ api: API })" in panel
     assert "mountStopActionBar(stopActionsEl, stopController)" in panel
     assert "const opts = { project, stopController };" in panel

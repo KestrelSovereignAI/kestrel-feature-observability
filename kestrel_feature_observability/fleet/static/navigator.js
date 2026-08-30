@@ -99,6 +99,16 @@ export {
 
 const PAGE_SIZE = 100; // root spans per lazy page (client-side aggregation window)
 const TRACE_SPAN_LIMIT = 1000; // events per turn (one trace)
+
+export function navigatorTurnCompletionEvidence(turn) {
+  const completed = Boolean(turn && turn.data && turn.data.summary);
+  return {
+    completed,
+    completionKnown: Boolean(
+      completed || (turn && turn.loaded && turn.data && turn.data.inventoryComplete),
+    ),
+  };
+}
 const POLL_MS = 10_000; // live-follow cadence
 
 // Virtualization: fixed-height tree rows.
@@ -531,6 +541,10 @@ export function mount(container, opts = {}) {
     const spans = (((trace && trace.spans) || {}).edges || [])
       .map((e) => e && e.node)
       .filter(Boolean);
+    // TRACE_SPANS_QUERY is bounded and exposes no cursor in the pinned Phoenix
+    // schema. A full page is therefore possibly truncated, never proof that a
+    // missing summary means the turn is still active.
+    node.data.inventoryComplete = spans.length < TRACE_SPAN_LIMIT;
 
     const bySpanId = new Map();
     for (const s of spans) {
@@ -813,10 +827,10 @@ export function mount(container, opts = {}) {
 
   function stopTargetForNode(node, detail = detailForNode(node)) {
     const turn = owningTurn(node);
-    const target = stopTargetFromDetail(detail, {
-      completed: Boolean(turn && turn.data.summary),
-      completionKnown: Boolean(turn && turn.loaded),
-    });
+    const target = stopTargetFromDetail(
+      detail,
+      navigatorTurnCompletionEvidence(turn),
+    );
     if (stopController) stopController.observe(target);
     return target;
   }
@@ -1025,7 +1039,19 @@ export function mount(container, opts = {}) {
     try {
       const targets = [];
       (function collect(node) {
-        if (node.expanded && node.loaded && node.kind !== "turn" && node.kind !== "event") {
+        if (
+          node.kind === "turn" &&
+          node.loaded &&
+          !node.data.summary
+        ) {
+          // A turn loaded while active must remain refreshable until its late
+          // summary appears. Excluding turns made the first snapshot permanent.
+          targets.push(node);
+        } else if (
+          node.expanded &&
+          node.loaded &&
+          node.kind !== "event"
+        ) {
           targets.push(node);
         }
         for (const child of node.children) collect(child);

@@ -155,6 +155,9 @@ export function createStopController({
 
   const selected = new Map();
   const results = new Map();
+  // Dismissing visible outcomes is presentation state, not authorization to
+  // repeat a mutation. Confirmed terminal receipts remain as local Stop guards.
+  const confirmedResults = new Map();
   const pendingOperations = new Map();
   const listeners = new Set();
 
@@ -231,8 +234,19 @@ export function createStopController({
     return [...results.values()];
   }
 
+  function storedResult(key) {
+    return results.get(key) || confirmedResults.get(key) || null;
+  }
+
+  function storeResult(result) {
+    results.set(result.key, result);
+    if (CONFIRMED_STOP_DISPOSITIONS.has(result.state)) {
+      confirmedResults.set(result.key, result);
+    }
+  }
+
   function targetForKey(key) {
-    return selected.get(key) || results.get(key)?.target || null;
+    return selected.get(key) || storedResult(key)?.target || null;
   }
 
   async function stopOne(candidate) {
@@ -243,13 +257,13 @@ export function createStopController({
     if (selected.has(original.key)) observe(original);
     const target = selected.get(original.key) || original;
     if (target.completionKnown !== true) return null;
-    const priorResult = results.get(target.key);
+    const priorResult = storedResult(target.key);
     if (CONFIRMED_STOP_DISPOSITIONS.has(priorResult?.state)) {
       return priorResult;
     }
     if (target.completed) {
       const complete = completedResult(target);
-      results.set(target.key, complete);
+      storeResult(complete);
       emit();
       return complete;
     }
@@ -257,11 +271,11 @@ export function createStopController({
     const correlationId = presentString(correlationIdFactory());
     if (!correlationId) {
       const invalid = indeterminateResult(target, "Stop correlation ID could not be created.");
-      results.set(target.key, invalid);
+      storeResult(invalid);
       emit();
       return invalid;
     }
-    results.set(target.key, pendingResult(target, correlationId));
+    storeResult(pendingResult(target, correlationId));
     emit();
 
     const operation = (async () => {
@@ -291,7 +305,7 @@ export function createStopController({
         } else {
           result = resultFromOutcome(target, outcomes[0], { message: response?.message });
         }
-        results.set(target.key, result);
+        storeResult(result);
         emit();
         return result;
       } catch (error) {
@@ -316,7 +330,7 @@ export function createStopController({
             },
           );
         }
-        results.set(target.key, result);
+        storeResult(result);
         emit();
         return result;
       }
@@ -336,7 +350,7 @@ export function createStopController({
     // sub-tab switches cannot retarget an in-flight multi-Stop operation.
     const targets = selectedTargets().filter(
       (target) => {
-        const state = results.get(target.key)?.state;
+        const state = storedResult(target.key)?.state;
         return (
           target.completionKnown === true &&
           state !== "submitting" &&
@@ -366,7 +380,7 @@ export function createStopController({
     targetForKey,
     getResult(candidateOrKey) {
       const key = typeof candidateOrKey === "string" ? candidateOrKey : candidateOrKey?.key;
-      return key ? results.get(key) || null : null;
+      return key ? storedResult(key) : null;
     },
     stopOne,
     stopSelected,
