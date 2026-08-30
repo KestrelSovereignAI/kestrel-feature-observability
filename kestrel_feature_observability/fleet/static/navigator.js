@@ -100,6 +100,17 @@ export {
 const PAGE_SIZE = 100; // root spans per lazy page (client-side aggregation window)
 const TRACE_SPAN_LIMIT = 1000; // events per turn (one trace)
 const TURN_COMPLETION_REFRESH_LIMIT = 6; // bounded late-summary checks per loaded turn
+const CANONICAL_TURN_SUMMARY_RE = /^turn\s+\d+\s+summary$/i;
+
+/** Only the emitter's exact direct-child summary role proves turn completion. */
+export function isCanonicalTurnSummarySpan(span, rootSpanId) {
+  return Boolean(
+    rootSpanId &&
+      span &&
+      span.parentId === rootSpanId &&
+      CANONICAL_TURN_SUMMARY_RE.test(String(span.name || "")),
+  );
+}
 
 /** Whether a Phoenix trace response proves its returned span inventory complete. */
 export function navigatorTraceInventoryComplete(trace, spans) {
@@ -617,11 +628,8 @@ export function mount(container, opts = {}) {
       if (st != null && (turnStart == null || st < turnStart)) turnStart = st;
       if (en != null && (turnEnd == null || en > turnEnd)) turnEnd = en;
     }
-    const turnSummary = spans.find(
-      (span) =>
-        span.parentId === rootSpanId &&
-        /\bturn\b.*\bsummary\b/i.test(String(span.name || "")),
-    );
+    const turnSummary = spans.find((span) =>
+      isCanonicalTurnSummarySpan(span, rootSpanId));
     node.data.summary = turnSummary ? spanSummaryOf(turnSummary) : null;
     node.data.summaryEndMs = turnSummary ? ts(turnSummary.endTime) : null;
     if (turnSummary || node.data.inventoryComplete !== true) {

@@ -856,6 +856,20 @@ function turnCompletionIdentityKey(detail) {
     : null;
 }
 
+/** Canonical key for the one focused completion read shared by a turn trace. */
+export function timelineTurnCompletionKey(value) {
+  return value?.projectId && value?.traceId
+    ? `${value.projectId}\u0000${value.traceId}`
+    : null;
+}
+
+/** Whether two rendered spans share the one trace-scoped turn completion read. */
+export function sameTimelineTurnCompletion(left, right) {
+  const leftKey = timelineTurnCompletionKey(left);
+  const rightKey = timelineTurnCompletionKey(right);
+  return leftKey !== null && leftKey === rightKey;
+}
+
 /** Index every completed turn in one pass over a loaded span inventory. */
 export function turnCompletionIndex(spanIter) {
   const completed = new Set();
@@ -3309,10 +3323,6 @@ export function mount(container, opts = {}) {
 
   // A leaf tool's own closed span does not mean its owning turn is complete.
   // Only the folded/actual turn summary closes the operator's Stop door.
-  function turnCompletionKey(s) {
-    return s?.projectId && s?.traceId ? `${s.projectId}\u0000${s.traceId}` : null;
-  }
-
   function knownTurnCompletion(s, detail) {
     // The layout's one-pass index can prove completion in O(1). Absence is not
     // proof of liveness; only a focused full-trace read can make that negative
@@ -3321,13 +3331,13 @@ export function mount(container, opts = {}) {
       return Object.freeze({ completed: true, completionKnown: true });
     }
     return (
-      turnCompletionCache.get(turnCompletionKey(s)) ||
+      turnCompletionCache.get(timelineTurnCompletionKey(s)) ||
       Object.freeze({ completed: false, completionKnown: false })
     );
   }
 
   function loadTurnCompletion(s, detail) {
-    const key = turnCompletionKey(s);
+    const key = timelineTurnCompletionKey(s);
     if (
       !key ||
       turnCompletionLoads.has(key) ||
@@ -3366,7 +3376,10 @@ export function mount(container, opts = {}) {
         // Unknown is load-bearing: a failed focused read never enables Stop.
       } finally {
         turnCompletionLoads.delete(key);
-        if (activePopoverSpan === s && !popEl.hidden) syncPopoverStopActions();
+        if (
+          sameTimelineTurnCompletion(activePopoverSpan, s) &&
+          !popEl.hidden
+        ) syncPopoverStopActions();
       }
     })();
     turnCompletionLoads.set(key, operation);

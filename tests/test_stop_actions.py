@@ -571,6 +571,44 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_navigator_only_canonical_direct_turn_summary_closes_stop(tmp_path):
+    pkg = _module_dir(tmp_path)
+    (pkg / "navigator.js").write_text(
+        (STATIC / "navigator.js").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    result = _run(
+        pkg,
+        "navigator-canonical-summary.mjs",
+        r"""
+import { isCanonicalTurnSummarySpan } from "./navigator.js";
+const span = (name, parentId = "turn-root") => ({ name, parentId });
+process.stdout.write(JSON.stringify({
+  canonical: isCanonicalTurnSummarySpan(span("turn 12 summary"), "turn-root"),
+  planning: isCanonicalTurnSummarySpan(span("turn planning summary"), "turn-root"),
+  decorated: isCanonicalTurnSummarySpan(span("agent turn 12 summary done"), "turn-root"),
+  wrongParent: isCanonicalTurnSummarySpan(span("turn 12 summary", "tool-root"), "turn-root"),
+}));
+""",
+    )
+
+    assert result == {
+        "canonical": True,
+        "planning": False,
+        "decorated": False,
+        "wrongParent": False,
+    }
+    navigator = (STATIC / "navigator.js").read_text(encoding="utf-8")
+    load_events = navigator[
+        navigator.index("async function loadEvents") : navigator.index(
+            "// ── Virtualized rows"
+        )
+    ]
+    assert "isCanonicalTurnSummarySpan(span, rootSpanId)" in load_events
+    assert r"\bturn\b.*\bsummary\b" not in load_events
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
 def test_focused_completion_updates_retained_selection_without_open_popover(tmp_path):
     pkg = _module_dir(tmp_path)
     (pkg / "timeline.js").write_text(
@@ -652,6 +690,41 @@ def test_active_turn_popover_uses_layout_completion_index_not_full_store_scans()
     assert "spans.values()" not in hot_path
     assert "completedTurnKeys" in hot_path
     assert "completedTurnKeys = turnCompletionIndex(spans.values())" in timeline
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_shared_trace_completion_repaints_the_current_same_turn_popover(tmp_path):
+    pkg = _module_dir(tmp_path)
+    (pkg / "timeline.js").write_text(
+        (STATIC / "timeline.js").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    result = _run(
+        pkg,
+        "timeline-completion-key.mjs",
+        r"""
+import { sameTimelineTurnCompletion } from "./timeline.js";
+const first = { id: "span-a", projectId: "project-1", traceId: "trace-1" };
+process.stdout.write(JSON.stringify({
+  sibling: sameTimelineTurnCompletion(
+    first,
+    { id: "span-b", projectId: "project-1", traceId: "trace-1" },
+  ),
+  otherTrace: sameTimelineTurnCompletion(
+    first,
+    { id: "span-c", projectId: "project-1", traceId: "trace-2" },
+  ),
+  otherProject: sameTimelineTurnCompletion(
+    first,
+    { id: "span-d", projectId: "project-2", traceId: "trace-1" },
+  ),
+}));
+""",
+    )
+
+    assert result == {"sibling": True, "otherTrace": False, "otherProject": False}
+    timeline = (STATIC / "timeline.js").read_text(encoding="utf-8")
+    assert "sameTimelineTurnCompletion(activePopoverSpan, s)" in timeline
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")
@@ -956,6 +1029,46 @@ process.stdout.write(JSON.stringify({ before, after, calls }));
     assert result["calls"] == [["Emma", "Emma#1"], ["Claw", "Claw#1"]]
     assert "Stopped" in result["after"]
     assert "Already complete" in result["after"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_action_bar_hides_retry_while_completion_is_unknown(tmp_path):
+    pkg = _module_dir(tmp_path)
+    result = _run(
+        pkg,
+        "action-bar-unknown-retry.mjs",
+        r"""
+import {
+  createStopController,
+  mountStopActionBar,
+  stopTargetFromDetail,
+} from "./stop-actions.js";
+const controller = createStopController({
+  api: { async requestForAgent() { throw new Error("response lost"); } },
+});
+const target = stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "Emma#unknown",
+}, { completionKnown: true, completed: false });
+await controller.stopOne(target);
+const listeners = new Map();
+const element = {
+  innerHTML: "",
+  addEventListener(name, fn) { listeners.set(name, fn); },
+  removeEventListener(name) { listeners.delete(name); },
+};
+const mounted = mountStopActionBar(element, controller);
+const before = element.innerHTML;
+controller.observe(stopTargetFromDetail({
+  agent: "Emma", agentDid: "did:kestrel:emma", turnId: "Emma#unknown",
+}, { completionKnown: false, completed: false }));
+const after = element.innerHTML;
+mounted.destroy();
+process.stdout.write(JSON.stringify({ before, after }));
+""",
+    )
+
+    assert "data-retry-stop" in result["before"]
+    assert "data-retry-stop" not in result["after"]
 
 
 def test_both_inspectors_and_panel_ship_the_shared_stop_wiring():

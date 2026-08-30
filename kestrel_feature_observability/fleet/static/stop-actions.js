@@ -540,7 +540,7 @@ export function mountStopActionBar(element, controller) {
                   <code>${escapeHtml(target.turnId)}</code>
                 </span>
                 ${result ? `<span class="obs-stopbar__outcome obs-stopbar__outcome--${escapeHtml(result.state)}" title="${escapeHtml(result.message)}">${escapeHtml(resultLabel(result))}</span>` : `<span class="obs-stopbar__outcome">Selected</span>`}
-                ${result && !target.completed && result.state !== "submitting" && result.state !== "stopped" && result.state !== "already_complete" ? `<button type="button" class="obs-stopbar__button" data-retry-stop="${escapeHtml(target.key)}">Retry</button>` : ""}
+                ${result && target.completionKnown === true && !target.completed && result.state !== "submitting" && result.state !== "stopped" && result.state !== "already_complete" ? `<button type="button" class="obs-stopbar__button" data-retry-stop="${escapeHtml(target.key)}">Retry</button>` : ""}
               </li>`).join("")}
           </ul>` : `<div class="obs-stopbar__empty">Select an addressable turn in Timeline or Navigator to build an exact multi-turn Stop set.</div>`}
       </section>`;
