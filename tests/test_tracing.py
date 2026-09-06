@@ -255,6 +255,28 @@ class TestAttributeResolution:
         assert t._defaults["run_id"] == "acme/widgets#99"
         assert t._defaults["orchestrator"] == "talon"
 
+    def test_orchestrator_resource_can_be_omitted_without_losing_span_default(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:6006",
+                "OTEL_RESOURCE_ATTRIBUTES": (
+                    "kestrel.orchestrator=stale-otel-resource,"
+                    "deployment.environment.name=test"
+                ),
+                "KESTREL_ORCHESTRATOR": "stale-process-default",
+            },
+            clear=True,
+        ):
+            t = configure(include_orchestrator_resource=False)
+
+        assert t._defaults["orchestrator"] == "stale-process-default"
+        assert KESTREL_ORCHESTRATOR not in t._tracer.resource.attributes
+        assert (
+            t._tracer.resource.attributes["deployment.environment.name"]
+            == "test"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 6. LLM span I/O attributes
