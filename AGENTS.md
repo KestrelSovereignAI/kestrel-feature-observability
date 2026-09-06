@@ -60,7 +60,7 @@ uv run pytest
   `[fleet]` extra: `fleet/feature.py` imports only `HostFeature`/`UIContributions` from `kestrel_sdk`, so on a
   modern SDK the class binds for real; only a too-old SDK (below the HostFeature contract) trips the guard,
   which logs a warning and resolves the `host_features` entry point to `None` so the host skips the panel.
-- Every install role declares the SDK as **floor-only** (`>=0.34,<1`) — base, `[metrics]`,
+- Every install role declares the SDK as **floor-only** (`>=0.38.1,<1`) — base, `[metrics]`,
   `[fleet]`, test extra, and dev group. **Do not add an upper bound.** The host
   (`kestrel-sovereign`) pins the SDK to a single minor and so decides which SDK the environment
   gets; a second ceiling here has to be walked forward by hand, in a separate repo, on every host

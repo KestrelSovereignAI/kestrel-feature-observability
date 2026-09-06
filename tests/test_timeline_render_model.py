@@ -262,6 +262,7 @@ export function rawSpan({
   session = null,
   traceId = "trace-1",
   kestrel = null,
+  hostAgentDid = null,
 }) {
   return {
     id,
@@ -273,6 +274,7 @@ export function rawSpan({
     statusCode: "OK",
     parentId,
     attributes: JSON.stringify({
+      ...(hostAgentDid != null ? { agent: { did: hostAgentDid } } : {}),
       openinference: { span: { kind } },
       kestrel: {
         agent_name: agent,
@@ -1324,6 +1326,7 @@ function span(o) {
     projectId: o.projectId != null ? o.projectId : "P",
     projectName: o.projectName || "kestrel-fleet",
     agent: o.agent,
+    agentDid: o.agentDid != null ? o.agentDid : null,
     worker: o.worker || null,
     orchestrator: o.orchestrator != null ? o.orchestrator : null,
     rHide: o.rHide === true,
@@ -1412,6 +1415,50 @@ const out = {};
     span({ agent: "Claw", orchestrator: "Claw" }),
     span({ agent: "Claw" }),
   ])["kestrel-fleet"];
+}
+
+// Canonical Kestrel turns project DIDs, not mutable display names. The raw DID
+// remains the lane identity while project-local agent DID metadata resolves its
+// human-facing parent lane. A self DID is the same plain lane, never a child.
+{
+  out.didProjection = groups([
+    span({ agent: "Peer", agentDid: "did:agent:peer" }),
+    span({
+      agent: "Child",
+      agentDid: "did:agent:child",
+      orchestrator: "did:agent:peer",
+    }),
+  ])["kestrel-fleet"];
+  out.selfDidProjection = groups([
+    span({ agent: "Child", agentDid: "did:agent:child" }),
+    span({
+      agent: "Child",
+      agentDid: "did:agent:child",
+      orchestrator: "did:agent:child",
+    }),
+  ])["kestrel-fleet"];
+  out.inferredSelfDidProjection = groups([
+    span({ agent: "Child", agentDid: "did:agent:child" }),
+    span({ agent: "Child", orchestrator: "did:agent:child" }),
+  ])["kestrel-fleet"];
+}
+
+// Display names are presentation, not identity. Two agents may deliberately
+// share one, so their stable DIDs must retain two parent lanes and each child
+// must nest under the exact DID that drove it.
+{
+  const lanes = laneGroups([
+    span({ agent: "Shared", agentDid: "did:agent:a" }),
+    span({ agent: "Shared", agentDid: "did:agent:b" }),
+    span({ agent: "Child A", agentDid: "did:agent:child-a", orchestrator: "did:agent:a" }),
+    span({ agent: "Child B", agentDid: "did:agent:child-b", orchestrator: "did:agent:b" }),
+  ]).get("kestrel-fleet");
+  out.sharedDisplayDids = lanes.map((lane) => ({
+    label: lane.label,
+    level: lane.level,
+    agentIdentity: lane.agentIdentity,
+    count: lane.items.length,
+  }));
 }
 
 // Rule 4 in isolation, at its sharpest: an agent literally named `Direct` HAS a
@@ -1622,6 +1669,74 @@ def test_lane_groups_nest_orchestrated_lanes(tmp_path):
             "orchestrator": None,
             "worker": None,
             "count": 3,
+        },
+    ]
+
+    # #117: the canonical raw DID nests under the lane whose agent DID matches,
+    # while the lane keeps the exact wire projection for reveal identity.
+    assert r["didProjection"] == [
+        {
+            "label": "Peer",
+            "level": 1,
+            "agent": "Peer",
+            "orchestrator": None,
+            "worker": None,
+            "count": 1,
+        },
+        {
+            "label": "Peer/Child",
+            "level": 2,
+            "agent": "Child",
+            "orchestrator": "did:agent:peer",
+            "worker": None,
+            "count": 1,
+        },
+    ]
+    assert r["selfDidProjection"] == [
+        {
+            "label": "Child",
+            "level": 1,
+            "agent": "Child",
+            "orchestrator": None,
+            "worker": None,
+            "count": 2,
+        },
+    ]
+    assert r["inferredSelfDidProjection"] == [
+        {
+            "label": "Child",
+            "level": 1,
+            "agent": "Child",
+            "orchestrator": None,
+            "worker": None,
+            "count": 2,
+        },
+    ]
+
+    assert r["sharedDisplayDids"] == [
+        {
+            "label": "Shared",
+            "level": 1,
+            "agentIdentity": "did:did:agent:a",
+            "count": 1,
+        },
+        {
+            "label": "Shared/Child A",
+            "level": 2,
+            "agentIdentity": "did:did:agent:child-a",
+            "count": 1,
+        },
+        {
+            "label": "Shared",
+            "level": 1,
+            "agentIdentity": "did:did:agent:b",
+            "count": 1,
+        },
+        {
+            "label": "Shared/Child B",
+            "level": 2,
+            "agentIdentity": "did:did:agent:child-b",
+            "count": 1,
         },
     ]
 
@@ -2191,6 +2306,66 @@ function hexId(prefix, n) {
   return `${prefix}${String(n).padStart(16 - prefix.length, "0")}`;
 }
 """
+
+
+@pytest.mark.skipif(NODE is None, reason="node runtime not available")
+def test_host_agent_did_joins_canonical_same_name_lane(tmp_path):
+    """Host ``agent.did`` and feature ``kestrel.agent_did`` share one lane."""
+    pkg = _poll_pkg(tmp_path)
+    result = _run_scenario(
+        pkg,
+        "host-agent-did-lane.mjs",
+        _TIMELINE_PRELUDE
+        + r"""
+const spans = [
+  rawSpan({
+    id: "feature-a",
+    name: "feature a",
+    start: T0 - 3000,
+    agent: "Shared",
+    spanId: "0000000000000001",
+    projectId: PROJECT.id,
+    kestrel: { agent_did: "did:agent:a" },
+  }),
+  rawSpan({
+    id: "host-a",
+    name: "host a",
+    start: T0 - 2000,
+    agent: "Shared",
+    spanId: "0000000000000002",
+    projectId: PROJECT.id,
+    hostAgentDid: "did:agent:a",
+  }),
+  rawSpan({
+    id: "host-b",
+    name: "host b",
+    start: T0 - 1000,
+    agent: "Shared",
+    spanId: "0000000000000003",
+    projectId: PROJECT.id,
+    hostAgentDid: "did:agent:b",
+  }),
+];
+const phoenix = installFakePhoenix({ projects: [PROJECT], spans });
+
+const { mount } = await import("./timeline.js");
+const container = new FakeElement("div");
+const mounted = mount(container, { openTrace() {}, openNavigator() {} });
+const canvas = container.querySelector("[data-canvas]");
+await settle(phoenix.calls);
+const labels = frameText(lastFrame(canvas));
+mounted.destroy();
+process.stdout.write(JSON.stringify({
+  sharedLaneCount: labels.filter((label) => label === "Shared").length,
+  servedUnique: new Set(phoenix.served).size,
+}));
+""",
+    )
+
+    assert result == {
+        "sharedLaneCount": 2,
+        "servedUnique": 3,
+    }
 
 
 @pytest.mark.skipif(NODE is None, reason="node runtime not available")

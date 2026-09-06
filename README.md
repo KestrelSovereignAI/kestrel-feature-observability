@@ -63,7 +63,7 @@ process boundaries):
   store/entities were retired, `fleet/feature.py` imports only the
   `HostFeature`/`UIContributions` contract from `kestrel_sdk`, so the host role
   is gated by the **SDK version**, not by an extra-only importable module: the
-  package declares the SDK floor-only (`>=0.34`) across every install role — the
+  package declares the SDK floor-only (`>=0.38.1`) across every install role — the
   host pins the SDK minor, so this package must not add a second ceiling (#99). The import/entry point
   stays **guarded** — if the
   resolved SDK is too old to export the contract, it degrades to `None` (with a
@@ -132,8 +132,13 @@ child `tool_span` (tool name, real duration, success,
 `kestrel.tool_outcome=completed`) parented to the current turn; `Stop`
 reconciles the turn's unfinished tools and emits a `turn <n> summary` (the
 session stays live), and `AgentTerminate`/teardown emits the true `session
-summary` aggregating turns. `orchestrator` is the agent itself when
-self-driven, else inherited.
+summary` aggregating turns. For in-process Kestrel agents,
+`kestrel.orchestrator` is a diagnostic projection of the canonical driving
+parent: the previous `CausationFrame` agent DID for driven work, the verified
+lineage DID only for a genuine lineage-root turn, this agent's DID for a root
+with no predecessor, and absent when the causal answer is unknown. The value is
+never authority. Timeline placement resolves that stable DID through
+`kestrel.agent_did`; Navigator displays the same raw projection.
 
 The `turn <n> summary` carries the per-turn stats — `kestrel.tool_count`,
 `kestrel.error_count`, `kestrel.success_ratio`, `kestrel.denied_count`,
@@ -330,12 +335,12 @@ Prompt capture is strictly opt-in: setting `KESTREL_OTEL_CAPTURE_PROMPTS=1` (off
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.34,<1` — base `Feature`, `Hook`, and shared `metrics` module
+- `kestrel-sovereign-sdk>=0.38.1,<1` — base `Feature`, `Hook`, shared `metrics`, and Two Axes contract
 - `httpx>=0.27.0` — lightweight HTTP client (OTLP/HTTP export transport)
 - `opentelemetry-sdk` + `opentelemetry-exporter-otlp-proto-http` +
   `openinference-semantic-conventions` — the OTel span builders + OTLP export
 - Optional `[metrics]` extra → `kestrel-sovereign-sdk[metrics]` → `prometheus-client`
-- Optional `[fleet]` extra → `kestrel-sovereign-sdk>=0.34,<1` (the HostFeature
+- Optional `[fleet]` extra → `kestrel-sovereign-sdk>=0.38.1,<1` (the HostFeature
   contract for the Phoenix-embed console panel). No DB.
 
 The base emitter has **no** runtime dependency on `kestrel-sovereign` (or any

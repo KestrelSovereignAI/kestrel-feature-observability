@@ -686,24 +686,42 @@ class ObservabilityHook(Hook):
         return _DrivingParentResolution(True, identities[-2])
 
     def _orchestrator_override(
-        self, agent_name: str, driving_parent: _DrivingParentResolution
-    ) -> Optional[str]:
-        """Project causal knowledge without smoothing an unknown predecessor.
+        self, driving_parent: _DrivingParentResolution
+    ) -> str:
+        """Project one canonical driving-parent answer onto the wire.
 
-        An empty string deliberately overrides and suppresses a tracer-level
-        default.  Known driven turns continue to inherit the configured
-        projection until #117 stamps the exact predecessor on every span.
+        A concrete predecessor is already the stable agent identity carried by
+        the canonical causation frame (or the verified lineage identity for a
+        genuine root), so emit it verbatim.  A root with no predecessor is
+        represented by this agent's stable DID.  An empty string deliberately
+        suppresses the tracer-level default for unknown input or a host shape
+        that cannot provide a stable DID; display names and environment values
+        never repair missing causal evidence.
         """
 
         if not driving_parent.known:
             return ""
+        if driving_parent.identity is not None:
+            return driving_parent.identity
         current_agent = self._agent_did()
-        if driving_parent.identity is None or (
-            isinstance(current_agent, str)
-            and driving_parent.identity == current_agent.strip()
-        ):
-            return agent_name
-        return None
+        if isinstance(current_agent, str) and current_agent.strip():
+            return current_agent.strip()
+        return ""
+
+    def _base_attrs(self, session_id: Optional[str]) -> Dict[str, Any]:
+        """Stable agent identity plus the paired session attributes.
+
+        ``kestrel.orchestrator`` now carries DIDs for in-process agents.  Stamp
+        ``kestrel.agent_did`` on every emitted span, not only the session root,
+        so Timeline placement can reconcile the raw causal identity with the
+        human-facing agent lane even when a page does not contain that root.
+        """
+
+        attrs = _session_attrs(session_id)
+        agent_did = self._agent_did()
+        if isinstance(agent_did, str) and agent_did.strip():
+            attrs["kestrel.agent_did"] = agent_did.strip()
+        return attrs
 
     @staticmethod
     def _scope_driving_parent(
@@ -727,7 +745,7 @@ class ObservabilityHook(Hook):
         Taking the turn explicitly is what lets reconciliation stamp a leftover
         tool with its OWN turn rather than the live one (#84).
         """
-        attrs = _session_attrs(session_id)
+        attrs = self._base_attrs(session_id)
         if turn is not None:
             if turn.turn_id is not None:
                 attrs[KESTREL_TURN_ID] = turn.turn_id
@@ -756,18 +774,15 @@ class ObservabilityHook(Hook):
         if existing is not None:
             return existing
 
-        # Known root → the agent is its own orchestrator. Driven → inherit
-        # the process-global projection until #117 stamps the exact predecessor.
-        # Unknown uses an explicit empty override so KestrelTracer cannot smooth
-        # missing/malformed causation into a stale process-global default.
+        # Root → this agent's stable DID; driven → the exact previous
+        # canonical frame (or verified lineage root); unknown → an explicit
+        # empty override so KestrelTracer cannot smooth missing/malformed
+        # causation into a stale process-global default.
         if driving_parent is None:
             driving_parent = self._driving_parent(input)
-        orchestrator = self._orchestrator_override(agent_name, driving_parent)
+        orchestrator = self._orchestrator_override(driving_parent)
 
-        attributes = _session_attrs(session_id)
-        agent_did = self._agent_did()
-        if agent_did:
-            attributes["kestrel.agent_did"] = agent_did
+        attributes = self._base_attrs(session_id)
 
         # Export the session root IMMEDIATELY: a short session-marker span opened
         # AND ended now. We keep its SpanContext (via the returned ended span) to
@@ -822,7 +837,7 @@ class ObservabilityHook(Hook):
 
         # current_turn isn't set yet, so stamp the turn identity explicitly here
         # (every span of the turn carries session id + turn id + turn index).
-        attributes = _session_attrs(session_id)
+        attributes = self._base_attrs(session_id)
         attributes.update(
             {
                 KESTREL_TURN_INDEX: index,
@@ -846,7 +861,7 @@ class ObservabilityHook(Hook):
             start_time=turn_marker_ns,
             end_time=turn_marker_ns,
             agent_name=agent_name,
-            orchestrator=self._orchestrator_override(agent_name, driving_parent),
+            orchestrator=self._orchestrator_override(driving_parent),
             attributes=attributes,
         )
         self._bind_turn_trace_identity(root)
@@ -900,8 +915,7 @@ class ObservabilityHook(Hook):
             end_time=marker_ns,
             agent_name=agent_name,
             orchestrator=self._orchestrator_override(
-                agent_name,
-                self._scope_driving_parent(session, session.current_turn),
+                self._scope_driving_parent(session, session.current_turn)
             ),
             attributes=attributes,
         )
@@ -992,8 +1006,7 @@ class ObservabilityHook(Hook):
             end_time=record.start_ns,
             agent_name=agent_name,
             orchestrator=self._orchestrator_override(
-                agent_name,
-                self._scope_driving_parent(session, record.turn),
+                self._scope_driving_parent(session, record.turn)
             ),
             extra={"tool.success": False},
             attributes=attributes,
@@ -1149,8 +1162,7 @@ class ObservabilityHook(Hook):
             end_time=end_ns,
             agent_name=agent_name,
             orchestrator=self._orchestrator_override(
-                agent_name,
-                self._scope_driving_parent(session, turn),
+                self._scope_driving_parent(session, turn)
             ),
             extra=extra,
             attributes=attributes,
@@ -1221,9 +1233,7 @@ class ObservabilityHook(Hook):
             start_time=turn.started_ns,
             end_time=end_ns,
             agent_name=agent_name,
-            orchestrator=self._orchestrator_override(
-                agent_name, turn.driving_parent
-            ),
+            orchestrator=self._orchestrator_override(turn.driving_parent),
             extra=extra,
             attributes=attributes,
         )
@@ -1279,7 +1289,7 @@ class ObservabilityHook(Hook):
             # Legacy per-scope duration key (back-compat); drop in a future major.
             "kestrel.session_duration_ms": duration_ms,
         }
-        attributes = _session_attrs(session_id)
+        attributes = self._base_attrs(session_id)
 
         # A `session summary` span in the session-marker trace, parented to the
         # exported root — carries session totals without any held-open span (#42).
@@ -1290,9 +1300,7 @@ class ObservabilityHook(Hook):
             start_time=state.started_ns,
             end_time=end_ns,
             agent_name=agent_name,
-            orchestrator=self._orchestrator_override(
-                agent_name, state.driving_parent
-            ),
+            orchestrator=self._orchestrator_override(state.driving_parent),
             extra=extra,
             attributes=attributes,
         )
