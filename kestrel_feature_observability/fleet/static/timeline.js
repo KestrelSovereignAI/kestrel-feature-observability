@@ -63,6 +63,7 @@ import {
   ATTR_TOOL_OUTCOME,
   ATTR_FEATURE_NAME,
   ATTR_ORCHESTRATOR,
+  ATTR_AGENT_DID,
   OUTCOME_COMPLETED,
   OUTCOME_IDLE,
   mintPhoenixSession,
@@ -1108,20 +1109,24 @@ export function spanMemberRollup(s, spans, childrenByParent) {
 // lanes: `Emma/talon` nested under Emma, `claude-code/talon` top-level.
 //
 // Lane A nests under agent B iff ALL of:
-//   1. `A.orchestrator === B` — the attribution names it.
+//   1. `A.orchestrator` equals B's display name OR stable `agentDid` — older
+//      process producers use the former; canonical Kestrel causation uses the
+//      latter.
 //   2. B has its own lane in the SAME project. An orchestrator with no lane here
 //      (`claude-code` in `kestrel-fleet`) leaves A top-level.
-//   3. `A.agent !== B` — no self-nesting. `Claw` spans stamped
-//      `orchestrator=Claw` stay one plain top-level `Claw` lane.
+//   3. A's agent name/DID does not equal the orchestrator — no self-nesting.
+//      `Claw` spans stamped `orchestrator=Claw` and Kestrel roots stamped with
+//      their own DID stay one plain top-level lane.
 //   4. `A.orchestrator` is not the `Direct` sentinel — that means "no
 //      orchestrator", never a parent.
 //
-// IDENTITY vs PLACEMENT are separate. The lane key is the (agent, orchestrator)
-// pair after normalizing only the cases that genuinely mean "nobody launched
-// this": no attribute, the `Direct` sentinel (rule 4), and self-orchestration
-// (rule 3) all collapse to the agent's plain lane. Rule 2 decides PLACEMENT
-// ONLY — an orchestrator with no lane in this project can't be nested under, so
-// its lane stays top-level, but it keeps its own identity: `claude-code/talon`
+// IDENTITY vs PLACEMENT are separate. The lane key is the (stable agent
+// identity, orchestrator) pair after normalizing only the cases that genuinely
+// mean "nobody launched this": no attribute, the `Direct` sentinel (rule 4),
+// and self-orchestration (rule 3) all collapse to the agent's plain lane. Rule 2
+// decides PLACEMENT ONLY — an orchestrator with no lane in this project can't be
+// nested under, so its lane stays top-level, but it keeps its own identity:
+// `claude-code/talon`
 // and `codex/talon` are two distinct top-level lanes, not one pooled `talon`.
 // Erasing the orchestrator there would merge runs from unrelated launchers into
 // a single band and make the lane a lie about what it holds.
@@ -1143,14 +1148,13 @@ export function laneGroups(spanIter) {
     if (s.rHide) continue;
     let p = byProject.get(s.projectName);
     if (!p) {
-      p = { agents: new Set(), spans: [] };
+      p = { spans: [] };
       byProject.set(s.projectName, p);
     }
-    p.agents.add(s.agent);
     p.spans.push(s);
   }
   const out = new Map();
-  for (const [name, p] of byProject) out.set(name, projectLanes(name, p.spans, p.agents));
+  for (const [name, p] of byProject) out.set(name, projectLanes(name, p.spans));
   return out;
 }
 
@@ -1162,36 +1166,94 @@ function laneOrchestratorOf(s) {
   const orch = s.orchestrator;
   if (orch == null || orch === "") return null;
   if (orch === DIRECT_ORCHESTRATOR) return null; // rule 4 — "no orchestrator"
-  if (orch === s.agent) return null; // rule 3 — no self-nesting
+  if (orch === s.agent || (s.agentDid != null && orch === s.agentDid)) return null;
   return String(orch); // rule 1
 }
 
 function cmpGroups(a, b) {
   return (
     String(a.agent).localeCompare(String(b.agent)) ||
-    String(a.orchestrator || "").localeCompare(String(b.orchestrator || ""))
+    String(a.orchestrator || "").localeCompare(String(b.orchestrator || "")) ||
+    String(a.agentIdentity).localeCompare(String(b.agentIdentity))
   );
 }
 
 // One project's ordered lanes: each agent lane followed by its worker sub-lanes,
 // then the agent lanes orchestrated BY it (each with their own workers).
-function projectLanes(projectName, projectSpans, agents) {
-  const groups = new Map(); // `<agent>\0<laneOrchestrator>` → agent lane + workers
-  const groupFor = (agent, orch) => {
-    const key = `${agent}\u0000${orch || ""}`;
+function projectLanes(projectName, projectSpans) {
+  // Canonical Kestrel causation projects stable DIDs while older producers
+  // (and process tools such as Talon/Claude Code) project display names. A DID,
+  // when present, is the lane's identity; a display name is only its label. For
+  // mixed legacy data, a no-DID span joins the one DID that uniquely owns its
+  // display name. An ambiguous shared name remains its own unplaced identity.
+  const didIdentitiesByDisplay = new Map();
+  for (const s of projectSpans) {
+    if (s.agentDid == null || s.agentDid === "") continue;
+    let identities = didIdentitiesByDisplay.get(s.agent);
+    if (!identities) {
+      identities = new Set();
+      didIdentitiesByDisplay.set(s.agent, identities);
+    }
+    identities.add(`did:${s.agentDid}`);
+  }
+  const agentIdentityOf = (s) => {
+    if (s.agentDid != null && s.agentDid !== "") return `did:${s.agentDid}`;
+    const didIdentities = didIdentitiesByDisplay.get(s.agent);
+    if (didIdentities && didIdentities.size === 1) return [...didIdentities][0];
+    return `name:${s.agent}`;
+  };
+
+  // Raw display-name/DID tokens resolve to a stable identity only when that
+  // token has exactly one owner in this project. This index drives placement
+  // and lets mixed legacy spans recognize self-orchestration after their
+  // display-only identity has been reconciled to that stable owner.
+  const identityOwners = new Map(); // display name or DID → stable identity
+  const rememberIdentity = (identity, agentIdentity) => {
+    if (identity == null || identity === "") return;
+    const token = String(identity);
+    if (!identityOwners.has(token)) {
+      identityOwners.set(token, agentIdentity);
+    } else if (identityOwners.get(token) !== agentIdentity) {
+      identityOwners.set(token, null); // ambiguous identity must not place
+    }
+  };
+  for (const s of projectSpans) {
+    const agentIdentity = agentIdentityOf(s);
+    rememberIdentity(s.agent, agentIdentity);
+    rememberIdentity(s.agentDid, agentIdentity);
+  }
+
+  const groups = new Map(); // stable agent identity + lane orchestrator → lane
+  const groupFor = (s, orch) => {
+    const agentIdentity = agentIdentityOf(s);
+    const key = `${agentIdentity}\u0000${orch || ""}`;
     let g = groups.get(key);
     if (!g) {
-      g = { key, agent, orchestrator: orch, items: [], workers: new Map() };
+      g = {
+        key,
+        agentIdentity,
+        agent: s.agent,
+        agentDid: s.agentDid,
+        orchestrator: orch,
+        items: [],
+        workers: new Map(),
+      };
       groups.set(key, g);
     }
     return g;
   };
   for (const s of projectSpans) {
-    const orch = laneOrchestratorOf(s);
+    const rawOrch = laneOrchestratorOf(s);
+    const agentIdentity = agentIdentityOf(s);
+    const orch =
+      rawOrch != null && identityOwners.get(String(rawOrch)) === agentIdentity
+        ? null
+        : rawOrch;
     s.rLaneOrchestrator = orch;
+    s.rLaneAgentIdentity = agentIdentity;
     // Touch the agent's own band even for a worker-only span, so the agent keeps
     // its (possibly empty) row exactly as the pre-nesting layout gave it.
-    const g = groupFor(s.agent, orch);
+    const g = groupFor(s, orch);
     const wk = s.worker || null;
     if (wk == null) {
       g.items.push({ span: s });
@@ -1209,17 +1271,17 @@ function projectLanes(projectName, projectSpans, agents) {
   // that agent's plain lane when there is one, else its first lane.
   const byAgent = new Map();
   for (const g of groups.values()) {
-    let arr = byAgent.get(g.agent);
+    let arr = byAgent.get(g.agentIdentity);
     if (!arr) {
       arr = [];
-      byAgent.set(g.agent, arr);
+      byAgent.set(g.agentIdentity, arr);
     }
     arr.push(g);
   }
   const parentOfAgent = new Map();
-  for (const [agent, arr] of byAgent) {
+  for (const [agentIdentity, arr] of byAgent) {
     const sorted = arr.slice().sort(cmpGroups);
-    parentOfAgent.set(agent, sorted.find((g) => g.orchestrator == null) || sorted[0]);
+    parentOfAgent.set(agentIdentity, sorted.find((g) => g.orchestrator == null) || sorted[0]);
   }
   // Placement (rule 2): a lane nests only under an orchestrator that HAS a lane
   // in this project. One that doesn't keeps its identity and stays top-level.
@@ -1227,9 +1289,11 @@ function projectLanes(projectName, projectSpans, agents) {
   const nested = new Set(); // group keys that are somebody's child
   for (const g of groups.values()) {
     if (g.orchestrator == null) continue;
-    if (!agents.has(g.orchestrator)) continue; // rule 2 — no lane here to nest under
-    const parent = parentOfAgent.get(g.orchestrator);
+    const parentAgentIdentity = identityOwners.get(g.orchestrator);
+    if (parentAgentIdentity == null) continue;
+    const parent = parentOfAgent.get(parentAgentIdentity);
     if (!parent || parent === g) continue;
+    g.orchestratorLabel = parent.agent;
     let arr = children.get(parent.key);
     if (!arr) {
       arr = [];
@@ -1246,16 +1310,20 @@ function projectLanes(projectName, projectSpans, agents) {
     emitted.add(g.key);
     lanes.push({
       projectName,
+      agentIdentity: g.agentIdentity,
       agent: g.agent,
       orchestrator: g.orchestrator,
       worker: null,
-      label: g.orchestrator ? `${g.orchestrator}/${g.agent}` : g.agent,
+      label: g.orchestrator
+        ? `${g.orchestratorLabel || g.orchestrator}/${g.agent}`
+        : g.agent,
       level,
       items: g.items,
     });
     for (const wk of [...g.workers.keys()].sort()) {
       lanes.push({
         projectName,
+        agentIdentity: g.agentIdentity,
         agent: g.agent,
         orchestrator: g.orchestrator,
         worker: wk,
@@ -1519,6 +1587,12 @@ export function mount(container, opts = {}) {
     const end = hasEnd ? rawEnd : start;
     const attrs = parseAttributes(raw.attributes);
     const agentRaw = getAttr(attrs, "kestrel.agent_name");
+    // Per-agent feature spans use the canonical Kestrel attribute while the
+    // host's process/streaming spans predate it and expose the same stable DID
+    // as ``agent.did``. Treat both producer shapes as one identity; otherwise
+    // duplicate display names split host spans into a spurious third lane.
+    const agentDidRaw =
+      getAttr(attrs, ATTR_AGENT_DID) ?? getAttr(attrs, "agent.did");
     const agent =
       agentRaw != null && agentRaw !== "" ? baseAgentName(agentRaw) : UNKNOWN_AGENT;
     const sess = sessionKeyOf(attrs);
@@ -1538,6 +1612,8 @@ export function mount(container, opts = {}) {
       kind: spanKindOf(raw),
       status: raw.statusCode === "ERROR" ? "error" : "ok",
       agent,
+      agentDid:
+        agentDidRaw != null && agentDidRaw !== "" ? String(agentDidRaw) : null,
       worker: workerOf(attrs),
       // Who LAUNCHED this run (talon attribution). Drives lane nesting (#101).
       orchestrator: orch != null && orch !== "" ? String(orch) : null,
@@ -1938,16 +2014,14 @@ export function mount(container, opts = {}) {
     highlightedSpanId = hit.spanId;
     viewEnd = hit.start + windowMs / 2;
     collapsed.delete(hit.projectName);
-    // (project, agent, worker) stopped identifying ONE row once an agent can hold
-    // a lane per orchestrator (#101) — an orchestrated `talon` lane and the
-    // plain one share that triple. Match the lane identity `laneGroups` stamped
-    // on this very span, not its raw attribute (`Direct`/self-orchestration
-    // normalize to null, i.e. the agent's plain lane).
+    // Display names are labels, so even (project, agent, orchestrator, worker)
+    // may identify several rows when two DIDs share a name. Match both stable
+    // identities `laneGroups` stamped on this exact span.
     const lane = layout.rows.find(
       (row) =>
         row.type === "lane" &&
         row.projectName === hit.projectName &&
-        row.agent === hit.agent &&
+        row.agentIdentity === hit.rLaneAgentIdentity &&
         (row.orchestrator || null) === (hit.rLaneOrchestrator || null) &&
         (row.worker || null) === (hit.worker || null),
     );
@@ -2660,6 +2734,7 @@ export function mount(container, opts = {}) {
           type: "lane",
           projectName: name,
           projectId: projId,
+          agentIdentity: lane.agentIdentity,
           agent: lane.agent,
           orchestrator: lane.orchestrator,
           worker: lane.worker,

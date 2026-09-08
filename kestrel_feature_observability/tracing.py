@@ -476,6 +476,7 @@ def configure(
     resource_attributes: Optional[Mapping[str, str]] = None,
     service_name: str = "kestrel",
     set_global: bool = False,
+    include_orchestrator_resource: bool = True,
 ) -> KestrelTracer:
     """Build a :class:`KestrelTracer`, wiring an OTLP/HTTP exporter when configured.
 
@@ -486,12 +487,16 @@ def configure(
 
     Process-global identity (``KESTREL_REPO`` / ``KESTREL_RUN_ID`` /
     ``KESTREL_ORCHESTRATOR``) becomes Resource + default span attributes;
-    ``resource_attributes`` overrides those. The Phoenix project is stamped as the
-    ``openinference.project.name`` Resource attribute from ``KESTREL_OTEL_PROJECT``
-    (default :data:`DEFAULT_OTEL_PROJECT` — ``kestrel-fleet``), so traces land in
-    the named project the fleet embed deep-links to rather than Phoenix's
-    "default". Auth headers come from ``OTEL_EXPORTER_OTLP_HEADERS`` (read by the
-    exporter) or the ``headers`` arg.
+    ``resource_attributes`` overrides those. Set
+    ``include_orchestrator_resource=False`` for emitters whose orchestrator is a
+    per-span causal projection: the environment value remains a span default,
+    but is not irreversibly attached to every span through the OTel Resource.
+    The Phoenix project is stamped as the ``openinference.project.name``
+    Resource attribute from ``KESTREL_OTEL_PROJECT`` (default
+    :data:`DEFAULT_OTEL_PROJECT` — ``kestrel-fleet``), so traces land in the named
+    project the fleet embed deep-links to rather than Phoenix's "default". Auth
+    headers come from ``OTEL_EXPORTER_OTLP_HEADERS`` (read by the exporter) or
+    the ``headers`` arg.
     """
     defaults = _env_defaults()
     if resource_attributes:
@@ -518,7 +523,29 @@ def configure(
         return KestrelTracer(tracer=None, defaults=defaults)
 
     try:
-        resource = Resource.create(_resource_attrs(defaults, service_name, resource_attributes))
+        resource = Resource.create(
+            _resource_attrs(
+                defaults,
+                service_name,
+                resource_attributes,
+                include_orchestrator=include_orchestrator_resource,
+            )
+        )
+        if not include_orchestrator_resource:
+            # ``Resource.create`` runs the standard OTel detectors after
+            # assembling our explicit attributes.  In particular,
+            # ``OTEL_RESOURCE_ATTRIBUTES`` can inject an orchestrator that the
+            # caller asked us to omit.  Rebuild the detected Resource without
+            # only that key so the remaining SDK/env attributes survive while
+            # an unknown causal scope cannot inherit stale attribution.
+            resource = Resource(
+                {
+                    key: value
+                    for key, value in resource.attributes.items()
+                    if key != KESTREL_ORCHESTRATOR
+                },
+                schema_url=resource.schema_url,
+            )
         provider = TracerProvider(resource=resource)
         exporter_kwargs: Dict[str, Any] = {}
         if endpoint:
@@ -540,12 +567,14 @@ def _resource_attrs(
     defaults: Mapping[str, str],
     service_name: str,
     resource_attributes: Optional[Mapping[str, str]],
+    *,
+    include_orchestrator: bool = True,
 ) -> Dict[str, str]:
     """Assemble Resource attributes: service name + process-global Kestrel identity."""
     attrs: Dict[str, str] = {"service.name": service_name}
     if defaults.get("repo"):
         attrs[KESTREL_REPO] = defaults["repo"]
-    if defaults.get("orchestrator"):
+    if include_orchestrator and defaults.get("orchestrator"):
         attrs[KESTREL_ORCHESTRATOR] = defaults["orchestrator"]
     if defaults.get("run_id"):
         attrs[KESTREL_RUN_ID] = defaults["run_id"]

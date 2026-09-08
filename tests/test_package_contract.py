@@ -8,8 +8,10 @@ dependency graph unsatisfiable. That is not hypothetical — the previous
 `>=0.34,<0.35` policy did exactly that when the host moved to `>=0.35.0,<0.36`,
 and every host with this package installed resolved into a broken pair.
 
-These tests therefore assert the *policy*, not a literal version string, and
-actively forbid reintroducing an upper bound.
+These tests therefore assert the *policy*, not a single literal version string,
+and actively forbid reintroducing an upper bound or a second, test-only floor.
+The 0.38.1 floor provides the shared executable Two Axes fixture used by this
+repository while retaining the non-lockstep ``<1`` compatibility policy.
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ import tomllib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 RELEASE_VERSION = "0.17.13"
-SDK_FLOOR = ">=0.34"
-SDK_SPECIFIER = ">=0.34,<1"
+SDK_FLOOR = ">=0.38.1"
+SDK_SPECIFIER = ">=0.38.1,<1"
 
 BASE_SDK_REQUIREMENT = f"kestrel-sovereign-sdk{SDK_SPECIFIER}"
 METRICS_SDK_REQUIREMENT = f"kestrel-sovereign-sdk[metrics]{SDK_SPECIFIER}"

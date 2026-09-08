@@ -102,6 +102,7 @@ import logging
 import os
 import time
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional
 
@@ -383,6 +384,22 @@ def _scheduler_tick_did_work(tool_response: Any) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class _DrivingParentResolution:
+    """Canonical causal predecessor, including an explicit unknown state.
+
+    ``identity=None`` means a known root.  ``known=False`` means the host could
+    not supply a trustworthy current chain; callers must not smooth that into
+    self-, lineage-, input-, or environment-derived attribution.
+    """
+
+    known: bool
+    identity: Optional[str] = None
+
+
+_UNKNOWN_DRIVING_PARENT = _DrivingParentResolution(known=False)
+
+
 @dataclass
 class _TurnState:
     """Per-turn bookkeeping — the exported turn root + per-turn totals.
@@ -398,6 +415,8 @@ class _TurnState:
     root: Any            # the ended turn-root span (holds the turn trace root SpanContext)
     index: int           # monotonic turn number (1-based) within the session
     turn_id: Optional[str]  # host-owned canonical cooperative-Stop address
+    # Canonical per-turn causal predecessor, resolved at turn start.
+    driving_parent: _DrivingParentResolution
     started_ns: int      # turn start (turn-root marker) — for the summary duration
     tool_count: int = 0
     success_count: int = 0
@@ -439,6 +458,8 @@ class _SessionState:
 
     root: Any            # the ended session-marker span (holds the root SpanContext)
     started_ns: int      # session start (marker start) — for the summary duration
+    # Canonical causal scope used by spans emitted outside a live turn.
+    driving_parent: _DrivingParentResolution
     tool_count: int = 0
     success_count: int = 0
     denied_count: int = 0
@@ -470,7 +491,13 @@ class ObservabilityHook(Hook):
         self.agent = agent
         # Frozen at construction. A no-op tracer when OTEL_EXPORTER_OTLP_ENDPOINT
         # (or the traces-specific var) is unset — never blocks, never networks.
-        self._tracer: KestrelTracer = configure_tracing(service_name=_SERVICE_NAME)
+        # Causal attribution varies by turn. Keep a configured orchestrator as a
+        # span default for known driven work, but never stamp it on the immutable
+        # OTel Resource: an unknown turn must be able to suppress a stale value.
+        self._tracer: KestrelTracer = configure_tracing(
+            service_name=_SERVICE_NAME,
+            include_orchestrator_resource=False,
+        )
         # Read but DELIBERATELY UNUSED — the deprecated #42 opt-in (#87). Idle
         # scheduler ticks now always emit, so there is nothing to enable; parsed
         # here so existing wiring that sets it neither errors nor changes behavior.
@@ -521,13 +548,188 @@ class ObservabilityHook(Hook):
         except Exception:  # noqa: BLE001 - tracing never weakens the turn
             logger.debug("Failed to bind turn trace identity", exc_info=True)
 
-    def _driving_parent(self, input: HookInput) -> Optional[str]:
-        """The agent/session driving this agent, if any (else None → self-driven)."""
-        return (
-            input.parent_did
-            or getattr(self.agent, "parent_agent", None)
-            or getattr(self.agent, "parent_did", None)
-        )
+    @staticmethod
+    def _frame_field(frame: Any, name: str) -> Any:
+        """Read one field from a typed or serialized ``CausationFrame``."""
+
+        if isinstance(frame, Mapping):
+            return frame.get(name)
+        return getattr(frame, name, None)
+
+    def _current_causation_chain(self) -> tuple[bool, Optional[Sequence[Any]]]:
+        """Read the host-owned current chain without deriving one locally.
+
+        New hosts expose ``get_current_causation_chain``.  The private provider
+        is the compatibility seam on currently released Sovereign hosts; it is
+        already the single producer used to sign outbound A2A metadata.  An
+        accessor failure is distinct from a successful empty-chain/root read.
+        """
+
+        accessor = getattr(self.agent, "get_current_causation_chain", None)
+        if not callable(accessor):
+            accessor = getattr(self.agent, "_provide_causation_chain", None)
+        if not callable(accessor):
+            return False, None
+        try:
+            chain = accessor()
+        except Exception:  # noqa: BLE001 - observability must never break work
+            logger.debug("Failed to read canonical causation chain", exc_info=True)
+            return False, None
+        if chain is None:
+            return True, ()
+        if isinstance(chain, (str, bytes, bytearray)) or not isinstance(
+            chain, Sequence
+        ):
+            return False, None
+        return True, chain
+
+    def _verified_lineage_parent(self) -> tuple[bool, Optional[str]]:
+        """Read the optional verified root lineage without losing failures.
+
+        ``(True, None)`` is a successful no-parent result (and is also the
+        compatibility result on released hosts that do not yet expose this
+        optional projection).  ``(False, None)`` means a present accessor failed
+        or returned a malformed value, which must remain unknown.
+        """
+
+        accessor = getattr(self.agent, "get_verified_parent_did", None)
+        if not callable(accessor):
+            return True, None
+        try:
+            identity = accessor()
+        except Exception:  # noqa: BLE001 - observability must never break work
+            logger.debug("Failed to read verified lineage parent", exc_info=True)
+            return False, None
+        if identity is None:
+            return True, None
+        if isinstance(identity, str) and identity.strip():
+            return True, identity.strip()
+        return False, None
+
+    def _driving_parent(self, _input: HookInput) -> _DrivingParentResolution:
+        """Resolve the previous canonical causal frame for this turn.
+
+        The dispatcher appends the receiving agent's frame before entering the
+        cognition turn, so the driving agent is the second-to-last frame.  A
+        valid empty chain or a one-frame non-agent source for this agent is a
+        genuine root; only that case may consult verified lineage.  Missing,
+        malformed, stale, truncated, cyclic, or first-hop A2A-ambiguous chains
+        stay explicitly unknown and never fall through to caller-supplied
+        ``HookInput`` or mutable agent display attributes.
+        """
+
+        available, chain = self._current_causation_chain()
+        if not available or chain is None:
+            return _UNKNOWN_DRIVING_PARENT
+
+        frames = list(chain)
+        if not frames:
+            lineage_known, lineage_parent = self._verified_lineage_parent()
+            if not lineage_known:
+                return _UNKNOWN_DRIVING_PARENT
+            return _DrivingParentResolution(True, lineage_parent)
+
+        identities: List[str] = []
+        sources: List[str] = []
+        seen_signal_ids: set[str] = set()
+        for expected_depth, frame in enumerate(frames, start=1):
+            identity = self._frame_field(frame, "agent_id")
+            source = self._frame_field(frame, "source")
+            signal_id = self._frame_field(frame, "signal_id")
+            depth = self._frame_field(frame, "depth")
+            if (
+                not isinstance(identity, str)
+                or not identity.strip()
+                or not isinstance(source, str)
+                or not source.strip()
+                or not isinstance(signal_id, str)
+                or not signal_id.strip()
+                or type(depth) is not int
+                or depth != expected_depth
+            ):
+                return _UNKNOWN_DRIVING_PARENT
+            identity = identity.strip()
+            source = source.strip()
+            signal_id = signal_id.strip()
+            # The dispatcher may accept repeated (agent, source) hops when that
+            # source explicitly enables self-loops.  This feature does not own
+            # the source registration, so it must not reapply cycle policy from
+            # an incomplete view.  A repeated signal identity cannot represent
+            # two canonical hops, however, and remains structurally cyclic.
+            if signal_id in seen_signal_ids:
+                return _UNKNOWN_DRIVING_PARENT
+            seen_signal_ids.add(signal_id)
+            identities.append(identity)
+            sources.append(source)
+
+        current_agent = self._agent_did()
+        if (
+            not isinstance(current_agent, str)
+            or not current_agent.strip()
+            or identities[-1] != current_agent.strip()
+        ):
+            return _UNKNOWN_DRIVING_PARENT
+
+        if len(identities) == 1:
+            # Released hosts append only the recipient frame when first-hop A2A
+            # work was sent from a direct/user turn.  That shape is peer-driven
+            # but does not carry the peer, so it is explicitly unknown rather
+            # than falsely self-/lineage-attributed.  Core #3199 adds the missing
+            # producer frame; once present, the normal predecessor path below
+            # activates without a compatibility special case.
+            if sources[0].startswith("a2a."):
+                return _UNKNOWN_DRIVING_PARENT
+            lineage_known, lineage_parent = self._verified_lineage_parent()
+            if not lineage_known:
+                return _UNKNOWN_DRIVING_PARENT
+            return _DrivingParentResolution(True, lineage_parent)
+        return _DrivingParentResolution(True, identities[-2])
+
+    def _orchestrator_override(
+        self, driving_parent: _DrivingParentResolution
+    ) -> str:
+        """Project one canonical driving-parent answer onto the wire.
+
+        A concrete predecessor is already the stable agent identity carried by
+        the canonical causation frame (or the verified lineage identity for a
+        genuine root), so emit it verbatim.  A root with no predecessor is
+        represented by this agent's stable DID.  An empty string deliberately
+        suppresses the tracer-level default for unknown input or a host shape
+        that cannot provide a stable DID; display names and environment values
+        never repair missing causal evidence.
+        """
+
+        if not driving_parent.known:
+            return ""
+        if driving_parent.identity is not None:
+            return driving_parent.identity
+        current_agent = self._agent_did()
+        if isinstance(current_agent, str) and current_agent.strip():
+            return current_agent.strip()
+        return ""
+
+    def _base_attrs(self, session_id: Optional[str]) -> Dict[str, Any]:
+        """Stable agent identity plus the paired session attributes.
+
+        ``kestrel.orchestrator`` now carries DIDs for in-process agents.  Stamp
+        ``kestrel.agent_did`` on every emitted span, not only the session root,
+        so Timeline placement can reconcile the raw causal identity with the
+        human-facing agent lane even when a page does not contain that root.
+        """
+
+        attrs = _session_attrs(session_id)
+        agent_did = self._agent_did()
+        if isinstance(agent_did, str) and agent_did.strip():
+            attrs["kestrel.agent_did"] = agent_did.strip()
+        return attrs
+
+    @staticmethod
+    def _scope_driving_parent(
+        session: _SessionState, turn: Optional[_TurnState]
+    ) -> _DrivingParentResolution:
+        """Return the canonical resolution for one emitted span's scope."""
+
+        return turn.driving_parent if turn is not None else session.driving_parent
 
     def _turn_attrs(
         self, session_id: Optional[str], turn: Optional[_TurnState]
@@ -543,7 +745,7 @@ class ObservabilityHook(Hook):
         Taking the turn explicitly is what lets reconciliation stamp a leftover
         tool with its OWN turn rather than the live one (#84).
         """
-        attrs = _session_attrs(session_id)
+        attrs = self._base_attrs(session_id)
         if turn is not None:
             if turn.turn_id is not None:
                 attrs[KESTREL_TURN_ID] = turn.turn_id
@@ -561,21 +763,26 @@ class ObservabilityHook(Hook):
     # ------------------------------------------------------------------
 
     def _ensure_session(
-        self, session_id: Optional[str], agent_name: str, input: HookInput
+        self,
+        session_id: Optional[str],
+        agent_name: str,
+        input: HookInput,
+        driving_parent: Optional[_DrivingParentResolution] = None,
     ) -> _SessionState:
         """Return the session state, exporting the root marker on first event."""
         existing = self._sessions.get(session_id)
         if existing is not None:
             return existing
 
-        # Self-driven → the agent is its own orchestrator; driven → inherit the
-        # process-global orchestrator (env default), if any.
-        orchestrator = agent_name if self._driving_parent(input) is None else None
+        # Root → this agent's stable DID; driven → the exact previous
+        # canonical frame (or verified lineage root); unknown → an explicit
+        # empty override so KestrelTracer cannot smooth missing/malformed
+        # causation into a stale process-global default.
+        if driving_parent is None:
+            driving_parent = self._driving_parent(input)
+        orchestrator = self._orchestrator_override(driving_parent)
 
-        attributes = _session_attrs(session_id)
-        agent_did = self._agent_did()
-        if agent_did:
-            attributes["kestrel.agent_did"] = agent_did
+        attributes = self._base_attrs(session_id)
 
         # Export the session root IMMEDIATELY: a short session-marker span opened
         # AND ended now. We keep its SpanContext (via the returned ended span) to
@@ -595,7 +802,11 @@ class ObservabilityHook(Hook):
             orchestrator=orchestrator,
             attributes=attributes,
         )
-        state = _SessionState(root=root, started_ns=session_marker_ns)
+        state = _SessionState(
+            root=root,
+            started_ns=session_marker_ns,
+            driving_parent=driving_parent,
+        )
         self._sessions[session_id] = state
         return state
 
@@ -604,6 +815,7 @@ class ObservabilityHook(Hook):
         session: _SessionState,
         session_id: Optional[str],
         agent_name: str,
+        driving_parent: _DrivingParentResolution,
         user_message: Optional[str] = None,
     ) -> None:
         """Begin a turn on ``UserPromptSubmit`` — mint a new per-turn trace root.
@@ -625,7 +837,7 @@ class ObservabilityHook(Hook):
 
         # current_turn isn't set yet, so stamp the turn identity explicitly here
         # (every span of the turn carries session id + turn id + turn index).
-        attributes = _session_attrs(session_id)
+        attributes = self._base_attrs(session_id)
         attributes.update(
             {
                 KESTREL_TURN_INDEX: index,
@@ -649,11 +861,16 @@ class ObservabilityHook(Hook):
             start_time=turn_marker_ns,
             end_time=turn_marker_ns,
             agent_name=agent_name,
+            orchestrator=self._orchestrator_override(driving_parent),
             attributes=attributes,
         )
         self._bind_turn_trace_identity(root)
         session.current_turn = _TurnState(
-            root=root, index=index, turn_id=turn_id, started_ns=turn_marker_ns
+            root=root,
+            index=index,
+            turn_id=turn_id,
+            driving_parent=driving_parent,
+            started_ns=turn_marker_ns,
         )
 
     def _turn_parent(self, session: _SessionState) -> Any:
@@ -697,6 +914,9 @@ class ObservabilityHook(Hook):
             start_time=marker_ns,
             end_time=marker_ns,
             agent_name=agent_name,
+            orchestrator=self._orchestrator_override(
+                self._scope_driving_parent(session, session.current_turn)
+            ),
             attributes=attributes,
         )
         stack = session.pending_tools.setdefault(input.tool_name, [])
@@ -785,6 +1005,9 @@ class ObservabilityHook(Hook):
             start_time=record.start_ns,
             end_time=record.start_ns,
             agent_name=agent_name,
+            orchestrator=self._orchestrator_override(
+                self._scope_driving_parent(session, record.turn)
+            ),
             extra={"tool.success": False},
             attributes=attributes,
         )
@@ -938,6 +1161,9 @@ class ObservabilityHook(Hook):
             start_time=start_time,
             end_time=end_ns,
             agent_name=agent_name,
+            orchestrator=self._orchestrator_override(
+                self._scope_driving_parent(session, turn)
+            ),
             extra=extra,
             attributes=attributes,
         )
@@ -1007,6 +1233,7 @@ class ObservabilityHook(Hook):
             start_time=turn.started_ns,
             end_time=end_ns,
             agent_name=agent_name,
+            orchestrator=self._orchestrator_override(turn.driving_parent),
             extra=extra,
             attributes=attributes,
         )
@@ -1062,7 +1289,7 @@ class ObservabilityHook(Hook):
             # Legacy per-scope duration key (back-compat); drop in a future major.
             "kestrel.session_duration_ms": duration_ms,
         }
-        attributes = _session_attrs(session_id)
+        attributes = self._base_attrs(session_id)
 
         # A `session summary` span in the session-marker trace, parented to the
         # exported root — carries session totals without any held-open span (#42).
@@ -1073,6 +1300,7 @@ class ObservabilityHook(Hook):
             start_time=state.started_ns,
             end_time=end_ns,
             agent_name=agent_name,
+            orchestrator=self._orchestrator_override(state.driving_parent),
             extra=extra,
             attributes=attributes,
         )
@@ -1159,14 +1387,24 @@ class ObservabilityHook(Hook):
                     # Use the post-rewrite prompt (an earlier hook may have
                     # redacted/rewritten it into ``tool_input``) so capture never
                     # exports a prompt the model never saw.
-                    session = self._ensure_session(session_id, agent_name, input)
+                    driving_parent = self._driving_parent(input)
+                    session = self._ensure_session(
+                        session_id,
+                        agent_name,
+                        input,
+                        driving_parent=driving_parent,
+                    )
                     # A turn still live here never saw its ``Stop`` (interrupted):
                     # close it — reconciling its leftovers into ITS OWN turn —
                     # before minting the next one, so nothing is ever attributed
                     # to the new turn (#84).
                     self._close_turn(session_id, agent_name)
                     self._start_turn(
-                        session, session_id, agent_name, _effective_prompt(input)
+                        session,
+                        session_id,
+                        agent_name,
+                        driving_parent,
+                        _effective_prompt(input),
                     )
                 elif event_type == "Stop":
                     # End the turn (reconcile leftovers, then the turn summary) —

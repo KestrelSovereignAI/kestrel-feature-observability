@@ -10,13 +10,13 @@ Covers:
 6. Feature registers hook during initialize() / closes spans on shutdown
 7. Privacy: user_message content is NOT stamped on any span
 8. Privacy: tool error truncated to 200 chars
-9. orchestrator = agent when self-driven, else inherited (driven)
+9. driving parent = previous canonical CausationFrame, never input/display state
 10. Prometheus metrics still emitted
 """
 
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -29,6 +29,7 @@ from kestrel_sdk.hooks.base import (
     HookInput,
     PermissionDecision,
 )
+from kestrel_sdk.testing import load_two_axes_contract
 from kestrel_feature_observability.hook import (
     ObservabilityHook,
     KESTREL_SESSION_ID,
@@ -70,6 +71,18 @@ def _make_agent(agent_name="test-agent", agent_id="did:agent:test"):
         agent_name=agent_name,
         agent_id=agent_id,
         get_current_turn_id=get_current_turn_id,
+        get_current_causation_chain=lambda: [],
+    )
+
+
+def _causation_frame(agent_id, depth, source="a2a.task_submitted"):
+    """Minimal canonical frame shape consumed by the attribution resolver."""
+
+    return SimpleNamespace(
+        agent_id=agent_id,
+        source=source,
+        signal_id=f"signal-{depth}",
+        depth=depth,
     )
 
 
@@ -1722,23 +1735,471 @@ class TestErrorTruncation:
 # ---------------------------------------------------------------------------
 
 class TestOrchestrator:
+    def test_hook_keeps_orchestrator_off_immutable_resource(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:6006",
+                "KESTREL_ORCHESTRATOR": "stale-process-default",
+            },
+            clear=True,
+        ):
+            hook = ObservabilityHook(_make_agent())
+
+        # The process default remains available to other tracing clients, but
+        # the agent hook always supplies the exact per-scope projection (or an
+        # explicit empty override for unknown causation).
+        assert hook._tracer._defaults["orchestrator"] == "stale-process-default"
+        assert KESTREL_ORCHESTRATOR not in hook._tracer._tracer.resource.attributes
+
     @pytest.mark.asyncio
     async def test_self_driven_sets_orchestrator_to_agent(self):
         hook, exporter = _memory_hook(agent=_make_agent(agent_id="did:agent:me"))
         await hook.execute(_make_input("SessionStart"))
         await hook.execute(_make_input("Stop"))
         run = _by_name(exporter.get_finished_spans())["test-agent"]
-        assert run.attributes[KESTREL_ORCHESTRATOR] == "test-agent"
+        assert run.attributes[KESTREL_ORCHESTRATOR] == "did:agent:me"
         assert run.attributes["kestrel.agent_did"] == "did:agent:me"
 
     @pytest.mark.asyncio
+    async def test_root_without_stable_did_does_not_fall_back_to_display_name(self):
+        agent = SimpleNamespace(
+            agent_name="mutable-display-name",
+            get_current_causation_chain=list,
+        )
+        hook, exporter = _memory_hook(
+            agent=agent,
+            defaults={"orchestrator": "stale-process-default"},
+        )
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+
+        turn = _by_name(exporter.get_finished_spans())["mutable-display-name turn 1"]
+        assert KESTREL_ORCHESTRATOR not in turn.attributes
+
+    @pytest.mark.asyncio
     async def test_driven_agent_does_not_self_orchestrate(self):
-        hook, exporter = _memory_hook()
-        await hook.execute(_make_input("SessionStart", parent_did="did:agent:driver"))
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: [
+            _causation_frame("did:agent:peer", 1),
+            _causation_frame("did:agent:child", 2),
+        ]
+        # Every legacy fallback disagrees. The canonical previous frame wins.
+        agent.parent_agent = "stale-parent-name"
+        agent.parent_did = "did:agent:stale-lineage"
+        hook, exporter = _memory_hook(agent=agent)
+        observed = hook._driving_parent(
+            _make_input("SessionStart", parent_did="did:agent:payload-claim")
+        )
+        assert observed.known is True
+        assert observed.identity == "did:agent:peer"
+
+        await hook.execute(
+            _make_input("SessionStart", parent_did="did:agent:payload-claim")
+        )
         await hook.execute(_make_input("Stop"))
         run = _by_name(exporter.get_finished_spans())["test-agent"]
-        # Driven → orchestrator not set to this agent's own name (no env default here).
-        assert run.attributes.get(KESTREL_ORCHESTRATOR) != "test-agent"
+        assert run.attributes[KESTREL_ORCHESTRATOR] == "did:agent:peer"
+
+    @pytest.mark.asyncio
+    async def test_previous_self_frame_self_orchestrates(self):
+        agent = _make_agent(agent_id="did:agent:self")
+        agent.get_current_causation_chain = lambda: [
+            _causation_frame("did:agent:self", 1, source="heartbeat"),
+            _causation_frame("did:agent:self", 2, source="a2a.task_complete"),
+        ]
+        hook, exporter = _memory_hook(
+            agent=agent,
+            defaults={"orchestrator": "stale-process-default"},
+        )
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert turn.attributes[KESTREL_ORCHESTRATOR] == "did:agent:self"
+
+    def test_host_accepted_repeated_hops_preserve_previous_attribution(self):
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: [
+            _causation_frame("did:agent:peer", 1, source="looper"),
+            _causation_frame("did:agent:peer", 2, source="looper"),
+            _causation_frame("did:agent:child", 3, source="looper"),
+        ]
+        hook, _ = _memory_hook(agent=agent)
+
+        observed = hook._driving_parent(_make_input("UserPromptSubmit"))
+
+        assert observed.known is True
+        assert observed.identity == "did:agent:peer"
+
+    @pytest.mark.asyncio
+    async def test_preexisting_session_binds_each_turn_to_current_previous_frame(self):
+        agent = _make_agent(agent_id="did:agent:child")
+        chain = []
+        agent.get_current_causation_chain = lambda: list(chain)
+        hook, _ = _memory_hook(agent=agent)
+
+        # Session startup is a genuine root. The later peer-driven turn must
+        # still resolve its own causation instead of inheriting session startup.
+        await hook.execute(_make_input("SessionStart"))
+        chain.extend(
+            [
+                _causation_frame("did:agent:peer", 1),
+                _causation_frame("did:agent:child", 2),
+            ]
+        )
+        await hook.execute(_make_input("UserPromptSubmit"))
+
+        turn = hook._sessions["sess-1"].current_turn
+        assert turn is not None
+        assert turn.driving_parent.known is True
+        assert turn.driving_parent.identity == "did:agent:peer"
+
+    def test_released_host_private_provider_is_the_compatibility_seam(self):
+        agent = SimpleNamespace(
+            agent_name="test-agent",
+            agent_id="did:agent:child",
+            _provide_causation_chain=lambda: [
+                {
+                    "agent_id": "did:agent:peer",
+                    "source": "a2a.task_submitted",
+                    "signal_id": "signal-1",
+                    "depth": 1,
+                },
+                {
+                    "agent_id": "did:agent:child",
+                    "source": "a2a.task_submitted",
+                    "signal_id": "signal-2",
+                    "depth": 2,
+                },
+            ],
+        )
+        hook, _ = _memory_hook(agent=agent)
+
+        observed = hook._driving_parent(_make_input("SessionStart"))
+
+        assert observed.known is True
+        assert observed.identity == "did:agent:peer"
+
+    def test_public_chain_accessor_cannot_be_overridden_by_legacy_provider(self):
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: []
+        agent._provide_causation_chain = lambda: [
+            {
+                "agent_id": "did:agent:stale-peer",
+                "source": "a2a.task_submitted",
+                "signal_id": "signal-1",
+                "depth": 1,
+            },
+            {
+                "agent_id": "did:agent:child",
+                "source": "a2a.task_submitted",
+                "signal_id": "signal-2",
+                "depth": 2,
+            },
+        ]
+        hook, _ = _memory_hook(agent=agent)
+
+        observed = hook._driving_parent(_make_input("SessionStart"))
+
+        assert observed.known is True
+        assert observed.identity is None
+
+    @pytest.mark.asyncio
+    async def test_genuine_root_may_use_verified_lineage_only(self):
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: [
+            _causation_frame("did:agent:child", 1, source="heartbeat")
+        ]
+        agent.get_verified_parent_did = lambda: "did:agent:verified-parent"
+        agent.parent_agent = "stale-parent-name"
+        agent.parent_did = "did:agent:stale-lineage"
+        hook, exporter = _memory_hook(agent=agent)
+
+        observed = hook._driving_parent(
+            _make_input("SessionStart", parent_did="did:agent:payload-claim")
+        )
+        await hook.execute(
+            _make_input("SessionStart", parent_did="did:agent:payload-claim")
+        )
+
+        assert observed.known is True
+        assert observed.identity == "did:agent:verified-parent"
+        run = _by_name(exporter.get_finished_spans())["test-agent"]
+        assert run.attributes[KESTREL_ORCHESTRATOR] == "did:agent:verified-parent"
+
+    @pytest.mark.asyncio
+    async def test_every_peer_turn_span_projects_exact_predecessor(self):
+        fixture = load_two_axes_contract()
+        agent = _make_agent(agent_name="Child", agent_id=fixture.child_did)
+        agent.get_current_causation_chain = lambda: [
+            _causation_frame(fixture.peer_did, 1),
+            _causation_frame(fixture.child_did, 2),
+        ]
+        # Every former fallback disagrees with the canonical predecessor.
+        agent.parent_agent = "stale-parent-name"
+        agent.parent_did = fixture.parent_did
+        control_probes = {
+            action: Mock(side_effect=AssertionError("diagnostics are not authority"))
+            for action in fixture.forbidden_authority_from_causation
+        }
+        for action, probe in control_probes.items():
+            setattr(agent, action, probe)
+        hook, exporter = _memory_hook(
+            agent=agent,
+            defaults={"orchestrator": "stale-process-default"},
+        )
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="completed"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse",
+                tool_name="completed",
+                execution_time_ms=1,
+                tool_response={"success": True},
+            )
+        )
+        await hook.execute(_make_input("PreToolUse", tool_name="incomplete"))
+        await hook.execute(_make_input("Stop"))
+        await hook.execute(_make_input("AgentTerminate"))
+
+        spans = exporter.get_finished_spans()
+        assert {span.name for span in spans} == {
+            "Child",
+            "Child turn 1",
+            "completed (started)",
+            "completed",
+            "incomplete (started)",
+            "incomplete",
+            "turn 1 summary",
+            "session summary",
+        }
+        assert all(
+            span.attributes[KESTREL_ORCHESTRATOR]
+            == fixture.causal_predecessor_did
+            for span in spans
+        )
+        assert all(
+            span.attributes["kestrel.agent_did"] == fixture.child_did
+            for span in spans
+        )
+        assert fixture.causal_predecessor_did != fixture.authority_holder_did
+        for probe in control_probes.values():
+            probe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_interrupted_turn_keeps_its_original_projection(self):
+        agent = _make_agent(agent_name="Child", agent_id="did:agent:child")
+        chain = [
+            _causation_frame("did:agent:first-peer", 1),
+            _causation_frame("did:agent:child", 2),
+        ]
+        agent.get_current_causation_chain = lambda: list(chain)
+        hook, exporter = _memory_hook(agent=agent)
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="stranded"))
+        chain[:] = [
+            _causation_frame("did:agent:second-peer", 1),
+            _causation_frame("did:agent:child", 2),
+        ]
+        # Starting turn 2 reconciles turn 1 after the ambient chain changed.
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="second"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse",
+                tool_name="second",
+                execution_time_ms=1,
+                tool_response={"success": True},
+            )
+        )
+        await hook.execute(_make_input("Stop"))
+
+        spans = exporter.get_finished_spans()
+        first_turn = [
+            span
+            for span in spans
+            if span.attributes.get(KESTREL_TURN_INDEX) == 1
+        ]
+        second_turn = [
+            span
+            for span in spans
+            if span.attributes.get(KESTREL_TURN_INDEX) == 2
+        ]
+        assert {span.name for span in first_turn} == {
+            "Child turn 1",
+            "stranded (started)",
+            "stranded",
+            "turn 1 summary",
+        }
+        assert all(
+            span.attributes[KESTREL_ORCHESTRATOR] == "did:agent:first-peer"
+            for span in first_turn
+        )
+        assert {span.name for span in second_turn} == {
+            "Child turn 2",
+            "second (started)",
+            "second",
+            "turn 2 summary",
+        }
+        assert all(
+            span.attributes[KESTREL_ORCHESTRATOR] == "did:agent:second-peer"
+            for span in second_turn
+        )
+
+    @pytest.mark.asyncio
+    async def test_verified_lineage_failure_stays_unknown(self):
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: []
+
+        def fail_lineage_lookup():
+            raise RuntimeError("verified lineage unavailable")
+
+        agent.get_verified_parent_did = fail_lineage_lookup
+        hook, exporter = _memory_hook(
+            agent=agent,
+            defaults={"orchestrator": "stale-process-default"},
+        )
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+
+        turn = _by_name(exporter.get_finished_spans())["test-agent turn 1"]
+        assert KESTREL_ORCHESTRATOR not in turn.attributes
+
+    def test_released_host_first_hop_a2a_frame_stays_unknown(self):
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: [
+            _causation_frame("did:agent:child", 1)
+        ]
+        # First-hop A2A from a direct/user turn has no producer frame on the
+        # released host. Neither self nor lineage may fill in the missing peer.
+        agent.get_verified_parent_did = lambda: "did:agent:unrelated-lineage"
+        hook, _ = _memory_hook(agent=agent)
+
+        observed = hook._driving_parent(_make_input("UserPromptSubmit"))
+
+        assert observed.known is False
+        assert observed.identity is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "chain",
+        [
+            "not-a-chain",
+            [_causation_frame("did:agent:peer", 1)],
+            [
+                _causation_frame("did:agent:peer", 7),
+                _causation_frame("did:agent:child", 8),
+            ],
+            [
+                _causation_frame("", 1),
+                _causation_frame("did:agent:child", 2),
+            ],
+            [
+                SimpleNamespace(
+                    agent_id="did:agent:peer",
+                    source="",
+                    signal_id="signal-1",
+                    depth=1,
+                ),
+                _causation_frame("did:agent:child", 2),
+            ],
+            [
+                _causation_frame("did:agent:child", 1),
+                _causation_frame("did:agent:peer", 2),
+                SimpleNamespace(
+                    agent_id="did:agent:child",
+                    source="a2a.task_submitted",
+                    signal_id="signal-1",
+                    depth=3,
+                ),
+            ],
+        ],
+    )
+    async def test_malformed_truncated_or_structurally_cyclic_chain_stays_unknown(
+        self, chain
+    ):
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: chain
+        agent.parent_agent = "stale-parent-name"
+        agent.parent_did = "did:agent:stale-lineage"
+        hook, exporter = _memory_hook(
+            agent=agent,
+            defaults={"orchestrator": "stale-process-default"},
+        )
+
+        observed = hook._driving_parent(
+            _make_input("SessionStart", parent_did="did:agent:payload-claim")
+        )
+        await hook.execute(
+            _make_input("SessionStart", parent_did="did:agent:payload-claim")
+        )
+
+        assert observed.known is False
+        run = _by_name(exporter.get_finished_spans())["test-agent"]
+        assert KESTREL_ORCHESTRATOR not in run.attributes
+
+    @pytest.mark.asyncio
+    async def test_chain_accessor_failure_stays_unknown_and_non_blocking(self):
+        agent = _make_agent(agent_id="did:agent:child")
+
+        def fail():
+            raise RuntimeError("chain unavailable")
+
+        agent.get_current_causation_chain = fail
+        hook, exporter = _memory_hook(
+            agent=agent,
+            defaults={"orchestrator": "stale-process-default"},
+        )
+
+        result = await hook.execute(
+            _make_input("SessionStart", parent_did="did:agent:payload-claim")
+        )
+
+        assert result.continue_execution is True
+        run = _by_name(exporter.get_finished_spans())["test-agent"]
+        assert KESTREL_ORCHESTRATOR not in run.attributes
+
+    @pytest.mark.asyncio
+    async def test_unknown_parent_suppresses_stale_default_across_entire_scope(self):
+        agent = _make_agent(agent_id="did:agent:child")
+        agent.get_current_causation_chain = lambda: "malformed-chain"
+        hook, exporter = _memory_hook(
+            agent=agent,
+            defaults={"orchestrator": "stale-process-default"},
+        )
+
+        await hook.execute(_make_input("UserPromptSubmit"))
+        await hook.execute(_make_input("PreToolUse", tool_name="peer_stop"))
+        await hook.execute(
+            _make_input(
+                "PostToolUse",
+                tool_name="peer_stop",
+                tool_response={"success": True},
+            )
+        )
+        # Exercise the reconciliation path as well as normal completion: every
+        # terminal shape in this causal scope must suppress the stale default.
+        await hook.execute(_make_input("PreToolUse", tool_name="held_stop"))
+        await hook.execute(_make_input("Stop"))
+        await hook.execute(_make_input("AgentTerminate"))
+
+        spans = exporter.get_finished_spans()
+        assert {span.name for span in spans} == {
+            "test-agent",
+            "test-agent turn 1",
+            "peer_stop (started)",
+            "peer_stop",
+            "held_stop (started)",
+            "held_stop",
+            "turn 1 summary",
+            "session summary",
+        }
+        assert all(
+            KESTREL_ORCHESTRATOR not in span.attributes for span in spans
+        )
 
 
 # ---------------------------------------------------------------------------
