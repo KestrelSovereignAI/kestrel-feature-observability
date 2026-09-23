@@ -70,6 +70,10 @@ def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     )
     assert "const API" in stubbed, "phoenix.js API import stub failed — import changed?"
     (pkg / "phoenix.js").write_text(stubbed, encoding="utf-8")
+    # The lifecycle read-model (#118) imports only ./phoenix.js — ships verbatim.
+    (pkg / "lifecycle.js").write_text(
+        (STATIC / "lifecycle.js").read_text(encoding="utf-8"), encoding="utf-8"
+    )
     (pkg / "timeline.js").write_text(
         (STATIC / "timeline.js").read_text(encoding="utf-8"), encoding="utf-8"
     )

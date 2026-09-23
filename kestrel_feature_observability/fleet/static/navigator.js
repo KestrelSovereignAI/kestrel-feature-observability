@@ -33,11 +33,14 @@
 //     visible and fills the persistent span inspector beside it.
 //
 // Levels load LAZILY: expanding a node fires exactly ONE paginated GraphQL
-// query for that level. Phoenix has no attribute group-by API, so the Agent /
-// Subagent / Session distinct-ness is aggregated client-side from one page of
-// recency-ordered spans — root-only where the level reads roots (Agents,
-// Turns), all spans where the split lives on children (Subagent / Session
-// under an agent). "Load more" merges further pages; span ids are deduped so
+// query for that level — except the Turn level, which also reads the loaded
+// roots' `turn <n> summary` children (exactly, by parent span id) for their
+// `kestrel.turn.outcome`, so a turn's lifecycle is known before its trace is
+// opened, however far back the operator has paged (#118). Phoenix has no
+// attribute group-by API, so the Agent / Subagent / Session distinct-ness is
+// aggregated client-side from one page of recency-ordered spans — root-only
+// where the level reads roots (Agents, Turns), all spans where the split lives
+// on children (Subagent / Session under an agent). "Load more" merges further pages; span ids are deduped so
 // overlapping pages never double-count. Tenant is a single static root until
 // Castle tenancy lands.
 //
@@ -46,7 +49,15 @@
 // inline with indentation guides, never modal/page navigation. Live-follow
 // (off by default) polls every 10s, refreshing counts and prepending new
 // sessions/turns. Keyboard: ↑/↓ move, → expand/descend, ← collapse/ascend,
-// Enter/Space activates/selects. Phoenix down → the same friendly notice as the embed.
+// Enter/Space activates/selects. Phoenix down → the same friendly notice as the
+// embed, as a strip above the tree: the host-served lifecycle group still renders.
+//
+// Governance lifecycle (#118): the Stop/Hold/Resume receipts (./lifecycle.js)
+// are read on the same poll. Turn/Event rows and the inspector state the
+// receipt-backed lifecycle the Timeline paints — one resolver, one answer — and
+// a tenant-level "Stop · Hold · Resume" group holds the host latch, every held
+// or stopped agent (spans or not), and receipts that name no agent or carry an
+// unrecognized schema.
 // Styles are console-native (dark/light aware) — kestrel chrome, not Phoenix's.
 
 import {
@@ -79,7 +90,25 @@ import {
   normalizeSpanDetail,
   renderSpanDetail,
   buildTimelineRevealTarget,
+  ATTR_TURN_ID,
+  parentIdFilter,
+  phoenixDownNoticeHtml,
 } from "./phoenix.js";
+import {
+  createLifecycleFeed,
+  lifecycleIndex,
+  lifecycleHolders,
+  unplacedEvents,
+  unrecognizedEvents,
+  resolveTurnLifecycles,
+  spanTurnOutcome,
+  renderTurnLifecycleHtml,
+  renderLifecycleEventHtml,
+  renderHolderHtml,
+  renderFeedNoticesHtml,
+  holderStateLabel,
+  AGENT_NOT_RECORDED,
+} from "./lifecycle.js";
 
 // Keep the pure read-model exports available from navigator.js for callers
 // that predate phoenix.js becoming the shared source of truth.
@@ -100,6 +129,29 @@ const POLL_MS = 10_000; // live-follow cadence
 // Virtualization: fixed-height tree rows.
 const ROW_H = 28;
 const OVERSCAN_PX = 200;
+
+// The tenant-level group holding every Stop/Hold/Resume holder (#118): the host
+// latch, each held or stopped agent — spans or not — and the receipts that
+// name no agent or carry an unrecognized schema.
+const LIFECYCLE_GROUP = "Stop · Hold · Resume";
+const SELECTABLE_KINDS = new Set(["turn", "event", "holder", "receipt"]);
+// Levels a poll re-reads from Phoenix; the lifecycle group is rebuilt locally.
+const REFRESHABLE_KINDS = new Set(["tenant", "project", "agent", "subagent", "session"]);
+
+// A turn's reported outcome lives on its `turn <n> summary` — a DIRECT child of
+// the turn root, not a root — so the Turn level reads the summaries of exactly
+// the roots it has loaded, by parent span id. Every Turn the operator has paged
+// in gets its outcome (the Timeline reads the same summaries), not only the
+// newest page of the session. The name condition only narrows the page; the
+// summary is recognized by `TURN_SUMMARY_NAME_RE`, as everywhere else.
+const OUTCOME_BATCH = 100; // turn roots per summary read (the exact-id batch size)
+
+function turnSummaryFilter(rootSpanIds) {
+  const byParent = parentIdFilter(rootSpanIds);
+  return byParent ? `(${byParent}) and ('summary' in name)` : null;
+}
+
+const TURN_SUMMARY_NAME_RE = /\bturn\b.*\bsummary\b/i;
 
 // Pure exact-selection contract used by the mounted reveal flow and Node
 // behavior tests. OTel span id is authoritative; Phoenix node id is used only
@@ -150,6 +202,17 @@ export function mount(container, opts = {}) {
   const revealTarget = opts.revealTarget || null;
 
   let destroyed = false;
+  // Stop/Hold/Resume receipts + current latches (#118): polled at boot and on
+  // every poll tick; the index is rebuilt whenever they change.
+  // A receipt history deeper than one poll's page cap keeps draining on its own
+  // — Live is off by default, so no poll tick is coming to read the rest.
+  const lifecycle = createLifecycleFeed({
+    onUpdate(changed) {
+      if (changed) applyLifecycle();
+    },
+  });
+  let lifecycleIdx = lifecycleIndex(lifecycle.store);
+  let heldDids = new Set();
   let liveFollow = false; // off by default — noise-free
   let pollTimer = null;
   let polling = false;
@@ -200,6 +263,8 @@ export function mount(container, opts = {}) {
                 title="Live-follow: poll every 10s for new activity">Live</button>
         <button type="button" class="obs-nav__btn" data-refresh title="Refresh now">Refresh</button>
       </div>
+      <div class="obs-nav__notices" data-lifecycle-notices></div>
+      <div class="obs-nav__phoenix" data-phoenix-notice></div>
       <div class="obs-nav__body" data-body>
         <div class="obs-nav__treepane">
           <div class="obs-nav__scroll" data-scroll tabindex="0" role="tree" aria-label="Fleet navigator">
@@ -212,12 +277,13 @@ export function mount(container, opts = {}) {
       </div>
     </div>`;
 
-  const bodyEl = container.querySelector("[data-body]");
   const scroller = container.querySelector("[data-scroll]");
   const spacerEl = container.querySelector("[data-spacer]");
   const liveBtn = container.querySelector("[data-live]");
   const refreshBtn = container.querySelector("[data-refresh]");
   const inspectorEl = container.querySelector("[data-inspector]");
+  const noticesEl = container.querySelector("[data-lifecycle-notices]");
+  const phoenixNoticeEl = container.querySelector("[data-phoenix-notice]");
 
   // ── Level loaders — one paginated GraphQL query per expand ──
 
@@ -250,7 +316,12 @@ export function mount(container, opts = {}) {
           break; // event children are pre-loaded
       }
       node.loaded = true;
-      if (mode !== "refresh") node.error = null;
+      // A level that loaded but could not read everything (`node.partial`)
+      // shows why; a refresh that reads it all clears only that partial error,
+      // never a refresh-era failure it did not produce.
+      const partial = node.partial || null;
+      if (mode !== "refresh" || partial || node.errorIsPartial) node.error = partial;
+      node.errorIsPartial = Boolean(partial);
     } catch (e) {
       if (mode !== "refresh") node.error = (e && e.message) || "query failed";
     } finally {
@@ -283,6 +354,7 @@ export function mount(container, opts = {}) {
       return child;
     });
     node.meta = plural(node.children.length, "project");
+    syncLifecycleGroup();
   }
 
   // One page of recency-ordered spans for `node` (its project), through
@@ -374,8 +446,8 @@ export function mount(container, opts = {}) {
     const entries = [...node.agg.agents.entries()].sort(
       (a, b) => (b[1].last || 0) - (a[1].last || 0),
     );
-    node.children = entries.map(([name, entry]) =>
-      childFor(
+    node.children = entries.map(([name, entry]) => {
+      const child = childFor(
         node,
         "agent",
         name,
@@ -383,8 +455,10 @@ export function mount(container, opts = {}) {
         { projectId: node.data.projectId, agentName: name },
         entry,
         "run",
-      ),
-    );
+      );
+      child.data.dids = entry.dids ? [...entry.dids].sort() : [];
+      return child;
+    });
   }
 
   // Subagent level: the worker split under an agent (e.g. talon/implement,
@@ -485,6 +559,16 @@ export function mount(container, opts = {}) {
     for (const span of spans) {
       if (span && !node.turns.has(span.id)) node.turns.set(span.id, span);
     }
+    // The outcomes decorate Turns this load already fetched, so a failed read
+    // must not cost the Turns themselves: the level still loads, and the
+    // failure is reported as a partial load on its error row. Whatever the read
+    // missed stays unread, so the next load (a Refresh included) asks again.
+    let outcomeError = null;
+    try {
+      await loadTurnOutcomes(node);
+    } catch (err) {
+      outcomeError = err;
+    }
     const ordered = [...node.turns.values()].sort(
       (a, b) => (ts(a.startTime) || 0) - (ts(b.startTime) || 0),
     );
@@ -508,9 +592,195 @@ export function mount(container, opts = {}) {
       child.status = span.statusCode === "ERROR" ? "error" : "ok";
       return child;
     });
+    resolveSessionLifecycles(node);
     const first = ordered.length ? ts(ordered[0].startTime) : null;
     const last = ordered.length ? ts(ordered[ordered.length - 1].endTime) : null;
     node.meta = `${plural(ordered.length, "turn")}${last ?? first ? ` · ${relTime(last ?? first)}` : ""}`;
+    node.partial = outcomeError
+      ? `turn outcomes unavailable: ${(outcomeError && outcomeError.message) || "query failed"}`
+      : null;
+  }
+
+  // The turn summaries of every loaded root still without one: trace id →
+  // its reported `kestrel.turn.outcome` (null: none reported). A summary is
+  // emitted once per turn, so a turn whose summary has been read is never asked
+  // for again; one still running is asked on each load until it closes. Read
+  // without touching the session's own pagination.
+  async function loadTurnOutcomes(node) {
+    if (!node.outcomes) node.outcomes = new Map();
+    const unread = [];
+    for (const span of node.turns.values()) {
+      const traceId = span.context && span.context.traceId;
+      const spanId = span.context && span.context.spanId;
+      if (traceId && spanId && !node.outcomes.has(traceId)) unread.push(spanId);
+    }
+    for (let i = 0; i < unread.length; i += OUTCOME_BATCH) {
+      const filter = turnSummaryFilter(unread.slice(i, i + OUTCOME_BATCH));
+      if (!filter) continue;
+      let after = null;
+      do {
+        const data = await gql(SPAN_PAGE_QUERY, {
+          projectId: node.data.projectId,
+          first: OUTCOME_BATCH,
+          after,
+          filter,
+          rootOnly: false,
+          sort: { col: "startTime", dir: "asc" },
+        });
+        const conn = data.node && data.node.spans;
+        const found = ((conn && conn.edges) || []).map((e) => e && e.node).filter(Boolean);
+        for (const span of found) {
+          const traceId = span.context && span.context.traceId;
+          if (!traceId || !TURN_SUMMARY_NAME_RE.test(String(span.name || ""))) continue;
+          node.outcomes.set(traceId, spanTurnOutcome(parseAttributes(span.attributes)));
+        }
+        const pageInfo = (conn && conn.pageInfo) || {};
+        after = pageInfo.hasNextPage ? pageInfo.endCursor || null : null;
+      } while (after && !destroyed);
+    }
+  }
+
+  // The turn descriptor both views resolve lifecycles from — the Timeline builds
+  // the identical shape from the same spans (see `annotateLifecycle`).
+  function turnDescriptor(key, span, reported) {
+    const attrs = parseAttributes(span.attributes);
+    const turnId = getAttr(attrs, ATTR_TURN_ID);
+    return {
+      key,
+      traceId: (span.context && span.context.traceId) || null,
+      spanId: (span.context && span.context.spanId) || null,
+      turnId: turnId != null && turnId !== "" ? String(turnId) : null,
+      outcome: spanTurnOutcome(attrs) ?? reported ?? null,
+    };
+  }
+
+  // Every Turn (and loaded Event) of one session against the receipt index.
+  function resolveSessionLifecycles(session) {
+    const turns = session.children.filter((c) => c.kind === "turn");
+    const descriptors = [];
+    const nodes = new Map();
+    for (const turn of turns) {
+      const span = turn.data.span;
+      const traceId = span.context && span.context.traceId;
+      const reported =
+        (traceId && session.outcomes && session.outcomes.get(traceId)) ?? turn.data.summaryOutcome;
+      const key = `turn:${turn.id}`;
+      descriptors.push(turnDescriptor(key, span, reported));
+      nodes.set(key, turn);
+      (function walk(parent) {
+        for (const child of parent.children) {
+          if (child.kind !== "event") continue;
+          if (!TURN_SUMMARY_NAME_RE.test(String(child.data.span.name || ""))) {
+            const ek = `event:${child.id}`;
+            descriptors.push(turnDescriptor(ek, child.data.span, null));
+            nodes.set(ek, child);
+          }
+          walk(child);
+        }
+      })(turn);
+    }
+    const resolved = resolveTurnLifecycles(lifecycleIdx, descriptors);
+    for (const [key, node] of nodes) node.data.lifecycle = resolved.get(key) || null;
+  }
+
+  // ── Lifecycle group (#118) — built locally from the receipt index ──
+
+  function lifecycleChild(parent, kind, key, label, data) {
+    const mapKey = `${kind}:${key}`;
+    let child = parent.childIndex.get(mapKey);
+    if (!child) {
+      child = makeNode(kind, label, data, parent);
+      parent.childIndex.set(mapKey, child);
+    }
+    child.label = label;
+    child.data = data;
+    child.loaded = true;
+    return child;
+  }
+
+  function eventChildren(parent, events) {
+    return events.map((ev) => {
+      const child = lifecycleChild(parent, "receipt", ev.id, ev.label, { event: ev });
+      child.expandable = false;
+      child.meta = Number.isFinite(ev.atMs) ? relTime(ev.atMs) : "";
+      child.status = ev.tone;
+      return child;
+    });
+  }
+
+  function syncLifecycleGroup() {
+    const holders = lifecycleHolders(lifecycleIdx);
+    heldDids = new Set(holders.filter((h) => h.held && h.did != null).map((h) => h.did));
+    const projectsOnly = tenant.children.filter((c) => c.kind === "project");
+    const unplaced = unplacedEvents(lifecycleIdx);
+    const unrecognized = unrecognizedEvents(lifecycleIdx);
+    if (!holders.length && !unplaced.length && !unrecognized.length) {
+      tenant.children = projectsOnly;
+      return;
+    }
+    const group = lifecycleChild(tenant, "lifecycle", "group", LIFECYCLE_GROUP, {});
+    const kids = holders.map((holder) => {
+      const label = holder.did != null ? holder.did : "host (every agent)";
+      const child = lifecycleChild(group, "holder", holder.key, label, { holder });
+      child.children = eventChildren(child, holder.events);
+      child.expandable = child.children.length > 0;
+      child.meta = holderStateLabel(holder);
+      child.status = holder.held ? "hold" : null;
+      return child;
+    });
+    for (const [key, label, events] of [
+      ["unplaced", AGENT_NOT_RECORDED, unplaced],
+      ["unrecognized", "unrecognized receipts", unrecognized],
+    ]) {
+      if (!events.length) continue;
+      const child = lifecycleChild(group, "holder", key, label, { holder: null, events });
+      child.children = eventChildren(child, events);
+      child.expandable = true;
+      child.meta = plural(events.length, "receipt");
+      child.status = key === "unrecognized" ? "unrecognized" : null;
+      kids.push(child);
+    }
+    group.children = kids;
+    group.meta = `${plural(heldDids.size, "held agent")} · ${plural(
+      lifecycleIdx.stops.length + lifecycleIdx.holds.length,
+      "receipt",
+    )}`;
+    tenant.children = [...projectsOnly, group];
+  }
+
+  // Poll the receipts and re-join everything loaded against them.
+  async function refreshLifecycle() {
+    if (destroyed) return;
+    await lifecycle.poll();
+    applyLifecycle();
+  }
+
+  // Whether `node` is still reachable from the tenant root after a rebuild.
+  function isAttached(node) {
+    for (let n = node; n !== tenant; n = n.parent) {
+      if (!n || !n.parent || !n.parent.children.includes(n)) return false;
+    }
+    return true;
+  }
+
+  function applyLifecycle() {
+    if (destroyed) return;
+    lifecycleIdx = lifecycleIndex(lifecycle.store);
+    syncLifecycleGroup();
+    // A rebuild can drop a node (a latch-only holder on release): its old data
+    // must never keep speaking in the inspector.
+    if (selectedNode && !isAttached(selectedNode)) {
+      selectedNode = null;
+      revealFallback = null;
+    }
+    if (focusedNode && !isAttached(focusedNode)) focusedNode = null;
+    (function walk(node) {
+      if (node.kind === "session" && node.loaded) resolveSessionLifecycles(node);
+      for (const child of node.children) walk(child);
+    })(tenant);
+    if (noticesEl) noticesEl.innerHTML = renderFeedNoticesHtml(lifecycle.store);
+    renderInspector();
+    scheduleRebuild();
   }
 
   // Events level: the turn's whole span tree in one query, nested by parent
@@ -566,6 +836,9 @@ export function mount(container, opts = {}) {
     );
     node.data.summary = turnSummary ? spanSummaryOf(turnSummary) : null;
     node.data.summaryEndMs = turnSummary ? ts(turnSummary.endTime) : null;
+    node.data.summaryOutcome = turnSummary
+      ? spanTurnOutcome(parseAttributes(turnSummary.attributes))
+      : null;
 
     function eventNode(parent, span) {
       const key = `event:${span.id}`;
@@ -591,6 +864,7 @@ export function mount(container, opts = {}) {
     }
 
     node.children = tops.map((s) => eventNode(node, s));
+    if (node.parent && node.parent.kind === "session") resolveSessionLifecycles(node.parent);
     node.meta = `${plural(spans.length ? spans.length - (rootSpanId && bySpanId.has(rootSpanId) ? 1 : 0) : 0, "event")} · ${fmtDuration(node.data.span && node.data.span.latencyMs)}`;
   }
 
@@ -655,6 +929,12 @@ export function mount(container, opts = {}) {
         return "session";
       case "turn":
         return "turn";
+      case "lifecycle":
+        return "lifecycle";
+      case "holder":
+        return node.data.holder && node.data.holder.scope === "host" ? "host" : "holder";
+      case "receipt":
+        return node.data.event.kind;
       case "event": {
         return spanKindOf(node.data.span);
       }
@@ -691,12 +971,7 @@ export function mount(container, opts = {}) {
       ? `<span class="obs-nav__caret" data-caret>${node.expanded ? "▾" : "▸"}</span>`
       : `<span class="obs-nav__caret"></span>`;
     const pill = `<span class="obs-nav__kind obs-nav__kind--${node.kind}">${escapeHtml(kindLabel(node))}</span>`;
-    const statusPill =
-      node.status === "error"
-        ? `<span class="obs-nav__pill obs-nav__pill--error">error</span>`
-        : node.kind === "turn"
-          ? `<span class="obs-nav__pill obs-nav__pill--ok">ok</span>`
-          : "";
+    const statusPill = statusPillHtml(node);
     const bar = node.kind === "event" ? barHtml(node) : "";
     const open =
       node.kind === "turn" && node.data.traceId && openTrace
@@ -710,6 +985,30 @@ export function mount(container, opts = {}) {
       <span class="obs-nav__meta">${escapeHtml(node.meta || "")}</span>
       ${open}
     </div>`;
+  }
+
+  // A Turn/Event row names its lifecycle — the receipt-backed state the
+  // Timeline paints (#118) — before the span's own ok/error.
+  function statusPillHtml(node) {
+    const lc = node.data && node.data.lifecycle;
+    if (lc && (lc.label || lc.markers.length)) {
+      const main = lc.label
+        ? `<span class="obs-lifecycle__pill obs-lifecycle__pill--${escapeHtml(lc.tone)}" data-lifecycle-state="${escapeHtml(lc.state)}">${escapeHtml(lc.label)}</span>`
+        : "";
+      return main + lc.markers.map((m) => `<span class="obs-lifecycle__marker">${escapeHtml(m)}</span>`).join("");
+    }
+    if (node.kind === "agent" && (node.data.dids || []).some((did) => heldDids.has(did))) {
+      return `<span class="obs-lifecycle__pill obs-lifecycle__pill--hold">held</span>`;
+    }
+    if (node.kind === "holder" || node.kind === "receipt") {
+      return node.status
+        ? `<span class="obs-lifecycle__pill obs-lifecycle__pill--${escapeHtml(node.status)}">${escapeHtml(
+            node.kind === "holder" ? (node.status === "hold" ? "held" : node.status) : node.data.event.disposition || node.status,
+          ).replace(/_/g, " ")}</span>`
+        : "";
+    }
+    if (node.status === "error") return `<span class="obs-nav__pill obs-nav__pill--error">error</span>`;
+    return node.kind === "turn" ? `<span class="obs-nav__pill obs-nav__pill--ok">ok</span>` : "";
   }
 
   function rowHtml(row, i) {
@@ -789,11 +1088,29 @@ export function mount(container, opts = {}) {
       context.summary = node.data.summary;
       context.endMs = node.data.summaryEndMs;
     }
+    if (node.data.lifecycle) context.lifecycle = node.data.lifecycle;
     return normalizeSpanDetail(node.data.span, context);
+  }
+
+  // A lifecycle holder or receipt: the same receipt rendering the Timeline's
+  // popovers use, never a span detail (#118).
+  function lifecycleInspectorHtml(node) {
+    if (node.kind === "receipt") return renderLifecycleEventHtml(node.data.event);
+    const holder = node.data.holder;
+    const events = holder ? holder.events : node.data.events || [];
+    return (holder ? renderHolderHtml(holder) : "") + events.map(renderLifecycleEventHtml).join("");
   }
 
   function renderInspector() {
     if (!inspectorEl) return;
+    if (selectedNode && (selectedNode.kind === "holder" || selectedNode.kind === "receipt")) {
+      inspectorEl.innerHTML = `
+      <div class="obs-nav__inspector-head">
+        <span class="obs-nav__inspector-title" title="${escapeHtml(selectedNode.label)}">${escapeHtml(selectedNode.label)}</span>
+      </div>
+      <div class="obs-nav__inspector-body" data-lifecycle-inspector>${lifecycleInspectorHtml(selectedNode)}</div>`;
+      return;
+    }
     const detail = detailForNode(selectedNode);
     if (!detail) {
       inspectorEl.innerHTML =
@@ -810,7 +1127,7 @@ export function mount(container, opts = {}) {
         <span class="obs-nav__inspector-title" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
       </div>
       ${fallback}
-      <div class="obs-nav__inspector-body">${renderSpanDetail(detail)}</div>
+      <div class="obs-nav__inspector-body">${renderTurnLifecycleHtml(selectedNode.data.lifecycle)}${renderSpanDetail(detail)}</div>
       <div class="obs-nav__inspector-actions">
         ${canPhx ? `<button type="button" class="obs-nav__action" data-inspector-phoenix>Open in Phoenix</button>` : ""}
         ${canTimeline ? `<button type="button" class="obs-nav__action" data-inspector-timeline>Show in Timeline</button>` : ""}
@@ -818,7 +1135,7 @@ export function mount(container, opts = {}) {
   }
 
   function selectSpanNode(node, fallbackMessage = null) {
-    if (!node || (node.kind !== "turn" && node.kind !== "event")) return;
+    if (!node || !SELECTABLE_KINDS.has(node.kind)) return;
     focusedNode = node;
     selectedNode = node;
     revealFallback = fallbackMessage;
@@ -836,7 +1153,7 @@ export function mount(container, opts = {}) {
 
   function activate(node) {
     focusedNode = node;
-    if (node.kind === "turn" || node.kind === "event") {
+    if (SELECTABLE_KINDS.has(node.kind)) {
       selectSpanNode(node);
     } else if (node.expandable) {
       toggleExpand(node);
@@ -988,7 +1305,7 @@ export function mount(container, opts = {}) {
     try {
       const targets = [];
       (function collect(node) {
-        if (node.expanded && node.loaded && node.kind !== "turn" && node.kind !== "event") {
+        if (node.expanded && node.loaded && REFRESHABLE_KINDS.has(node.kind)) {
           targets.push(node);
         }
         for (const child of node.children) collect(child);
@@ -999,6 +1316,8 @@ export function mount(container, opts = {}) {
         if (destroyed || (!manual && !liveFollow)) break;
         await loadChildren(node, "refresh");
       }
+      // The receipts ride the same poll as the spans (#118).
+      if (!destroyed && (manual || liveFollow)) await refreshLifecycle();
     } catch (_e) {
       /* transient poll errors are non-fatal */
     } finally {
@@ -1168,6 +1487,7 @@ export function mount(container, opts = {}) {
 
   function teardown() {
     destroyed = true;
+    lifecycle.destroy();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -1175,20 +1495,12 @@ export function mount(container, opts = {}) {
     window.removeEventListener("resize", onResize);
   }
 
-  // Phoenix down → the same friendly notice as the embed subtab, plus a retry
-  // that remounts a fresh instance (this closure's scroller DOM is gone).
+  // Phoenix down → the same friendly notice as the embed subtab, as a strip
+  // above the tree, plus a retry that remounts a fresh instance.
   function renderNotice() {
-    if (destroyed || !bodyEl) return;
-    bodyEl.innerHTML = `
-      <div class="obs-notice">
-        <div class="obs-notice__title">Phoenix is not running on this host</div>
-        <div class="obs-notice__body">
-          Install <code>kestrel-sovereign[phoenix]</code> and restart, or set
-          <code>KESTREL_PHOENIX_ENABLED=1</code>.
-        </div>
-        <button type="button" class="obs-nav__btn" data-retry>Retry</button>
-      </div>`;
-    const retry = bodyEl.querySelector("[data-retry]");
+    if (destroyed || !phoenixNoticeEl) return;
+    phoenixNoticeEl.innerHTML = phoenixDownNoticeHtml("obs-nav__btn");
+    const retry = phoenixNoticeEl.querySelector("[data-retry]");
     if (retry) {
       retry.addEventListener("click", () => {
         if (destroyed) return;
@@ -1200,20 +1512,24 @@ export function mount(container, opts = {}) {
   }
 
   async function boot() {
+    let phoenixUp = true;
     try {
       // Mint the embed session BEFORE the first query — the cookie authenticates
       // every /phoenix/graphql call the tree makes from here on.
       await mintPhoenixSession();
     } catch (_e) {
+      // Phoenix down costs the span levels, not the lifecycle: the receipts and
+      // latches are the host's, so a held agent keeps its node (#118).
+      phoenixUp = false;
       renderNotice();
-      return;
     }
     if (destroyed) return;
     // Root is pre-expanded: Tenant → Fleet with real counts on first paint.
-    await loadChildren(tenant, "initial");
+    if (phoenixUp) await loadChildren(tenant, "initial");
+    await refreshLifecycle();
     // A pending Timeline "open in Navigator" reveal drills in once the fleet
     // level is loaded (#54).
-    if (!destroyed && revealTarget) reveal(revealTarget);
+    if (!destroyed && phoenixUp && revealTarget) reveal(revealTarget);
   }
 
   rebuildRows();
@@ -1237,6 +1553,9 @@ function ensureStyles() {
     .obs-nav__toolbar { display:flex; align-items:center; gap:8px; padding:6px 12px;
                         border-bottom:1px solid var(--color-border,#334155); }
     .obs-nav__title { font-weight:600; }
+    .obs-nav__notices { display:flex; flex-wrap:wrap; gap:4px 12px; padding:3px 12px;
+                        border-bottom:1px solid var(--color-border,#334155); }
+    .obs-nav__notices:empty { display:none; }
     .obs-nav__grow { flex:1; }
     .obs-nav__btn { background:transparent; color:var(--color-text-muted,#94a3b8);
                     border:1px solid var(--color-border,#334155); border-radius:999px;
@@ -1320,6 +1639,11 @@ function ensureStyles() {
     .obs-nav .obs-notice code { font-family:ui-monospace,monospace; background:var(--color-surface,#1e293b);
                                 border:1px solid var(--color-border,#334155); border-radius:4px;
                                 padding:1px 5px; }
+    .obs-nav__phoenix:empty { display:none; }
+    .obs-nav .obs-notice--strip { flex:none; flex-direction:row; flex-wrap:wrap; justify-content:flex-start;
+                                  gap:4px 12px; padding:6px 12px; text-align:left;
+                                  border-bottom:1px solid var(--color-border,#334155); }
+    .obs-nav .obs-notice--strip .obs-notice__title { font-size:13px; }
   `;
   document.head.appendChild(style);
   stylesInjected = true;

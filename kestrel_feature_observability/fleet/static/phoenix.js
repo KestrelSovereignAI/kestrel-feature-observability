@@ -65,6 +65,10 @@ export const ATTR_INCOMPLETE_COUNT = "kestrel.incomplete_count";
 export const ATTR_IDLE_COUNT = "kestrel.idle_count";
 export const ATTR_REPO = "kestrel.repo";
 export const ATTR_AGENT_DID = "kestrel.agent_did";
+// How a turn ENDED, computed once by core (kestrel-sovereign#3159) and stamped
+// on its turn span and the feature's `turn <n> summary`. The Stop receipts stay
+// the authority for "stopped"; this is only what the span itself reports (#118).
+export const ATTR_TURN_OUTCOME = "kestrel.turn.outcome";
 
 // Spans missing kestrel.agent_name bucket here (should be none post-#2602).
 export const UNKNOWN_AGENT = "unknown";
@@ -81,6 +85,13 @@ let phoenixSessionMinted = false;
 export async function mintPhoenixSession() {
   await API.requestHost(PHOENIX_SESSION_PATH, { method: "POST" });
   phoenixSessionMinted = true;
+}
+
+// A host-ROOT read through the console API client — the one host coupling both
+// views share. The lifecycle receipt feeds (./lifecycle.js) read through it so
+// the console's auth, CSRF and 401 handling apply exactly as for the mint.
+export function requestHost(path, options) {
+  return API.requestHost(path, options || {});
 }
 
 // `opts.signal` is an optional AbortSignal: a view torn down mid-flight (a
@@ -256,13 +267,40 @@ export function workerFilter(agentName, worker) {
 // anything else is dropped rather than interpolated into the DSL. Returns null
 // when no id survives, so the caller can skip the request entirely.
 export function spanIdFilter(spanIds) {
+  return exactIdFilter("span_id", spanIds);
+}
+
+// The direct CHILDREN of the given spans, exactly and window-free — the same
+// membership form on `parent_id` (verified live against Phoenix 17.7.0, alone
+// and `and`-combined with further conditions).
+export function parentIdFilter(spanIds) {
+  return exactIdFilter("parent_id", spanIds);
+}
+
+function exactIdFilter(field, spanIds) {
   const ids = new Set();
   for (const id of spanIds || []) {
     const hex = String(id);
     if (/^[0-9a-f]+$/i.test(hex)) ids.add(hex);
   }
   if (!ids.size) return null;
-  return `span_id in [${[...ids].map(dslString).join(", ")}]`;
+  return `${field} in [${[...ids].map(dslString).join(", ")}]`;
+}
+
+// The "Phoenix is down" notice both span views show. It is a strip ABOVE the
+// view's body, never a replacement for it: the Stop/Hold/Resume lifecycle is
+// served by the host, not Phoenix, so a held agent must stay visible while the
+// spans are unavailable (#118). `buttonClass` is the view's own button style.
+export function phoenixDownNoticeHtml(buttonClass) {
+  return `
+      <div class="obs-notice obs-notice--strip">
+        <div class="obs-notice__title">Phoenix is not running on this host</div>
+        <div class="obs-notice__body">
+          Spans are unavailable. Install <code>kestrel-sovereign[phoenix]</code> and
+          restart, or set <code>KESTREL_PHOENIX_ENABLED=1</code>.
+        </div>
+        <button type="button" class="${escapeHtml(buttonClass)}" data-retry>Retry</button>
+      </div>`;
 }
 
 export function ts(iso) {
@@ -517,13 +555,17 @@ export function mergeSpansIntoAgg(agg, spans) {
     const errored = span.statusCode === "ERROR";
 
     const agent = getAttr(attrs, ATTR_AGENT_NAME);
-    bump(
-      agg.agents,
-      agent != null && agent !== "" ? baseAgentName(agent) : UNKNOWN_AGENT,
-      start,
-      end,
-      errored,
-    );
+    const agentKey = agent != null && agent !== "" ? baseAgentName(agent) : UNKNOWN_AGENT;
+    bump(agg.agents, agentKey, start, end, errored);
+    // The stable DIDs behind a display name — what a Hold latch or a Stop
+    // receipt names the agent by (#118). Both producer spellings, as the
+    // Timeline reads them.
+    const did = getAttr(attrs, ATTR_AGENT_DID) ?? getAttr(attrs, "agent.did");
+    if (did != null && did !== "") {
+      const entry = agg.agents.get(agentKey);
+      if (!entry.dids) entry.dids = new Set();
+      entry.dids.add(String(did));
+    }
 
     const worker = workerOf(attrs);
     if (worker) bump(agg.workers, worker, start, end, errored);
@@ -631,7 +673,14 @@ export function normalizeSpanDetail(span, context = {}) {
   // a point in time (#88).
   const pointEvent =
     durationMs === 0 && (POINT_ROLES.has(role) || isRefusedOutcome(outcome));
-  const state = source.rAbandoned
+  // A governance lifecycle resolved from the Stop/Hold receipts (#118) names
+  // how the turn ended; "completed" or "point event" beside "stopped" would be
+  // exactly the contradiction #88 removed.
+  const lifecycleLabel =
+    context.lifecycle && present(context.lifecycle.label) ? String(context.lifecycle.label) : null;
+  const state = lifecycleLabel
+    ? lifecycleLabel
+    : source.rAbandoned
     ? "abandoned — no completion recorded"
     : running
       ? "running"
