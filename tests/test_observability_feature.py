@@ -1616,11 +1616,13 @@ class TestFeatureInitialization:
         assert hooks[0].priority == 999
 
     @pytest.mark.asyncio
-    async def test_feature_clears_hook_on_shutdown(self):
+    async def test_hook_stays_unregisterable_after_shutdown(self):
+        # The host calls shutdown() BEFORE get_hooks() to unregister (#118).
         feature = ObservabilityFeature(_make_agent())
         await feature.initialize()
+        (hook,) = feature.get_hooks()
         await feature.shutdown()
-        assert feature.get_hooks() == []
+        assert feature.get_hooks() == [hook]
 
     @pytest.mark.asyncio
     async def test_shutdown_emits_summary_for_open_sessions(self):

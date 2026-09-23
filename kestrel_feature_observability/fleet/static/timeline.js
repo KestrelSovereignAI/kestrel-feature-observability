@@ -46,9 +46,9 @@
 // purpose): capped at MAX_POLL_PAGES per pass, resumed on its own cursor and
 // fixed bounds, and counted as covering its range only once it finishes
 // (#109). The Stop/Hold/Resume receipts ride the same poll (./lifecycle.js):
-// a stopped turn paints in the stopped hue (receipt pending: washed + dashed),
-// each agent's home lane carries a lifecycle track of Hold bands and receipt
-// marks, and a held agent with no spans gets its own lane (#118). Phoenix down
+// a stopped turn paints in the stopped hue, each agent's home lane carries a
+// lifecycle track of Hold bands and receipt marks, and a held agent with no
+// spans gets its own lane (#118). Phoenix down
 // → the same friendly notice as the
 // Navigator / embed sub-views. Canvas rendering keeps it smooth with thousands
 // of in-window spans.
@@ -195,7 +195,6 @@ const VIRTUAL_BAND_DASH = [5, 4];
 // walking away, an interruption neither — none of them is a defect.
 const LIFECYCLE_COLORS = {
   stopped: "#a855f7",
-  pending: "#a855f7",
   error: ERROR_COLOR,
   disconnected: "#fb923c",
   interrupted: "#78716c",
@@ -207,8 +206,6 @@ const LIFECYCLE_COLORS = {
   resume: "#4ade80",
 };
 const LIFECYCLE_EVENT_PX = 6; // one Stop/Hold/Resume receipt's paint width
-const LIFECYCLE_PENDING_ALPHA = 0.5; // "stopped (receipt pending)" — same hue, not yet witnessed
-const LIFECYCLE_PENDING_DASH = [3, 3];
 // The synthetic group holding lifecycle lanes no span lane can carry: the host
 // latch, held agents with no spans loaded, receipts that name no agent, and
 // unrecognized receipts.
@@ -838,7 +835,7 @@ export function annotateRenderModel(spanIter, nowMs) {
 // span's reported outcome is its own `kestrel.turn.outcome`, else the one on its
 // folded `turn <n> summary` (step 1 of `annotateRenderModel`, which must run
 // first). Sets `rLifecycle` (null: nothing to say). Pure + exported for tests.
-export function annotateLifecycle(spanIter, index, nowMs) {
+export function annotateLifecycle(spanIter, index) {
   const list = [...spanIter];
   const turns = [];
   for (const s of list) {
@@ -851,10 +848,7 @@ export function annotateLifecycle(spanIter, index, nowMs) {
       traceId: s.traceId,
       spanId: s.spanId,
       turnId: turnId != null && turnId !== "" ? String(turnId) : null,
-      agentDid: s.agentDid,
       outcome: spanTurnOutcome(s.attrs) ?? folded,
-      startMs: s.start,
-      endMs: s.rOpen ? nowMs : s.rEnd != null ? s.rEnd : s.end,
     });
   }
   const resolved = resolveTurnLifecycles(index, turns);
@@ -868,23 +862,19 @@ export function annotateLifecycle(spanIter, index, nowMs) {
 // carry. An agent's Stop/Hold/Resume receipts land on its HOME lane — its plain
 // (un-orchestrated, worker-less) lane, keyed by the stable `did:` identity the
 // lanes already use — in every project it has one. A holder with no lane gets a
-// synthetic one, so a held agent is visible even with no spans loaded. A Stop
-// joined exactly to a loaded span is shown on that span, not repeated on the
-// lane. Pure + exported for tests: `lanesByProject` is `laneGroups()` output.
-export function lifecycleLaneModel(lanesByProject, index, loadedExactKeys) {
-  const shown = (ev) =>
-    !(
-      ev.kind === "stop" &&
-      ev.exact &&
-      loadedExactKeys.has(`${ev.receipt.traceId} ${ev.receipt.spanId}`)
-    );
+// synthetic one, so a held agent is visible even with no spans loaded. Every
+// lifecycle carries a `key` (its holder's, else the synthetic lane's) so a view
+// of it can be found again in a rebuilt model. Pure + exported for tests:
+// `lanesByProject` is `laneGroups()` output.
+export function lifecycleLaneModel(lanesByProject, index) {
   const homes = new Map(); // lane object → lifecycle
   const synthetic = [];
   for (const holder of lifecycleHolders(index)) {
     const lifecycle = {
+      key: holder.key,
       holder,
       episodes: holder.episodes,
-      events: holder.events.filter(shown),
+      events: holder.events,
     };
     let placed = false;
     if (holder.did != null) {
@@ -907,12 +897,12 @@ export function lifecycleLaneModel(lanesByProject, index, loadedExactKeys) {
       });
     }
   }
-  const unplaced = unplacedEvents(index).filter(shown);
+  const unplaced = unplacedEvents(index);
   if (unplaced.length) {
     synthetic.push({
       key: "unplaced",
       label: AGENT_NOT_RECORDED,
-      lifecycle: { holder: null, episodes: [], events: unplaced },
+      lifecycle: { key: "unplaced", holder: null, episodes: [], events: unplaced },
     });
   }
   const unrecognized = unrecognizedEvents(index);
@@ -920,7 +910,7 @@ export function lifecycleLaneModel(lanesByProject, index, loadedExactKeys) {
     synthetic.push({
       key: "unrecognized",
       label: "unrecognized receipts",
-      lifecycle: { holder: null, episodes: [], events: unrecognized },
+      lifecycle: { key: "unrecognized", holder: null, episodes: [], events: unrecognized },
     });
   }
   return { homes, synthetic };
@@ -1668,6 +1658,11 @@ export function mount(container, opts = {}) {
   // ── Layout cache (rebuilt on data / collapse change, projected each frame) ──
   const collapsed = new Set(); // collapsed project names
   let layout = { rows: [], contentH: 0 };
+  // Every lifecycle in the current model (home + synthetic lanes, collapsed or
+  // not), rebuilt with the layout: what an open lifecycle popover is re-read from.
+  let lifecycleViews = [];
+  let popoverItem = null; // what the open popover shows, as an identity (see `openPopover`)
+  let popoverHtml = null; // its last painted content
   let drawn = []; // {x,y,w,h,span?,density?,count} for hit-testing (per frame)
   const rollupCache = new Map(); // spanId → memberRollup (invalidated by buildLayout)
 
@@ -2842,13 +2837,13 @@ export function mount(container, opts = {}) {
       for (const s of list) if (s.start < m) m = s.start;
       return m;
     };
-    const ordered = [...groups.values()].sort((a, b) => minStart(a) - minStart(b));
+    const ordered = [...groups.entries()].sort((a, b) => minStart(a[1]) - minStart(b[1]));
 
     const outItems = [];
     const sessionBands = [];
     const envelopes = [];
     let laneTracks = baseTracks;
-    for (const members of ordered) {
+    for (const [key, members] of ordered) {
       const band = buildBand(members, nowMs);
       const offset = laneTracks;
       for (const p of band.placed) {
@@ -2866,6 +2861,7 @@ export function mount(container, opts = {}) {
         });
       }
       sessionBands.push({
+        key, // the band's identity within its lane (its session, else its trace)
         sessionId: band.sessionId,
         traceId: band.traceId,
         start: band.start,
@@ -2900,12 +2896,9 @@ export function mount(container, opts = {}) {
     const byProject = laneGroups(spans.values());
     // Join the receipts: each span's lifecycle, then each holder's lane (#118).
     const index = lifecycleIndex(lifecycle.store);
-    annotateLifecycle(spans.values(), index, nowMs);
-    const loadedExactKeys = new Set();
-    for (const s of spans.values()) {
-      if (s.traceId && s.spanId) loadedExactKeys.add(`${s.traceId} ${s.spanId}`);
-    }
-    const lifecycleLanes = lifecycleLaneModel(byProject, index, loadedExactKeys);
+    annotateLifecycle(spans.values(), index);
+    const lifecycleLanes = lifecycleLaneModel(byProject, index);
+    lifecycleViews = [...lifecycleLanes.homes.values(), ...lifecycleLanes.synthetic.map((l) => l.lifecycle)];
     if (noticesEl) noticesEl.innerHTML = renderFeedNoticesHtml(lifecycle.store);
 
     // Order projects: known projects first (DEFAULT_PROJECT, then repos), then
@@ -2957,6 +2950,10 @@ export function mount(container, opts = {}) {
       for (const lane of byProject.get(name)) {
         const laneLifecycle = lifecycleLanes.homes.get(lane) || null;
         const band = laneBands(lane.items, nowMs, laneLifecycle ? 1 : 0);
+        // A band's identity survives rebuilds, so an open band popover can be
+        // re-read from the current layout (#118).
+        const laneId = JSON.stringify([name, lane.agentIdentity, lane.worker]);
+        for (const sb of band.sessionBands) sb.id = `${laneId}|${sb.key}`;
         const h = band.tracks * TRACK_H + 2 * LANE_VPAD;
         rows.push({
           type: "lane",
@@ -2981,6 +2978,7 @@ export function mount(container, opts = {}) {
     }
     layout = { rows, contentH: y };
     clampScroll();
+    refreshPopover();
   }
 
   function clampScroll() {
@@ -3182,6 +3180,8 @@ export function mount(container, opts = {}) {
         }
         drawn.push({ x: r.cx, y: ry, w, h: bh, episode: ep });
       }
+      // Every receipt, unconditionally: a turn bar's stopped state and the
+      // lane's Stop mark are two facts (what the turn is, when the act happened).
       for (const ev of row.lifecycle.events) {
         if (!Number.isFinite(ev.atMs) || ev.atMs < vs || ev.atMs > ve) continue;
         const x = Math.max(GUTTER_W, timeToX(ev.atMs) - LIFECYCLE_EVENT_PX / 2);
@@ -3422,23 +3422,8 @@ export function mount(container, opts = {}) {
           continue;
         }
         const lc = s.rLifecycle;
-        const lcColor = lifecycleColor(s);
-        if (lc && lc.tone === "pending") {
-          // Stopped per the span, not yet witnessed by a receipt: the stopped
-          // hue, washed and dashed, until the receipt lands.
-          ctx.fillStyle = lcColor;
-          ctx.globalAlpha = LIFECYCLE_PENDING_ALPHA;
-          ctx.fillRect(cx, ry, w, bh);
-          ctx.globalAlpha = 1;
-          ctx.strokeStyle = lcColor;
-          ctx.lineWidth = 1;
-          ctx.setLineDash(LIFECYCLE_PENDING_DASH);
-          ctx.strokeRect(cx + 0.5, ry + 0.5, Math.max(1, w - 1), Math.max(1, bh - 1));
-          ctx.setLineDash([]);
-        } else {
-          ctx.fillStyle = lcColor || kindColor(s.kind);
-          ctx.fillRect(cx, ry, w, bh);
-        }
+        ctx.fillStyle = lifecycleColor(s) || kindColor(s.kind);
+        ctx.fillRect(cx, ry, w, bh);
         if (s.status === "error") {
           ctx.fillStyle = ERROR_COLOR;
           ctx.fillRect(cx, ry, w, 2);
@@ -3706,7 +3691,22 @@ export function mount(container, opts = {}) {
     return null;
   }
 
-  function showPopover(s, clientX, clientY) {
+  // The open popover shows an ITEM, not a snapshot: the identity it was opened
+  // on (`popoverItem`), re-read from the current model on every rebuild
+  // (`refreshPopover`, run by `buildLayout`) — so a receipt or span landing
+  // while it is open shows in it, and an item gone from the model closes it
+  // (#118). A session band is re-read by its lane-scoped identity (`band.id`).
+  function popoverShell(title, bodyHtml, { bodyAttr = "", footHtml = "", fullTitle = title } = {}) {
+    return `
+      <div class="obs-tl__phead">
+        <span class="obs-tl__ptitle" title="${escapeHtml(fullTitle)}">${escapeHtml(title)}</span>
+        <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
+      </div>
+      <div class="obs-tl__pbody"${bodyAttr}>${bodyHtml}</div>${footHtml}`;
+  }
+
+  // A span's popover: its lifecycle, then the shared detail contract.
+  function spanPopoverContent(s) {
     const detail = spanDetail(s);
     const canNav = Boolean(
       openNavigator &&
@@ -3717,47 +3717,38 @@ export function mount(container, opts = {}) {
         detail.spanId,
     );
     const canPhx = Boolean(openTrace && s.traceId && s.projectId);
-    popEl.innerHTML = `
-      <div class="obs-tl__phead">
-        <span class="obs-tl__ptitle" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
-        <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
-      </div>
-      <div class="obs-tl__pbody">${renderTurnLifecycleHtml(s.rLifecycle)}${renderSpanDetail(detail, { rawAttributes: false })}</div>
+    const foot = `
       <div class="obs-tl__pfoot">
         ${canNav ? `<button type="button" class="obs-tl__plink" data-pnav>Open in Navigator</button>` : ""}
         ${canPhx ? `<button type="button" class="obs-tl__plink" data-pphx>Open in Phoenix</button>` : ""}
       </div>`;
-    popEl.hidden = false;
-    const rect = bodyEl.getBoundingClientRect();
-    let x = clientX - rect.left + 12;
-    let y = clientY - rect.top + 12;
-    const pw = popEl.offsetWidth;
-    const ph = popEl.offsetHeight;
-    if (x + pw > cssW) x = Math.max(2, cssW - pw - 4);
-    if (y + ph > cssH) y = Math.max(2, cssH - ph - 4);
-    popEl.style.left = `${x}px`;
-    popEl.style.top = `${y}px`;
-
-    const closeBtn = popEl.querySelector("[data-pclose]");
-    if (closeBtn) closeBtn.addEventListener("click", hidePopover);
-    const navBtn = popEl.querySelector("[data-pnav]");
-    if (navBtn) {
-      navBtn.addEventListener("click", () => {
-        hidePopover();
-        openNavigator(buildNavigatorRevealTarget(detail));
-      });
-    }
-    const phxBtn = popEl.querySelector("[data-pphx]");
-    if (phxBtn) {
-      phxBtn.addEventListener("click", () => {
-        const url = openTraceUrl(s);
-        if (url && openTrace) openTrace(url);
-      });
-    }
-  }
-  function hidePopover() {
-    popEl.hidden = true;
-    popEl.innerHTML = "";
+    const id = s.id;
+    return {
+      html: popoverShell(
+        detail.displayName,
+        `${renderTurnLifecycleHtml(s.rLifecycle)}${renderSpanDetail(detail, { rawAttributes: false })}`,
+        { footHtml: foot, fullTitle: detail.name },
+      ),
+      // The links act on the span as it is when clicked, not as it was painted.
+      bind() {
+        const navBtn = popEl.querySelector("[data-pnav]");
+        if (navBtn) {
+          navBtn.addEventListener("click", () => {
+            const cur = spans.get(id);
+            hidePopover();
+            if (cur) openNavigator(buildNavigatorRevealTarget(spanDetail(cur)));
+          });
+        }
+        const phxBtn = popEl.querySelector("[data-pphx]");
+        if (phxBtn) {
+          phxBtn.addEventListener("click", () => {
+            const cur = spans.get(id);
+            const url = cur ? openTraceUrl(cur) : null;
+            if (url && openTrace) openTrace(url);
+          });
+        }
+      },
+    };
   }
 
   // The session band's click popover: the folded `session summary` stats (turn /
@@ -3766,39 +3757,82 @@ export function mount(container, opts = {}) {
   // detail contract, so a summary-LESS band (notably the virtual scheduler
   // session, which never reconciles) still identifies itself and reports what it
   // covers (#88).
-  function showBandPopover(b, clientX, clientY) {
+  function bandPopoverContent(b) {
     const detail = bandDetail(b);
-    const title = detail.displayName;
-    popEl.innerHTML = `
-      <div class="obs-tl__phead">
-        <span class="obs-tl__ptitle" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
-        <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
-      </div>
-      <div class="obs-tl__pbody">${renderSpanDetail(detail, { rawAttributes: false })}</div>`;
-    popEl.hidden = false;
-    const rect = bodyEl.getBoundingClientRect();
-    let x = clientX - rect.left + 12;
-    let y = clientY - rect.top + 12;
-    const pw = popEl.offsetWidth;
-    const ph = popEl.offsetHeight;
-    if (x + pw > cssW) x = Math.max(2, cssW - pw - 4);
-    if (y + ph > cssH) y = Math.max(2, cssH - ph - 4);
-    popEl.style.left = `${x}px`;
-    popEl.style.top = `${y}px`;
-    const closeBtn = popEl.querySelector("[data-pclose]");
-    if (closeBtn) closeBtn.addEventListener("click", hidePopover);
+    return { html: popoverShell(detail.displayName, renderSpanDetail(detail, { rawAttributes: false })) };
   }
 
   // A lifecycle popover: one receipt, one hold episode, or a lane's whole
   // lifecycle (its resting state, then every receipt in order) (#118).
-  function showLifecyclePopover(title, bodyHtml, clientX, clientY) {
-    popEl.innerHTML = `
-      <div class="obs-tl__phead">
-        <span class="obs-tl__ptitle" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
-        <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
-      </div>
-      <div class="obs-tl__pbody" data-lifecycle-popover>${bodyHtml}</div>`;
+  function lifecyclePopoverContent(title, bodyHtml) {
+    return { html: popoverShell(title, bodyHtml, { bodyAttr: " data-lifecycle-popover" }) };
+  }
+
+  function findBand(id) {
+    for (const row of layout.rows) {
+      if (row.type !== "lane") continue;
+      for (const b of row.sessionBands) if (b.id === id) return b;
+    }
+    return null;
+  }
+  function findLifecycleEvent(id) {
+    for (const lc of lifecycleViews) for (const ev of lc.events) if (ev.id === id) return ev;
+    return null;
+  }
+  function findEpisode(id) {
+    for (const lc of lifecycleViews) for (const ep of lc.episodes) if (ep.id === id) return ep;
+    return null;
+  }
+
+  // An item's popover content from the CURRENT model, or null when the item no
+  // longer exists in it.
+  function popoverContent(item) {
+    if (item.kind === "span") {
+      const s = spans.get(item.id);
+      return s ? spanPopoverContent(s) : null;
+    }
+    if (item.kind === "band") {
+      const b = findBand(item.id);
+      return b ? bandPopoverContent(b) : null;
+    }
+    if (item.kind === "event") {
+      const ev = findLifecycleEvent(item.id);
+      return ev ? lifecyclePopoverContent(ev.label, renderLifecycleEventHtml(ev)) : null;
+    }
+    if (item.kind === "episode") {
+      const ep = findEpisode(item.id);
+      return ep ? lifecyclePopoverContent(`Hold · ${ep.scope}`, renderEpisodeHtml(ep)) : null;
+    }
+    if (item.kind === "lane") {
+      const lc = lifecycleViews.find((l) => l.key === item.key);
+      return lc ? lifecyclePopoverContent(item.title, laneLifecycleHtml(lc)) : null;
+    }
+    return null;
+  }
+
+  // Paint the open item; the DOM is replaced only when its content changed, so
+  // a rebuild that changed nothing never swaps a button out from under a click.
+  function paintPopover() {
+    const content = popoverContent(popoverItem);
+    if (!content) return false;
+    if (content.html !== popoverHtml) {
+      popEl.innerHTML = content.html;
+      popoverHtml = content.html;
+      const closeBtn = popEl.querySelector("[data-pclose]");
+      if (closeBtn) closeBtn.addEventListener("click", hidePopover);
+      if (content.bind) content.bind();
+    }
     popEl.hidden = false;
+    return true;
+  }
+
+  function openPopover(item, clientX, clientY) {
+    popoverItem = item;
+    popoverHtml = null;
+    if (!paintPopover()) {
+      hidePopover();
+      return;
+    }
     const rect = bodyEl.getBoundingClientRect();
     let x = clientX - rect.left + 12;
     let y = clientY - rect.top + 12;
@@ -3808,12 +3842,20 @@ export function mount(container, opts = {}) {
     if (y + ph > cssH) y = Math.max(2, cssH - ph - 4);
     popEl.style.left = `${x}px`;
     popEl.style.top = `${y}px`;
-    const closeBtn = popEl.querySelector("[data-pclose]");
-    if (closeBtn) closeBtn.addEventListener("click", hidePopover);
   }
 
-  function laneLifecycleHtml(row) {
-    const lc = row.lifecycle;
+  function refreshPopover() {
+    if (popoverItem && !paintPopover()) hidePopover();
+  }
+
+  function hidePopover() {
+    popoverItem = null;
+    popoverHtml = null;
+    popEl.hidden = true;
+    popEl.innerHTML = "";
+  }
+
+  function laneLifecycleHtml(lc) {
     const holder = lc.holder;
     const state = holder
       ? `<div class="obs-lifecycle__head"><span class="obs-lifecycle__pill obs-lifecycle__pill--${holder.held ? "hold" : "ok"}">${escapeHtml(holderStateLabel(holder))}</span></div>`
@@ -3958,24 +4000,23 @@ export function mount(container, opts = {}) {
     if (d.band) {
       // Every band opens its session popover: even without folded summary stats
       // it names the session and reports what it covers (#88).
-      showBandPopover(d.band, clientX, clientY);
+      openPopover({ kind: "band", id: d.band.id }, clientX, clientY);
       return;
     }
     if (d.lifecycleEvent) {
-      showLifecyclePopover(
-        d.lifecycleEvent.label,
-        renderLifecycleEventHtml(d.lifecycleEvent),
-        clientX,
-        clientY,
-      );
+      openPopover({ kind: "event", id: d.lifecycleEvent.id }, clientX, clientY);
       return;
     }
     if (d.episode) {
-      showLifecyclePopover(`Hold · ${d.episode.scope}`, renderEpisodeHtml(d.episode), clientX, clientY);
+      openPopover({ kind: "episode", id: d.episode.id }, clientX, clientY);
       return;
     }
     if (d.laneLifecycle) {
-      showLifecyclePopover(d.laneLifecycle.label, laneLifecycleHtml(d.laneLifecycle), clientX, clientY);
+      openPopover(
+        { kind: "lane", key: d.laneLifecycle.lifecycle.key, title: d.laneLifecycle.label },
+        clientX,
+        clientY,
+      );
       return;
     }
     if (d.density) {
@@ -3991,7 +4032,7 @@ export function mount(container, opts = {}) {
       requestDraw();
       return;
     }
-    if (d.span) showPopover(d.span, clientX, clientY);
+    if (d.span) openPopover({ kind: "span", id: d.span.id }, clientX, clientY);
   }
 
   // Toolbar.

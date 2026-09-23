@@ -90,7 +90,6 @@ import {
   normalizeSpanDetail,
   renderSpanDetail,
   buildTimelineRevealTarget,
-  ATTR_AGENT_DID,
   ATTR_TURN_ID,
   parentIdFilter,
   phoenixDownNoticeHtml,
@@ -586,10 +585,10 @@ export function mount(container, opts = {}) {
   }
 
   // The turn summaries of every loaded root still without one: trace id →
-  // {outcome, endMs}. A summary is emitted once per turn, so a turn whose
-  // summary has been read is never asked for again; one still running is asked
-  // on each load until it closes. Read without touching the session's own
-  // pagination.
+  // its reported `kestrel.turn.outcome` (null: none reported). A summary is
+  // emitted once per turn, so a turn whose summary has been read is never asked
+  // for again; one still running is asked on each load until it closes. Read
+  // without touching the session's own pagination.
   async function loadTurnOutcomes(node) {
     if (!node.outcomes) node.outcomes = new Map();
     const unread = [];
@@ -616,10 +615,7 @@ export function mount(container, opts = {}) {
         for (const span of found) {
           const traceId = span.context && span.context.traceId;
           if (!traceId || !TURN_SUMMARY_NAME_RE.test(String(span.name || ""))) continue;
-          node.outcomes.set(traceId, {
-            outcome: spanTurnOutcome(parseAttributes(span.attributes)),
-            endMs: ts(span.endTime),
-          });
+          node.outcomes.set(traceId, spanTurnOutcome(parseAttributes(span.attributes)));
         }
         const pageInfo = (conn && conn.pageInfo) || {};
         after = pageInfo.hasNextPage ? pageInfo.endCursor || null : null;
@@ -631,19 +627,13 @@ export function mount(container, opts = {}) {
   // the identical shape from the same spans (see `annotateLifecycle`).
   function turnDescriptor(key, span, reported) {
     const attrs = parseAttributes(span.attributes);
-    const did = getAttr(attrs, ATTR_AGENT_DID) ?? getAttr(attrs, "agent.did");
     const turnId = getAttr(attrs, ATTR_TURN_ID);
-    const startMs = ts(span.startTime);
-    const ownEnd = ts(span.endTime) ?? startMs;
     return {
       key,
       traceId: (span.context && span.context.traceId) || null,
       spanId: (span.context && span.context.spanId) || null,
       turnId: turnId != null && turnId !== "" ? String(turnId) : null,
-      agentDid: did != null && did !== "" ? String(did) : null,
-      outcome: spanTurnOutcome(attrs) ?? (reported ? reported.outcome : null),
-      startMs,
-      endMs: reported && reported.endMs != null ? Math.max(ownEnd, reported.endMs) : ownEnd,
+      outcome: spanTurnOutcome(attrs) ?? reported ?? null,
     };
   }
 
@@ -656,10 +646,7 @@ export function mount(container, opts = {}) {
       const span = turn.data.span;
       const traceId = span.context && span.context.traceId;
       const reported =
-        (traceId && session.outcomes && session.outcomes.get(traceId)) ||
-        (turn.data.summaryOutcome
-          ? { outcome: turn.data.summaryOutcome, endMs: turn.data.summaryEndMs }
-          : null);
+        (traceId && session.outcomes && session.outcomes.get(traceId)) ?? turn.data.summaryOutcome;
       const key = `turn:${turn.id}`;
       descriptors.push(turnDescriptor(key, span, reported));
       nodes.set(key, turn);
@@ -751,10 +738,25 @@ export function mount(container, opts = {}) {
     applyLifecycle();
   }
 
+  // Whether `node` is still reachable from the tenant root after a rebuild.
+  function isAttached(node) {
+    for (let n = node; n !== tenant; n = n.parent) {
+      if (!n || !n.parent || !n.parent.children.includes(n)) return false;
+    }
+    return true;
+  }
+
   function applyLifecycle() {
     if (destroyed) return;
     lifecycleIdx = lifecycleIndex(lifecycle.store);
     syncLifecycleGroup();
+    // A rebuild can drop a node (a latch-only holder on release): its old data
+    // must never keep speaking in the inspector.
+    if (selectedNode && !isAttached(selectedNode)) {
+      selectedNode = null;
+      revealFallback = null;
+    }
+    if (focusedNode && !isAttached(focusedNode)) focusedNode = null;
     (function walk(node) {
       if (node.kind === "session" && node.loaded) resolveSessionLifecycles(node);
       for (const child of node.children) walk(child);

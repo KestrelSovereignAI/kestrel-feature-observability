@@ -131,6 +131,41 @@ class TestRegistrationThroughTheFeatureLifecycle:
         assert agent._turn_outcome_listeners == []
 
     @pytest.mark.asyncio
+    async def test_host_teardown_order_unregisters_the_hook(self):
+        """Follows core's ``_unregister_feature_runtime`` / ``_activate_feature_runtime``:
+        ``shutdown()`` runs BEFORE ``get_hooks()`` is asked what to unregister,
+        and a re-enable re-runs ``initialize()`` on the same instance."""
+        agent = HostAgent()
+        feature, hook, exporter = await _feature(agent)
+        registered = list(feature.get_hooks())
+
+        await feature.shutdown()
+        for h in feature.get_hooks():
+            registered.remove(h)
+        assert registered == []
+        assert agent._turn_outcome_listeners == []
+
+        with patch(
+            "kestrel_feature_observability.hook.configure_tracing",
+            return_value=hook._tracer,
+        ):
+            await feature.initialize()
+        registered.extend(feature.get_hooks())
+        (live,) = registered
+        assert live is not hook
+        assert agent._turn_outcome_listeners == [live.on_turn_outcome]
+
+        exporter.clear()
+        turn_id = agent.begin_turn()
+        for h in registered:
+            await h.execute(_input("UserPromptSubmit"))
+            await h.execute(_input("Stop"))
+        agent.publish(turn_id, TurnOutcome.COMPLETED)
+        (summary,) = _named(exporter, "turn 1 summary")
+        assert summary.attributes[KESTREL_TURN_OUTCOME] == "completed"
+        await feature.shutdown()
+
+    @pytest.mark.asyncio
     async def test_host_without_the_seam_keeps_stop_closing_turns(self):
         agent = HostAgent(with_seam=False)
         feature, hook, exporter = await _feature(agent)

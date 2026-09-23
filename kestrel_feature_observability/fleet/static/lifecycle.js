@@ -8,15 +8,24 @@
 //
 //   - The RECEIPTS decide what happened; spans are only matched to them. The
 //     feeds are the sovereign-gated `GET /api/host/stop/receipts` and
-//     `GET /api/host/hold/receipts`, paged on `feed_seq` (the `cursor` the core
-//     issues — a commit-ordered key, so a later commit can never land behind a
-//     page already read), plus `GET /api/host/hold` for the CURRENT latches.
-//   - A turn-scope Stop joins its turn by EXACT `(trace_id, span_id)` (and, via
-//     the canonical `kestrel.turn_id`, every span of that same turn). An agent-
-//     or host-scope Stop joins the agent lane by DID at `occurred_at`: agent
-//     scope names its DID in `target_agent_id`, a host fan-out names one per
-//     outcome. A receipt with no DID renders "agent not recorded" — the agent is
-//     never inferred.
+//     `GET /api/host/hold/receipts`, paged by the server's opaque `next_cursor`
+//     (passed back verbatim; the core's keyset is commit-ordered, so a later
+//     commit can never land behind a page already read), plus
+//     `GET /api/host/hold` for the CURRENT latches. `feed_seq` is opaque
+//     display/debug data: it is never parsed, compared or validated as a
+//     number — a 64-bit position a browser cannot hold exactly changes nothing.
+//   - A turn's stopped state comes from its own span (`kestrel.turn.outcome`)
+//     or from a receipt that names it EXACTLY: a turn-scope Stop joins its turn
+//     by `(trace_id, span_id)` (and, via the canonical `kestrel.turn_id`, every
+//     span of that same turn). Nothing is ever joined to a turn by time, and a
+//     tool-call Stop — which may name its tool span — never classifies the turn.
+//   - An agent- or host-scope Stop carries only a DID and a time, and is written
+//     after the Stop's effects complete — possibly after the turn ended — so it
+//     is a LANE event on its agent at `occurred_at`, never a turn's: agent scope
+//     names its DID in `target_agent_id`, a host fan-out names one per outcome.
+//     Only a `did:` identity is placed; anything else (core's `"host"` for an
+//     empty host Stop, `"unresolved"`, any future placeholder) or no identity at
+//     all renders "agent not recorded" — the agent is never inferred.
 //   - How a turn is shown is a PURE function of (spans, receipts, latches):
 //     receipts are immutable and keyed by `receipt_id`, every list is re-sorted
 //     here, so arrival order, duplicate pages, late receipts and a reload all
@@ -42,6 +51,9 @@ export const MAX_RECEIPT_PAGES = 5; // per feed per poll; the rest resumes on th
 // A feed with pages still past its cursor keeps draining on its own, this long
 // after each poll, rather than waiting for a view tick that may never come.
 export const RECEIPT_BACKLOG_MS = 250;
+// A backlog whose read failed is retried, not abandoned: the delay doubles per
+// consecutive failed poll and is capped here.
+export const RECEIPT_BACKLOG_RETRY_MAX_MS = 30_000;
 
 export const FEED_STOP = "stop";
 export const FEED_HOLD = "hold";
@@ -68,7 +80,6 @@ const KNOWN_OUTCOMES = new Set(TURN_OUTCOMES);
 // is the styling key both views use — only `failed` is the error tone.
 export const TURN_STATES = Object.freeze({
   stopped: { label: "stopped", tone: "stopped" },
-  stopped_pending: { label: "stopped (receipt pending)", tone: "pending" },
   completed: { label: "completed", tone: "ok" },
   failed: { label: "failed", tone: "error" },
   disconnected: { label: "disconnected", tone: "disconnected" },
@@ -89,22 +100,17 @@ function text(value) {
   return typeof value === "string" && value.trim() !== "" ? value : null;
 }
 
-// `feed_seq` is a signed 64-bit integer — past 2^53 a JS number cannot hold it,
-// so it is kept as its canonical decimal string and compared by length first.
-function seqOf(value) {
-  if (typeof value === "number") {
-    return Number.isSafeInteger(value) && value >= 1 ? String(value) : null;
-  }
-  if (typeof value !== "string" || !/^\d{1,19}$/.test(value)) return null;
-  const canonical = value.replace(/^0+/, "");
-  return canonical === "" ? null : canonical;
+// `feed_seq` as served, for display and debugging only. It is a 64-bit
+// position a JS number may not hold exactly, and nothing here needs it: paging
+// follows `next_cursor`, dedupe is by `receipt_id`, and order is by time + id.
+function opaqueSeq(value) {
+  return value == null ? null : String(value);
 }
 
-export function compareSeq(a, b) {
-  if (a === b) return 0;
-  if (a == null) return -1;
-  if (b == null) return 1;
-  return a.length - b.length || (a < b ? -1 : 1);
+// The identity a receipt is placed by: a DID, else null ("agent not recorded").
+function placeableDid(value) {
+  const v = text(value);
+  return v && v.startsWith("did:") ? v : null;
 }
 
 function timeOf(value) {
@@ -119,12 +125,11 @@ function cmpText(a, b) {
   return x < y ? -1 : x > y ? 1 : 0;
 }
 
-// The one receipt order every list uses: the displayed time, then the commit-
-// ordered feed position, then the id — total over immutable rows.
+// The one receipt order every list uses: the displayed time, then the feed,
+// then the id — total over immutable rows, whatever order they arrived in.
 function cmpReceipts(a, b) {
   return (
     (a.atMs ?? 0) - (b.atMs ?? 0) ||
-    compareSeq(a.feedSeq, b.feedSeq) ||
     cmpText(a.feed, b.feed) ||
     cmpText(a.receiptId, b.receiptId)
   );
@@ -147,9 +152,8 @@ function normalizeStopOutcome(raw) {
 export function normalizeStopReceipt(raw) {
   if (!raw || typeof raw !== "object") return null;
   const receiptId = text(raw.receipt_id);
-  const feedSeq = seqOf(raw.feed_seq);
   const atMs = timeOf(raw.occurred_at);
-  if (!receiptId || !feedSeq || atMs == null || !STOP_SCOPES.has(raw.scope)) return null;
+  if (!receiptId || atMs == null || !STOP_SCOPES.has(raw.scope)) return null;
   if (!Array.isArray(raw.outcomes)) return null;
   const outcomes = [];
   for (const o of raw.outcomes) {
@@ -160,7 +164,7 @@ export function normalizeStopReceipt(raw) {
   outcomes.sort((a, b) => a.ordinal - b.ordinal);
   return {
     feed: FEED_STOP,
-    feedSeq,
+    feedSeq: opaqueSeq(raw.feed_seq),
     receiptId,
     scope: raw.scope,
     actorId: text(raw.actor_id),
@@ -178,16 +182,15 @@ export function normalizeStopReceipt(raw) {
 export function normalizeHoldReceipt(raw) {
   if (!raw || typeof raw !== "object") return null;
   const receiptId = text(raw.receipt_id);
-  const feedSeq = seqOf(raw.feed_seq);
   const atMs = timeOf(raw.occurred_at);
   const targetId = text(raw.target_id);
-  if (!receiptId || !feedSeq || atMs == null || !targetId) return null;
+  if (!receiptId || atMs == null || !targetId) return null;
   if (!HOLD_SCOPES.has(raw.scope) || !HOLD_ACTIONS.has(raw.action)) return null;
   if (!HOLD_DISPOSITIONS.has(raw.disposition)) return null;
   if (raw.scope === "host" && targetId !== HOST_HOLD_TARGET) return null;
   return {
     feed: FEED_HOLD,
-    feedSeq,
+    feedSeq: opaqueSeq(raw.feed_seq),
     receiptId,
     operationId: text(raw.operation_id),
     action: raw.action,
@@ -253,8 +256,11 @@ export function spanTurnOutcome(attrs) {
 
 function feedState() {
   // status: "pending" (never read) | "ok" | "unavailable" | "unrecognized" | "malformed"
-  // more: the newest page read said the feed has rows past `cursor`.
-  return { cursor: null, status: "pending", detail: null, more: false };
+  // cursor: the server-issued cursor the next read starts from (null: the start).
+  // more: the feed has pages past `cursor` not read yet.
+  // pages: every page read, as the cursor it was read from ("" for the start) →
+  //   the `next_cursor` it returned (null: it was the tail).
+  return { cursor: null, status: "pending", detail: null, more: false, pages: new Map() };
 }
 
 export function createLifecycleStore() {
@@ -273,7 +279,7 @@ export function createLifecycleStore() {
 
 function rememberUnrecognized(store, feed, raw, index, schemaVersion, why) {
   const receiptId = raw && typeof raw === "object" ? text(raw.receipt_id) : null;
-  const feedSeq = raw && typeof raw === "object" ? seqOf(raw.feed_seq) : null;
+  const feedSeq = raw && typeof raw === "object" ? opaqueSeq(raw.feed_seq) : null;
   const key = `${feed}:${receiptId || (feedSeq ? `#${feedSeq}` : `v${schemaVersion}@${index}`)}`;
   store.unrecognized.set(key, {
     key,
@@ -286,18 +292,46 @@ function rememberUnrecognized(store, feed, raw, index, schemaVersion, why) {
   });
 }
 
-// Ingest one receipt page. Idempotent: receipts are immutable and keyed, so a
+const START = ""; // the `pages` key of a read from the start of a feed
+
+// Where a feed stands, from the pages read so far: follow each page's
+// `next_cursor` from the start. A position whose page is unread is where the
+// next read starts, with history still past it; a tail page (no `next_cursor`)
+// is re-read from its own cursor on the next poll — that is how a row committed
+// later is found, without ever reading the cursor as a number. Only string
+// identity is used, so the answer does not depend on the order pages arrived in.
+function feedPosition(pages) {
+  let at = START;
+  const seen = new Set();
+  while (pages.has(at)) {
+    const next = pages.get(at);
+    if (next == null) return { cursor: at === START ? null : at, more: false, cycle: false };
+    if (seen.has(next)) return { cursor: at === START ? null : at, more: false, cycle: true };
+    seen.add(at);
+    at = next;
+  }
+  return { cursor: at === START ? null : at, more: at !== START, cycle: false };
+}
+
+// Ingest one receipt page, read from the server-issued cursor `from` (null: the
+// start). Idempotent: receipts are immutable and keyed by `receipt_id`, so a
 // page read twice, out of order, or after a reload changes nothing. Returns
-// whether the feed has more rows past this page.
+// whether the feed has more rows past the position it now holds.
 //
-// `more` (the feed's history is not fully read) is taken only from a page at
-// or past the cursor already held: an older page arriving late says nothing
-// about what lies beyond the newer one, so it can neither raise nor clear it.
-export function ingestReceiptPage(store, feed, payload) {
+// A position that once had a successor keeps it: the feed's rows are immutable
+// and commit-ordered, so a stale tail read arriving late cannot hide pages
+// already known to lie past it.
+export function ingestReceiptPage(store, feed, payload, from = null) {
   const state = store.feeds[feed];
   const target = feed === FEED_STOP ? store.stop : store.hold;
   const normalize = feed === FEED_STOP ? normalizeStopReceipt : normalizeHoldReceipt;
-  if (!payload || typeof payload !== "object" || !Array.isArray(payload.receipts)) {
+  const next = payload && typeof payload === "object" ? payload.next_cursor : undefined;
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    !Array.isArray(payload.receipts) ||
+    (next != null && text(next) == null)
+  ) {
     state.status = "malformed";
     state.detail = "unreadable page";
     return false;
@@ -314,13 +348,7 @@ export function ingestReceiptPage(store, feed, payload) {
     state.more = false; // nothing past here can be read by this build
     return false;
   }
-  const held = state.cursor;
-  let newest = held;
-  let pageTop = null;
   payload.receipts.forEach((raw, i) => {
-    const seq = raw && typeof raw === "object" ? seqOf(raw.feed_seq) : null;
-    if (seq && compareSeq(seq, pageTop) > 0) pageTop = seq;
-    if (seq && compareSeq(seq, newest) > 0) newest = seq;
     const receipt = normalize(raw);
     if (!receipt) {
       rememberUnrecognized(store, feed, raw, i, RECEIPT_SCHEMA_VERSION, "malformed receipt");
@@ -328,14 +356,19 @@ export function ingestReceiptPage(store, feed, payload) {
     }
     if (!target.has(receipt.receiptId)) target.set(receipt.receiptId, receipt);
   });
-  const next = seqOf(payload.next_cursor);
-  if (next && compareSeq(next, pageTop) > 0) pageTop = next;
-  if (next && compareSeq(next, newest) > 0) newest = next;
-  if (pageTop == null || compareSeq(pageTop, held) >= 0) state.more = next != null;
-  state.cursor = newest;
+  const key = from == null ? START : from;
+  if (next != null || !state.pages.has(key)) state.pages.set(key, next == null ? null : next);
+  const position = feedPosition(state.pages);
+  state.cursor = position.cursor;
+  state.more = position.more;
+  if (position.cycle) {
+    state.status = "malformed";
+    state.detail = "cursor cycle";
+    return false;
+  }
   state.status = "ok";
   state.detail = null;
-  return next != null;
+  return state.more;
 }
 
 export function ingestHoldState(store, payload) {
@@ -372,11 +405,22 @@ function storeSignature(store) {
   });
 }
 
-// Whether a readable receipt feed still has history past its cursor.
+// Whether a receipt feed still has history past its cursor that this build can
+// read. A failed read (`unavailable`) keeps its known backlog — the failure may
+// be transient, and the rows past the cursor are still unread — while an
+// unrecognized or malformed feed has nothing more this build can read.
 export function lifecycleBacklog(store) {
   return [FEED_STOP, FEED_HOLD].some((feed) => {
     const state = store.feeds[feed];
-    return state.status === "ok" && state.more;
+    return (state.status === "ok" || state.status === "unavailable") && state.more;
+  });
+}
+
+// Whether a known backlog is currently failing to read.
+function backlogFailing(store) {
+  return [FEED_STOP, FEED_HOLD].some((feed) => {
+    const state = store.feeds[feed];
+    return state.status === "unavailable" && state.more;
   });
 }
 
@@ -387,23 +431,28 @@ export function lifecycleBacklog(store) {
 // leave the rest for a view tick that may never come (the Navigator polls once
 // unless Live is on): while a feed still has pages past its cursor it keeps
 // polling on its own, `backlogMs` apart, calling `onUpdate(changed)` after
-// each, until it is caught up. `destroy()` stops it.
+// each, until it is caught up. A page that fails to read does not end that: the
+// feed shows as unavailable and the backlog is retried after a delay that
+// doubles per consecutive failed poll, capped at `retryMaxMs`, until a read
+// succeeds. `destroy()` stops it.
 export function createLifecycleFeed({
   request = requestHost,
   maxPages = MAX_RECEIPT_PAGES,
   backlogMs = RECEIPT_BACKLOG_MS,
+  retryMaxMs = RECEIPT_BACKLOG_RETRY_MAX_MS,
   onUpdate = null,
 } = {}) {
   const store = createLifecycleStore();
   let inFlight = null;
   let backlogTimer = null;
   let destroyed = false;
+  let failedPolls = 0; // consecutive polls that left a known backlog unreadable
 
   async function drain(feed, path) {
     for (let page = 0; page < maxPages; page++) {
       const params = new URLSearchParams({ limit: String(RECEIPT_PAGE_LIMIT) });
       const cursor = store.feeds[feed].cursor;
-      if (cursor) params.set("cursor", cursor);
+      if (cursor != null) params.set("cursor", cursor);
       let payload;
       try {
         payload = await request(`${path}?${params}`, { cache: "no-store" });
@@ -413,7 +462,7 @@ export function createLifecycleFeed({
         recordFeedFailure(store, feed, error);
         return;
       }
-      if (!ingestReceiptPage(store, feed, payload)) return;
+      if (!ingestReceiptPage(store, feed, payload, cursor)) return;
     }
   }
 
@@ -440,18 +489,22 @@ export function createLifecycleFeed({
     })();
     return inFlight.finally(() => {
       inFlight = null;
+      failedPolls = backlogFailing(store) ? failedPolls + 1 : 0;
       scheduleBacklog();
     });
   }
 
   function scheduleBacklog() {
     if (destroyed || !onUpdate || backlogTimer || !lifecycleBacklog(store)) return;
+    const delay = failedPolls
+      ? Math.min(Math.max(backlogMs, 1) * 2 ** failedPolls, retryMaxMs)
+      : backlogMs;
     backlogTimer = setTimeout(async () => {
       backlogTimer = null;
       if (destroyed) return;
       const changed = await poll();
       if (!destroyed) onUpdate(changed);
-    }, backlogMs);
+    }, delay);
   }
 
   function destroy() {
@@ -485,25 +538,34 @@ export function lifecycleIndex(store) {
   const byDid = new Map(); // agent DID → [entry]
   const unplaced = []; // entries whose agent was not recorded
   for (const r of stops) {
-    const exactKey = r.traceId && r.spanId ? `${r.traceId} ${r.spanId}` : null;
+    // Only a turn-scope Stop names a TURN. A tool-call Stop may carry the
+    // `(trace_id, span_id)` of its tool span, but it stopped that call, not the
+    // turn: it stays inspectable at its own scope as an event on its agent and
+    // never classifies the turn the span belongs to.
+    const exactKey =
+      r.scope === "turn" && r.traceId && r.spanId ? `${r.traceId} ${r.spanId}` : null;
+    const header = placeableDid(r.targetAgentId);
     const own = [];
     const perDid = new Map();
     const orphan = [];
     for (const o of r.outcomes) {
-      // Agent scope blinds the per-outcome identity; its DID is the header's.
-      const did = o.agentId || (r.scope !== "host" ? r.targetAgentId : null);
-      if (exactKey && (!did || !r.targetAgentId || did === r.targetAgentId)) own.push(o);
+      // A blinded outcome (no identity at all) takes the header's DID — except
+      // in a host fan-out, whose header names no agent. A recorded identity that
+      // is not a DID is a placeholder and places nothing.
+      const did =
+        o.agentId != null ? placeableDid(o.agentId) : r.scope !== "host" ? header : null;
+      if (exactKey && (!did || !header || did === header)) own.push(o);
       else if (did) pushTo(perDid, did, o);
       else orphan.push(o);
     }
     if (exactKey) {
-      const entry = { receipt: r, did: r.targetAgentId, outcomes: own, exact: true };
+      const entry = { receipt: r, did: header, outcomes: own, exact: true };
       pushTo(byTraceSpan, exactKey, entry);
-      if (r.targetAgentId) pushTo(byDid, r.targetAgentId, entry);
+      if (header) pushTo(byDid, header, entry);
       else unplaced.push(entry);
     } else if (!r.outcomes.length) {
-      const entry = { receipt: r, did: r.targetAgentId, outcomes: [], exact: false };
-      if (r.targetAgentId) pushTo(byDid, r.targetAgentId, entry);
+      const entry = { receipt: r, did: header, outcomes: [], exact: false };
+      if (header) pushTo(byDid, header, entry);
       else unplaced.push(entry);
     }
     for (const [did, outcomes] of [...perDid.entries()].sort((a, b) => cmpText(a[0], b[0]))) {
@@ -512,7 +574,7 @@ export function lifecycleIndex(store) {
     if (orphan.length) unplaced.push({ receipt: r, did: null, outcomes: orphan, exact: false });
   }
   const unrecognized = [...store.unrecognized.values()].sort(
-    (a, b) => cmpText(a.feed, b.feed) || compareSeq(a.feedSeq, b.feedSeq) || cmpText(a.key, b.key),
+    (a, b) => cmpText(a.feed, b.feed) || cmpText(a.key, b.key),
   );
   return { store, stops, holds, byTraceSpan, byDid, unplaced, unrecognized, latches: store.latches };
 }
@@ -543,7 +605,6 @@ function lifecycleOf(entries, spanOutcome) {
   for (const e of entries) for (const o of e.outcomes) dispositions.add(o.disposition);
   let state = null;
   if (dispositions.has("stopped")) state = "stopped";
-  else if (spanOutcome === "stopped") state = "stopped_pending";
   else if (spanOutcome != null) {
     state = KNOWN_OUTCOMES.has(spanOutcome) ? spanOutcome : "unrecognized_outcome";
   } else if (dispositions.has("unreachable")) state = "unreachable";
@@ -567,17 +628,17 @@ function lifecycleOf(entries, spanOutcome) {
 }
 
 // Resolve every turn's lifecycle at once. A turn is
-// `{key, traceId, spanId, turnId, agentDid, outcome, startMs, endMs}`; the result
-// maps `key` → lifecycle (or null: nothing to say — the span renders as before).
+// `{key, traceId, spanId, turnId, outcome}`; the result maps `key` → lifecycle
+// (or null: nothing to say — the span renders as before).
 //
-//   1. Exact: a receipt whose `(trace_id, span_id)` is this span's — and, through
-//      the canonical `kestrel.turn_id`, every other span of that same turn.
-//   2. Agent/host scope: a turn whose own outcome says `stopped` joins the DID's
-//      non-exact receipts with a `stopped` outcome recorded while it ran.
-//   3. State: a `stopped` disposition → stopped; a span-reported `stopped` with
-//      no receipt yet → stopped (receipt pending), converging when it lands;
-//      otherwise the span's own outcome. `already_complete` never changes the
-//      outcome — it adds the "Stop arrived after completion" marker.
+//   1. Receipts: only a turn-scope one whose `(trace_id, span_id)` is this
+//      span's — and, through the canonical `kestrel.turn_id`, every other span
+//      of that same turn. Agent-, host- and tool-call-scope receipts are lane
+//      events, never joined here.
+//   2. State: an exact `stopped` disposition → stopped; otherwise the span's own
+//      outcome (a span-reported `stopped` is stopped, receipt or not).
+//      `already_complete` never changes the outcome — it adds the "Stop arrived
+//      after completion" marker.
 export function resolveTurnLifecycles(index, turns) {
   const exactOf = (t) =>
     t.traceId && t.spanId ? index.byTraceSpan.get(`${t.traceId} ${t.spanId}`) || [] : [];
@@ -591,16 +652,7 @@ export function resolveTurnLifecycles(index, turns) {
   const out = new Map();
   for (const t of turns) {
     const outcome = t.outcome != null && t.outcome !== "" ? String(t.outcome) : null;
-    let entries = [...exactOf(t), ...((t.turnId && byTurnId.get(t.turnId)) || [])];
-    if (!entries.length && outcome === "stopped" && t.agentDid) {
-      entries = (index.byDid.get(t.agentDid) || []).filter(
-        (e) =>
-          !e.exact &&
-          e.receipt.atMs >= t.startMs &&
-          e.receipt.atMs <= t.endMs &&
-          e.outcomes.some((o) => o.disposition === "stopped"),
-      );
-    }
+    const entries = [...exactOf(t), ...((t.turnId && byTurnId.get(t.turnId)) || [])];
     out.set(t.key, lifecycleOf(uniqueEntries(entries), outcome));
   }
   return out;
@@ -797,7 +849,9 @@ export function lifecycleFeedNotices(store) {
         : state.status === "malformed"
           ? `unreadable (${state.detail})`
           : `unavailable (${state.detail})`;
-    notices.push({ feed, status: state.status, text: `${names[feed]} ${what}` });
+    // A failed read over a known backlog is retried; the history stays partial.
+    const partial = state.status === "unavailable" && state.more ? " — older history unread, retrying" : "";
+    notices.push({ feed, status: state.status, text: `${names[feed]} ${what}${partial}` });
   }
   return notices;
 }
@@ -828,7 +882,7 @@ function outcomeListHtml(outcomes) {
           `<li data-outcome-disposition="${escapeHtml(o.disposition)}">` +
           `<span class="obs-lifecycle__pill obs-lifecycle__pill--${escapeHtml(o.disposition)}">` +
           `${escapeHtml(o.disposition.replace(/_/g, " "))}</span> ` +
-          `${escapeHtml(clip(o.agentId || AGENT_NOT_RECORDED))}` +
+          `${escapeHtml(clip(placeableDid(o.agentId) || AGENT_NOT_RECORDED))}` +
           (o.detail ? ` · ${escapeHtml(clip(o.detail))}` : "") +
           `</li>`,
       )
@@ -839,8 +893,7 @@ function outcomeListHtml(outcomes) {
 
 export function renderStopReceiptHtml(receipt, focusOutcomes = null) {
   const r = receipt;
-  const agent =
-    r.scope === "host" ? null : r.targetAgentId || AGENT_NOT_RECORDED;
+  const agent = r.scope === "host" ? null : placeableDid(r.targetAgentId) || AGENT_NOT_RECORDED;
   const focus =
     focusOutcomes && focusOutcomes.length !== r.outcomes.length
       ? `<div class="obs-lifecycle__sub">this target</div>${outcomeListHtml(focusOutcomes)}`
@@ -954,16 +1007,12 @@ export function renderTurnLifecycleHtml(lifecycle) {
   const markers = lifecycle.markers
     .map((m) => `<span class="obs-lifecycle__marker">${escapeHtml(m)}</span>`)
     .join("");
-  const pending =
-    lifecycle.state === "stopped_pending"
-      ? `<div class="obs-lifecycle__note">The span reports a Stop; its receipt has not arrived yet.</div>`
-      : "";
   const receipts = lifecycle.receipts
     .map((e) => renderStopReceiptHtml(e.receipt, e.outcomes))
     .join("");
   return (
     `<div class="obs-lifecycle" data-lifecycle-state="${escapeHtml(lifecycle.state || "")}">` +
-    `<div class="obs-lifecycle__head">${pill}${markers}</div>${pending}${receipts}</div>`
+    `<div class="obs-lifecycle__head">${pill}${markers}</div>${receipts}</div>`
   );
 }
 

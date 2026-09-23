@@ -822,8 +822,7 @@ function ensureStyles() {
                           color:var(--color-text-muted,#94a3b8);
                           background:color-mix(in srgb, currentColor 15%, transparent); }
     .obs-lifecycle__marker { color:#a855f7; }
-    .obs-lifecycle__pill--stopped, .obs-lifecycle__pill--pending { color:#a855f7; }
-    .obs-lifecycle__pill--pending { border:1px dashed #a855f7; }
+    .obs-lifecycle__pill--stopped { color:#a855f7; }
     .obs-lifecycle__pill--ok, .obs-lifecycle__pill--resume { color:var(--color-success,#34d399); }
     .obs-lifecycle__pill--error { color:var(--color-danger,#f87171); }
     .obs-lifecycle__pill--disconnected { color:#fb923c; }

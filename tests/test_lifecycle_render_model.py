@@ -4,9 +4,11 @@ The render rules (kestrel-sovereign#3159 R1/R5/R6, and #118's rulings) are
 executed under node against the shipped ``lifecycle.js`` / ``timeline.js`` /
 ``navigator.js``:
 
-1. The receipts decide what happened; spans are only matched to them — a
-   turn-scope Stop by exact ``(trace_id, span_id)``, an agent/host-scope Stop by
-   DID at ``occurred_at``, and a receipt with no DID is "agent not recorded".
+1. A turn's stopped state comes from its own span or an exact receipt. A
+   receipt joins a turn only by exact ``(trace_id, span_id)``; an agent/host-scope
+   Stop is a lane event on its DID at ``occurred_at`` — never time-joined to a
+   turn — and a receipt with no ``did:`` identity (none, or a placeholder such as
+   core's ``"host"`` / ``"unresolved"``) is "agent not recorded".
 2. A turn's picture is a pure function of (spans, receipts, latches): shuffled,
    duplicated, late and reloaded fetches produce an IDENTICAL model.
 3. A held agent always has a visible state; host and agent latches are drawn
@@ -237,26 +239,57 @@ import {
   createLifecycleStore, ingestReceiptPage, ingestHoldState, recordFeedFailure, lifecycleIndex,
   lifecycleFeedNotices, renderStopReceiptHtml, renderLifecycleEventHtml, renderTurnLifecycleHtml,
 } from "./lifecycle.js";
-import { annotateRenderModel, annotateLifecycle, laneGroups, lifecycleLaneModel } from "./timeline.js";
+import {
+  annotateRenderModel, annotateLifecycle, laneGroups, lifecycleLaneModel,
+} from "./timeline.js";
 
 const MIN = 60_000;
 // Claw: t1 stopped (exact receipt), t2 stopped per span only, t3 completed but
 // Stop arrived late, t4 failed, t5 disconnected, t6 interrupted, t7 stopped by an
-// agent-scope Stop, t8 an outcome this build does not know. Emma: e1 stopped by
-// a host fan-out.
+// agent-scope Stop whose receipt is written AFTER the turn summary, t8 an outcome
+// this build does not know. Emma: e1 stopped by a host fan-out.
 const outcomes = ["stopped", "stopped", "completed", "failed", "disconnected", "interrupted", "stopped", "paused"];
 const raw = [];
 outcomes.forEach((o, i) => raw.push(...turnSpans("Claw", DID_CLAW, i + 1, turnStart(i), o)));
 raw.push(...turnSpans("Emma", DID_EMMA, 1, turnStart(2) + 30_000, "stopped", "sess-emma"));
+// Claw turn 3's tool call, carrying the turn's canonical kestrel.turn_id.
+const TOOL_SPAN_ID = Buffer.from("tool-Claw-3").toString("hex");
+{
+  const [root3] = raw.filter((s) => s.id === "node-Claw-root-3");
+  const a = JSON.parse(root3.attributes);
+  a.openinference.span.kind = "TOOL";
+  a.kestrel = { ...a.kestrel, marker: undefined, turn_index: 3, turn_id: "Claw#3" };
+  raw.push({
+    ...root3,
+    id: "node-Claw-tool-3",
+    name: "Bash",
+    spanKind: "tool",
+    startTime: new Date(turnStart(2) + MIN).toISOString(),
+    endTime: new Date(turnStart(2) + 2 * MIN).toISOString(),
+    latencyMs: MIN,
+    parentId: root3.context.spanId,
+    attributes: JSON.stringify(a),
+    context: { spanId: TOOL_SPAN_ID, traceId: "trace-Claw-3" },
+  });
+}
 
 const stopRows = [
   stopReceipt("R1", { scope: "turn", at: turnStart(0) + MIN, target: DID_CLAW, trace: "trace-Claw-1", span: rootId("Claw", 1), outcomes: [["stopped", DID_CLAW]] }),
   stopReceipt("R3", { scope: "turn", at: turnStart(2) + 5 * MIN, target: DID_CLAW, trace: "trace-Claw-3", span: rootId("Claw", 3), outcomes: [["already_complete", DID_CLAW]] }),
-  stopReceipt("R7", { scope: "agent", at: turnStart(6) + MIN, target: DID_CLAW, outcomes: [["stopped", null]] }),
+  // The summary of turn 7 ends at +4m; the Stop's receipt is persisted after
+  // its effects complete, at +5m.
+  stopReceipt("R7", { scope: "agent", at: turnStart(6) + 5 * MIN, target: DID_CLAW, outcomes: [["stopped", null]] }),
   stopReceipt("RH", { scope: "host", at: turnStart(2) + MIN, outcomes: [["stopped", DID_EMMA], ["already_complete", DID_CLAW], ["unreachable", DID_IDLE], ["unreachable", null]] }),
   stopReceipt("R0", { scope: "agent", at: turnStart(0), target: null, outcomes: [["stopped", null]] }),
+  // Core's placeholders: an empty host Stop names agent "host"; an unresolved
+  // target names "unresolved". Neither is a DID, so neither places an agent.
+  stopReceipt("RE", { scope: "host", at: turnStart(3), outcomes: [["refused", "host"]] }),
+  stopReceipt("RU", { scope: "agent", at: turnStart(4), target: "unresolved", outcomes: [["unreachable", "unresolved"]] }),
+  // A tool-call Stop naming the loaded tool span of completed turn 3 (which
+  // shares the turn's kestrel.turn_id): it stopped that call, never the turn.
+  stopReceipt("RT", { scope: "tool_call", at: turnStart(2) + 2 * MIN, target: DID_CLAW, trace: "trace-Claw-3", span: TOOL_SPAN_ID, outcomes: [["stopped", DID_CLAW]] }),
 ];
-const late = stopReceipt("R2", { scope: "turn", at: turnStart(1) + MIN, target: DID_CLAW, trace: "trace-Claw-2", span: rootId("Claw", 2), outcomes: [["stopped", DID_CLAW]] });
+const late = stopReceipt("R2", { scope: "turn", at: turnStart(1) + 5 * MIN, target: DID_CLAW, trace: "trace-Claw-2", span: rootId("Claw", 2), outcomes: [["stopped", DID_CLAW]] });
 const holdRows = [
   holdReceipt("H1", { action: "hold", scope: "host", target: "host", at: NOW - 50 * MIN, resulting: "H1" }),
   holdReceipt("H2", { action: "hold", scope: "agent", target: DID_IDLE, at: NOW - 40 * MIN, resulting: "H2" }),
@@ -279,10 +312,9 @@ function model(store, spanRaws) {
   const spans = spanRaws.map(record);
   annotateRenderModel(spans, NOW);
   const index = lifecycleIndex(store);
-  annotateLifecycle(spans, index, NOW);
+  annotateLifecycle(spans, index);
   const lanes = laneGroups(spans);
-  const keys = new Set(spans.map((s) => `${s.traceId} ${s.spanId}`));
-  const laneModel = lifecycleLaneModel(lanes, index, keys);
+  const laneModel = lifecycleLaneModel(lanes, index);
   const turns = {};
   for (const s of [...spans].sort((a, b) => (a.id < b.id ? -1 : 1))) {
     if (!s.rLifecycle) continue;
@@ -299,7 +331,13 @@ function model(store, spanRaws) {
     held: lc.holder ? lc.holder.held : null,
     sources: lc.holder ? lc.holder.sources : null,
     episodes: lc.episodes.map((e) => ({ hold: e.hold && e.hold.receiptId, end: e.end && e.end.receiptId, open: e.open, scope: e.scope })),
-    events: lc.events.map((e) => ({ id: e.id, kind: e.kind, disposition: e.disposition, action: e.receipt && e.receipt.action })),
+    events: lc.events.map((e) => ({
+      id: e.id,
+      kind: e.kind,
+      disposition: e.disposition,
+      action: e.receipt && e.receipt.action,
+      exact: e.exact === true,
+    })),
   });
   const homes = {};
   for (const [lane, lc] of laneModel.homes) homes[lane.label] = describe(lc);
@@ -312,11 +350,12 @@ function load(order) {
   for (const step of order) step(store);
   return store;
 }
+// Each page is ingested with the cursor it was read from.
 const steps = {
-  stopA: (st) => ingestReceiptPage(st, "stop", page(stopRows.slice(0, 2), "2")),
-  stopB: (st) => ingestReceiptPage(st, "stop", page(stopRows.slice(2))),
-  holdA: (st) => ingestReceiptPage(st, "hold", page(holdRows.slice(0, 3), "3")),
-  holdB: (st) => ingestReceiptPage(st, "hold", page(holdRows.slice(3))),
+  stopA: (st) => ingestReceiptPage(st, "stop", page(stopRows.slice(0, 2), "c-stop-2")),
+  stopB: (st) => ingestReceiptPage(st, "stop", page(stopRows.slice(2)), "c-stop-2"),
+  holdA: (st) => ingestReceiptPage(st, "hold", page(holdRows.slice(0, 3), "c-hold-3")),
+  holdB: (st) => ingestReceiptPage(st, "hold", page(holdRows.slice(3)), "c-hold-3"),
   latches: (st) => ingestHoldState(st, holdState),
 };
 const out = {};
@@ -330,8 +369,42 @@ const orders = [
 ];
 out.shuffled = orders.map((o, i) => JSON.stringify(model(load(o), i % 2 ? [...raw].reverse() : raw)));
 out.baseJson = JSON.stringify(out.base);
+// Where each feed stands is order-independent too: its next read re-reads the
+// tail page, from the cursor the server issued for it.
+out.positions = [[steps.stopA, steps.stopB, steps.holdA, steps.holdB, steps.latches], ...orders].map((o) => {
+  const st = load(o);
+  return ["stop", "hold"].map((f) => [st.feeds[f].cursor, st.feeds[f].more]);
+});
+// Only the first page read: the rest is unread, and the next read starts at
+// the server's cursor, verbatim.
+out.partial = (() => {
+  const st = load([steps.stopA]);
+  return { cursor: st.feeds.stop.cursor, more: st.feeds.stop.more, notices: lifecycleFeedNotices(st) };
+})();
 
-// A late receipt converges "stopped (receipt pending)" → "stopped".
+// A 64-bit feed position a browser cannot hold exactly: the row is a normal
+// receipt, and paging follows the server's cursor text verbatim.
+{
+  const wide = JSON.parse(
+    '{"schema_version":1,"next_cursor":"9223372036854775806","receipts":[' +
+      JSON.stringify({ ...stopRows[2], receipt_id: "RW", feed_seq: 0 }).replace('"feed_seq":0', '"feed_seq":9223372036854775807') +
+      "]}",
+  );
+  const st = createLifecycleStore();
+  const unsafe = !Number.isSafeInteger(wide.receipts[0].feed_seq);
+  ingestReceiptPage(st, "stop", wide);
+  const m = model(st, raw);
+  out.wide = {
+    unsafe,
+    held: st.stop.has("RW"),
+    cursor: st.feeds.stop.cursor,
+    unrecognized: st.unrecognized.size,
+    onLane: ((m.homes.Claw && m.homes.Claw.events) || []).filter((e) => e.id === "stop:RW:did:key:claw"),
+  };
+}
+
+// A late turn-scope receipt — written after the turn summary — attaches by its
+// exact (trace_id, span_id); the turn was already "stopped" per its span.
 const lateStore = load([steps.stopA, steps.stopB, steps.holdA, steps.holdB, steps.latches]);
 ingestReceiptPage(lateStore, "stop", page([late]));
 out.late = model(lateStore, raw).turns["Claw turn 2"];
@@ -367,6 +440,8 @@ const longHtml = renderStopReceiptHtml(longStore.stop.get("RL"));
 out.clipped = longHtml.includes("(truncated)") && !longHtml.includes("x".repeat(4001));
 out.holdHtml = renderLifecycleEventHtml({ kind: "resume", receipt: lateStore.hold.get("H3") });
 out.pendingHtml = renderTurnLifecycleHtml(null);
+const sentinel = load([steps.stopB]);
+out.placeholderHtml = ["RE", "RU"].map((id) => renderStopReceiptHtml(sentinel.stop.get(id)));
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -379,43 +454,68 @@ def test_render_rules_are_a_pure_function_of_spans_receipts_and_latches(tmp_path
     # Rule 1/2: an exact turn-scope receipt stops its turn, receipt inspectable.
     assert turns["Claw turn 1"]["state"] == "stopped"
     assert turns["Claw turn 1"]["receipts"] == ["R1"]
-    # The span alone says stopped → pending until the receipt lands.
+    # The span alone says stopped → stopped; there is no "pending" state.
     assert turns["Claw turn 2"] == {
-        "state": "stopped_pending",
-        "label": "stopped (receipt pending)",
-        "tone": "pending",
+        "state": "stopped",
+        "label": "stopped",
+        "tone": "stopped",
         "markers": [],
         "receipts": [],
         "outcomes": [],
     }
+    # Its receipt, written after the summary, attaches by exact identity.
     assert out["late"]["state"] == "stopped" and out["late"]["receipts"] == ["R2"]
     # already_complete keeps the turn's own outcome and adds the marker.
     assert turns["Claw turn 3"]["state"] == "completed"
     assert turns["Claw turn 3"]["markers"] == ["Stop arrived after completion"]
     assert turns["Claw turn 3"]["receipts"] == ["R3"]
+    # A tool-call Stop naming a loaded tool span of that completed turn never
+    # reclassifies it: not the tool span it names (which shares only the turn's
+    # own exact R3), and not — via the shared kestrel.turn_id — the turn above it
+    # (asserted just above: still completed, R3 its only receipt).
+    assert turns["Bash"]["receipts"] == ["R3"]
+    assert turns["Bash"]["state"] != "stopped"
     # disconnected / interrupted / failed are distinct; only failed is error-red.
     states = {name: t["state"] for name, t in turns.items()}
     assert states["Claw turn 4"] == "failed"
     assert states["Claw turn 5"] == "disconnected"
     assert states["Claw turn 6"] == "interrupted"
     assert [n for n, t in turns.items() if t["tone"] == "error"] == ["Claw turn 4"]
-    # Agent scope joins by DID at occurred_at; host scope by each outcome's DID.
-    assert turns["Claw turn 7"]["state"] == "stopped" and turns["Claw turn 7"]["receipts"] == ["R7"]
+    # Agent and host scope are never joined to a turn — not by time, not at all:
+    # the turn states "stopped" from its own span, and the receipt (here written
+    # after the turn summary) is an event on the agent's lane.
+    assert turns["Claw turn 7"]["state"] == "stopped" and turns["Claw turn 7"]["receipts"] == []
     assert turns["Emma turn 1 (Emma)"]["state"] == "stopped"
-    assert turns["Emma turn 1 (Emma)"]["receipts"] == ["RH"]
-    assert turns["Emma turn 1 (Emma)"]["outcomes"] == [["stopped"]]
+    assert turns["Emma turn 1 (Emma)"]["receipts"] == []
     # An outcome this build does not know is shown as such, not mapped.
     assert turns["Claw turn 8"]["state"] == "unrecognized_outcome"
     assert turns["Claw turn 8"]["label"] == 'unrecognized outcome "paused"'
 
     # Rule 2: shuffled, duplicated, reloaded arrival → identical model.
     assert out["shuffled"] == [out["baseJson"]] * 3
+    # The feed position is the server's cursor text, whatever the page order:
+    # caught up, each feed re-reads its tail page from the cursor issued for it.
+    assert out["positions"] == [[["c-stop-2", False], ["c-hold-3", False]]] * 4
+    assert out["partial"] == {
+        "cursor": "c-stop-2",
+        "more": True,
+        "notices": [{"feed": "stop", "status": "loading", "text": "Stop receipts loading older history…"}],
+    }
 
     # A receipt whose span is not loaded yet shows on the lane, then joins it.
     assert "stop:R1:did:key:claw" in out["receiptBeforeSpan"]
     homes = out["base"]["homes"]
     claw_events = [e["id"] for e in homes["Claw"]["events"]]
-    assert "stop:R1:did:key:claw" not in claw_events  # joined to its loaded turn
+    # The exact Stop is also a lane event: the turn's state and the act's time
+    # are two facts, and the lane keeps every Stop.
+    r1 = next(e for e in homes["Claw"]["events"] if e["id"] == "stop:R1:did:key:claw")
+    assert r1["exact"] is True
+    assert "stop:R3:did:key:claw" in claw_events
+    assert "stop:R7:did:key:claw" in claw_events  # the agent-scope Stop, on the lane
+    assert "stop:RT:did:key:claw" in claw_events
+    # The tool-call Stop stays inspectable at its own scope, on its agent's lane.
+    rt = next(e for e in homes["Claw"]["events"] if e["id"] == "stop:RT:did:key:claw")
+    assert rt["disposition"] == "stopped"
     # Per-target partial outcomes stay inspectable on each agent's own lane.
     assert "stop:RH:did:key:claw" in claw_events
     rh_claw = next(e for e in homes["Claw"]["events"] if e["id"] == "stop:RH:did:key:claw")
@@ -441,21 +541,36 @@ def test_render_rules_are_a_pure_function_of_spans_receipts_and_latches(tmp_path
     # never ended the host episode.
     host = synthetic["host"]
     assert host["episodes"] == [{"hold": "H1", "end": None, "open": True, "scope": "host"}]
-    # A receipt with no DID is "agent not recorded" — never an inferred agent.
+    # A receipt with no DID is "agent not recorded" — never an inferred agent —
+    # and so is one whose identity is a placeholder rather than a DID.
     unplaced = synthetic["unplaced"]
     assert unplaced["label"] == "agent not recorded"
-    assert {e["id"] for e in unplaced["events"]} == {"stop:R0:-", "stop:RH:-"}
+    assert {e["id"] for e in unplaced["events"]} == {"stop:R0:-", "stop:RH:-", "stop:RE:-", "stop:RU:-"}
+    assert not any(k in synthetic for k in ("did:host", "did:unresolved"))
+    assert not any(label in homes for label in ("host", "unresolved"))
+    empty_host, unresolved = out["placeholderHtml"]
+    for html in (empty_host, unresolved):
+        assert "</span> agent not recorded</li>" in html
+        assert "</span> host</li>" not in html and "</span> unresolved</li>" not in html
+    assert (
+        '<span class="obs-detail__key">agent</span>'
+        '<span class="obs-detail__value">agent not recorded</span>'
+    ) in unresolved
+    assert "unresolved" not in unresolved
     assert out["base"]["notices"] == []
 
-    # Rule 4: unknown schema_version → unrecognized, turn 2 NOT reclassified.
+    # Rule 4: unknown schema_version → unrecognized; its row (a copy of turn 2's
+    # exact receipt) is never attached to turn 2 or used to classify it.
     unknown = out["unknown"]
-    assert unknown["turns"]["Claw turn 2"]["state"] == "stopped_pending"
+    assert unknown["turns"]["Claw turn 2"]["state"] == "stopped"
+    assert unknown["turns"]["Claw turn 2"]["receipts"] == []
     assert any(l["key"] == "unrecognized" and l["events"] for l in unknown["synthetic"])
     assert unknown["notices"] == [
         {"feed": "stop", "status": "unrecognized", "text": "Stop receipts unrecognized schema_version 2"}
     ]
     malformed = out["malformed"]
-    assert malformed["turns"]["Claw turn 2"]["state"] == "stopped_pending"
+    assert malformed["turns"]["Claw turn 2"]["state"] == "stopped"
+    assert malformed["turns"]["Claw turn 2"]["receipts"] == []
     assert any(l["key"] == "unrecognized" for l in malformed["synthetic"])
 
     assert out["refused"] == [
@@ -468,6 +583,15 @@ def test_render_rules_are_a_pure_function_of_spans_receipts_and_latches(tmp_path
     assert out["clipped"] is True
     assert "ends hold H2" in out["holdHtml"]
     assert out["pendingHtml"] == ""
+
+    # A feed_seq past Number.MAX_SAFE_INTEGER is opaque: a normal lifecycle
+    # event, never malformed, and paging carries the server's cursor verbatim.
+    wide = out["wide"]
+    assert wide["unsafe"] is True
+    assert wide["held"] is True and wide["unrecognized"] == 0
+    assert wide["cursor"] == "9223372036854775806"
+    assert [e["kind"] for e in wide["onLane"]] == ["stop"]
+    assert wide["onLane"][0]["disposition"] == "stopped"
 
 
 _FEED = r"""
@@ -534,6 +658,63 @@ out.drainDone = {
   notices: lifecycleFeedNotices(drained.store),
   updates,
 };
+// A transient failure mid-drain does not strand the rest of a deep history:
+// five pages (the default cap) land, the next reads fail, and the feed keeps
+// retrying on its own — showing the feed unavailable meanwhile — until a read
+// succeeds and the backlog drains. No view tick is involved.
+const deep = [];
+for (let i = 0; i < 1100; i++) {
+  deep.push(stopReceipt(`D${i}`, { scope: "agent", at: NOW, target: "did:key:a", outcomes: [["stopped", null]] }));
+}
+const firstSeq = deep[0].feed_seq - 1;
+let failNextStop = 0;
+const retryCalls = [];
+async function flaky(path) {
+  const url = new URL(path, "http://host");
+  if (url.pathname === "/api/host/hold") return { can_hold: false, host_hold: null, agents: [] };
+  if (url.pathname === "/api/host/hold/receipts") return { schema_version: 1, receipts: [], next_cursor: null };
+  retryCalls.push(url.searchParams.get("cursor"));
+  if (failNextStop > 0) {
+    failNextStop -= 1;
+    throw Object.assign(new Error("Durable Stop evidence is unavailable."), { status: 503 });
+  }
+  const after = Number(url.searchParams.get("cursor") || firstSeq);
+  const limit = Number(url.searchParams.get("limit"));
+  const pageRows = deep.filter((r) => r.feed_seq > after).slice(0, limit + 1);
+  const served = pageRows.slice(0, limit);
+  return {
+    schema_version: 1,
+    receipts: served,
+    next_cursor: pageRows.length > limit ? String(served[served.length - 1].feed_seq) : null,
+  };
+}
+const recoveryUpdates = [];
+const recovering = createLifecycleFeed({
+  request: flaky,
+  backlogMs: 0,
+  retryMaxMs: 4,
+  onUpdate: () =>
+    recoveryUpdates.push({
+      size: recovering.store.stop.size,
+      backlog: lifecycleBacklog(recovering.store),
+      notices: lifecycleFeedNotices(recovering.store),
+    }),
+});
+await recovering.poll();
+out.recoveryFirst = recovering.store.stop.size;
+out.recoveryFirstCalls = retryCalls.length;
+failNextStop = 3;
+await settle(() => recovering.store.stop.size === 1100 && !lifecycleBacklog(recovering.store));
+out.recovery = {
+  size: recovering.store.stop.size,
+  backlog: lifecycleBacklog(recovering.store),
+  notices: lifecycleFeedNotices(recovering.store),
+  updates: recoveryUpdates,
+  retriedCursors: retryCalls.slice(out.recoveryFirstCalls),
+  lastSeq: String(deep[999].feed_seq),
+};
+recovering.destroy();
+
 // A destroyed feed stops draining.
 const stopped = createLifecycleFeed({ request, maxPages: 2, backlogMs: 0, onUpdate: () => {} });
 await stopped.poll();
@@ -556,10 +737,11 @@ def test_feed_pages_on_the_core_cursor_and_reports_failures(tmp_path):
     assert "cursor=" not in first and "limit=200" in first
     assert "cursor=200" in first_seq[1]
     assert out["secondChanged"] is True and out["afterSecond"] == 450
-    # Nothing new: the next poll asks strictly after the newest feed_seq held.
+    # Nothing new: the next poll re-reads the tail page from the cursor the
+    # server issued for it — never a position computed from feed_seq.
     assert out["idleChanged"] is False
     (idle,) = stop_calls(out["idleCalls"])
-    assert "cursor=450" in idle
+    assert "cursor=400" in idle
     assert any(c == "/api/host/hold" for c in out["idleCalls"])
     # A 503 is visible, and the receipts already held stay held.
     assert out["failChanged"] is True
@@ -579,6 +761,29 @@ def test_feed_pages_on_the_core_cursor_and_reports_failures(tmp_path):
     assert out["drainDone"]["updates"] == [{"changed": True, "size": 450}]
     assert out["destroyedSize"] == 400
 
+    # A transient failure after the first five pages: the backlog is retried,
+    # unavailable (and partial) while it fails, and drains once a read succeeds.
+    assert out["recoveryFirst"] == 1000 and out["recoveryFirstCalls"] == 5
+    recovery = out["recovery"]
+    failing = {
+        "size": 1000,
+        "backlog": True,
+        "notices": [
+            {
+                "feed": "stop",
+                "status": "unavailable",
+                "text": "Stop receipts unavailable (HTTP 503) — older history unread, retrying",
+            }
+        ],
+    }
+    assert recovery["updates"][:3] == [failing] * 3
+    assert recovery["updates"][3:] == [{"size": 1100, "backlog": False, "notices": []}]
+    # Every retry resumes from the cursor already held — nothing skipped or re-read.
+    assert recovery["retriedCursors"] == [recovery["lastSeq"]] * 4
+    assert recovery["size"] == 1100
+    assert recovery["backlog"] is False
+    assert recovery["notices"] == []
+
 
 _MOUNTED = r"""
 import { FakeElement, installFakeDom, waitFor } from "./fake-dom.mjs";
@@ -589,14 +794,19 @@ import {
 
 installFakeDom();
 const MIN = 60_000;
-// Claw: turn 1 stopped with its receipt; turn 2 stopped per the span only.
+// Claw: turn 1 stopped with its exact receipt; turn 2 stopped per the span, its
+// Stop an agent-scope receipt written after the turn summary; turn 3 (ended
+// 25m ago) stopped by an exact receipt persisted only 2m ago.
 // DID_IDLE is held and has NO spans at all.
 const spans = [
   ...turnSpans("Claw", DID_CLAW, 1, NOW - 20 * MIN, "stopped"),
   ...turnSpans("Claw", DID_CLAW, 2, NOW - 12 * MIN, "stopped"),
+  ...turnSpans("Claw", DID_CLAW, 3, NOW - 29 * MIN, "stopped"),
 ];
 const receipts = [
   stopReceipt("R1", { scope: "turn", at: NOW - 19 * MIN, target: DID_CLAW, trace: "trace-Claw-1", span: rootId("Claw", 1), outcomes: [["stopped", DID_CLAW]] }),
+  stopReceipt("RA", { scope: "agent", at: NOW - 7 * MIN, target: DID_CLAW, outcomes: [["stopped", null]] }),
+  stopReceipt("R3", { scope: "turn", at: NOW - 2 * MIN, target: DID_CLAW, trace: "trace-Claw-3", span: rootId("Claw", 3), outcomes: [["stopped", DID_CLAW]] }),
 ];
 const holds = [holdReceipt("H4", { action: "hold", scope: "agent", target: DID_IDLE, at: NOW - 25 * MIN, resulting: "H4" })];
 globalThis.__requestHost = async (path) => {
@@ -657,10 +867,67 @@ const click = async (label, wait) => {
   await waitFor(() => pop.innerHTML.includes(wait), `popover for ${label} did not open`);
   return pop.innerHTML;
 };
+// A lane receipt mark: a LIFECYCLE_EVENT_PX-wide rect in its tone's hue.
+const clickLaneEvent = async (receiptId) => {
+  const frame = canvas.context.frames[canvas.context.frames.length - 1];
+  const marks = frame.operations.filter((o) => o.type === "fillRect" && o.fillStyle === "#a855f7" && o.args[2] === 6);
+  for (const m of marks) {
+    const x = m.args[0] + 3;
+    const y = m.args[1] + m.args[3] / 2;
+    const pointer = { button: 0, pointerId: 1, clientX: x, clientY: y, offsetX: x, offsetY: y };
+    canvas.dispatch("pointerdown", pointer);
+    canvas.dispatch("pointerup", pointer);
+    if (pop.innerHTML.includes(`data-receipt-id="${receiptId}"`)) return pop.innerHTML;
+  }
+  return "";
+};
 out.tlTurn1 = await click("turn 1 · 4m 0s · stopped", "R1");
-out.tlTurn2 = await click("turn 2 · 4m 0s · stopped (receipt pending)", "receipt pending");
+out.tlTurn2 = await click("turn 2 · 4m 0s · stopped", 'data-lifecycle-state="stopped"');
 out.tlIdle = await click("⏸ did:key:idle", "H4");
+out.tlRA = await clickLaneEvent("RA");
+// Turn 3's bar is drawn and shows its exact receipt — and the lane keeps the
+// Stop's own mark at occurred_at.
+out.tlR3Drawn = { mark: await clickLaneEvent("R3"), bar: await click("turn 3 · 4m 0s · stopped", "R3") };
 out.tlState = JSON.stringify(timeline.getState());
+// An open popover is a view of the current model: a turn-scope receipt for
+// turn 2 lands while its popover is open, and the popover shows it.
+out.tlTurn2Before = await click("turn 2 · 4m 0s · stopped", 'data-lifecycle-state="stopped"');
+receipts.push(
+  stopReceipt("R2", { scope: "turn", at: NOW - 3 * MIN, target: DID_CLAW, trace: "trace-Claw-2", span: rootId("Claw", 2), outcomes: [["stopped", DID_CLAW]] }),
+);
+tlContainer.querySelector("[data-refresh]").dispatch("click");
+await waitFor(() => pop.innerHTML.includes('data-receipt-id="R2"'), "open popover never showed the late receipt");
+out.tlTurn2After = { html: pop.innerHTML, hidden: pop.hidden };
+// A session band's popover is the same: re-read by the band's identity, so a
+// turn landing in the session updates it, and the band leaving the layout
+// (its project collapsed) closes it.
+const clickBand = async () => {
+  const frame = canvas.context.frames[canvas.context.frames.length - 1];
+  const bands = frame.operations.filter((o) => o.type === "fillRect" && o.fillStyle === "#64748b");
+  for (const b of bands) {
+    const y = b.args[1] + b.args[3] / 2;
+    for (let x = b.args[0] + 1; x < b.args[0] + b.args[2]; x += 2) {
+      const pointer = { button: 0, pointerId: 1, clientX: x, clientY: y, offsetX: x, offsetY: y };
+      canvas.dispatch("pointerdown", pointer);
+      canvas.dispatch("pointerup", pointer);
+      if (pop.innerHTML.includes("session sess-claw")) return pop.innerHTML;
+    }
+  }
+  return "";
+};
+out.tlBandBefore = await clickBand();
+const turn4 = turnSpans("Claw", DID_CLAW, 4, NOW - 5 * MIN, "completed");
+spans.push(...turn4);
+tlContainer.querySelector("[data-refresh]").dispatch("click");
+await waitFor(() => pop.innerHTML !== out.tlBandBefore, "open band popover never re-read its band");
+out.tlBandAfter = { html: pop.innerHTML, hidden: pop.hidden };
+await click("kestrel-fleet", "");
+await waitFor(() => pop.hidden, "band popover stayed open after its band left the layout");
+out.tlBandGone = { html: pop.innerHTML, hidden: pop.hidden };
+spans.splice(spans.length - turn4.length, turn4.length);
+timeline.destroy();
+// The Navigator below states turn 2 as stopped per its span alone.
+receipts.pop();
 timeline.destroy();
 
 // ── Navigator: the same turns through the reveal path ──
@@ -715,13 +982,31 @@ def test_timeline_and_navigator_state_the_same_lifecycle(tmp_path):
     pkg = _module_dir(tmp_path)
     out = _run(pkg, "mounted.mjs", _MOUNTED)
 
-    # Timeline: stopped vs pending, painted and inspectable.
+    # Timeline: both turns stopped; only the exact receipt is attached to a turn.
     assert "turn 1 · 4m 0s · stopped" in out["tlTexts"]
-    assert "turn 2 · 4m 0s · stopped (receipt pending)" in out["tlTexts"]
+    assert "turn 2 · 4m 0s · stopped" in out["tlTexts"]
+    assert not any("receipt pending" in t for t in out["tlTexts"])
     assert 'data-receipt-id="R1"' in out["tlTurn1"]
     assert 'data-lifecycle-state="stopped"' in out["tlTurn1"]
-    assert 'data-lifecycle-state="stopped_pending"' in out["tlTurn2"]
+    assert 'data-lifecycle-state="stopped"' in out["tlTurn2"]
     assert "data-receipt-id" not in out["tlTurn2"]
+    # The agent-scope Stop, persisted after turn 2's summary, is a lane event.
+    assert 'data-receipt-id="RA"' in out["tlRA"]
+    # An exact Stop is shown on its drawn turn bar AND keeps its lane mark.
+    assert 'data-receipt-id="R3"' in out["tlR3Drawn"]["mark"]
+    assert 'data-lifecycle-state="stopped"' not in out["tlR3Drawn"]["mark"]
+    assert 'data-receipt-id="R3"' in out["tlR3Drawn"]["bar"]
+    # A late receipt lands in the popover already open on its turn.
+    assert "data-receipt-id" not in out["tlTurn2Before"]
+    assert 'data-receipt-id="R2"' in out["tlTurn2After"]["html"]
+    assert 'data-lifecycle-state="stopped"' in out["tlTurn2After"]["html"]
+    assert out["tlTurn2After"]["hidden"] is False
+    # A band popover is re-read from the current layout, and closes with it.
+    assert "session sess-claw" in out["tlBandBefore"]
+    assert "session sess-claw" in out["tlBandAfter"]["html"]
+    assert out["tlBandAfter"]["html"] != out["tlBandBefore"]
+    assert out["tlBandAfter"]["hidden"] is False
+    assert out["tlBandGone"] == {"html": "", "hidden": True}
     # The held agent with no spans has a lane and a resting state.
     assert "⏸ did:key:idle" in out["tlTexts"]
     assert "Stop · Hold · Resume" in " ".join(out["tlTexts"])
@@ -731,12 +1016,13 @@ def test_timeline_and_navigator_state_the_same_lifecycle(tmp_path):
     assert 'data-lifecycle-state="stopped"' in out["navTurn1"]["inspector"]
     assert 'data-receipt-id="R1"' in out["navTurn1"]["inspector"]
     assert 'data-lifecycle-state="stopped"' in out["navTurn1"]["tree"]
-    assert 'data-lifecycle-state="stopped_pending"' in out["navTurn2"]["inspector"]
-    assert "stopped (receipt pending)" in out["navTurn2"]["tree"]
+    assert 'data-lifecycle-state="stopped"' in out["navTurn2"]["inspector"]
     assert "data-receipt-id" not in out["navTurn2"]["inspector"]
+    assert "receipt pending" not in out["navTurn2"]["tree"]
     # Turn 2 was never selected, so its trace never loaded: the Turn level's own
-    # outcome read is what lets its row already say "receipt pending".
-    assert "stopped (receipt pending)" in out["navTurn1"]["tree"]
+    # outcome read is what lets its row already say "stopped".
+    turn2_row = next(r for r in out["navTurn1"]["tree"].split('<div class="obs-nav__row') if ">Claw turn 2<" in r)
+    assert 'data-lifecycle-state="stopped"' in turn2_row
     # The shared span detail's `state` IS the lifecycle, in both views — never
     # "completed"/"point event" beside a Stop.
     state_row = (
@@ -775,6 +1061,8 @@ const holdState = {
 };
 let stopRows = [];
 let phoenixUp = false;
+let receiptsRefused = false;
+const refusedFeed = () => Object.assign(new Error("forbidden"), { status: 403 });
 let gqlCalls = 0;
 const stopCursors = [];
 function stopPage(url) {
@@ -795,8 +1083,14 @@ globalThis.__requestHost = async (path) => {
     if (!phoenixUp) throw Object.assign(new Error("phoenix disabled"), { status: 503 });
     return {};
   }
-  if (url.pathname === "/api/host/stop/receipts") return stopPage(url);
-  if (url.pathname === "/api/host/hold/receipts") return { schema_version: 1, receipts: idleHold, next_cursor: null };
+  if (url.pathname === "/api/host/stop/receipts") {
+    if (receiptsRefused) throw refusedFeed();
+    return stopPage(url);
+  }
+  if (url.pathname === "/api/host/hold/receipts") {
+    if (receiptsRefused) throw refusedFeed();
+    return { schema_version: 1, receipts: idleHold, next_cursor: null };
+  }
   if (url.pathname === "/api/host/hold") return holdState;
   throw new Error(`unexpected host path ${path}`);
 };
@@ -925,6 +1219,26 @@ function clickRow(container, label, caret) {
   out.olderTurn = { row: turn1 || null, summaryReads: [...summaryReads] };
   nav.destroy();
 }
+
+// ── 4. Navigator: a selected latch-only holder is released, receipts refused ──
+{
+  receiptsRefused = true;
+  spans = [];
+  const nc = new FakeElement("div");
+  const nav = mountNavigator(nc, {});
+  const inspector = nc.querySelector("[data-inspector]");
+  await waitFor(() => navRows(nc).some((c) => c.includes("Stop · Hold · Resume")), "lifecycle group missing");
+  clickRow(nc, "Stop · Hold · Resume", true);
+  await waitFor(() => navRows(nc).some((c) => c.includes(DID_IDLE)), "latch-only holder missing");
+  clickRow(nc, DID_IDLE, false);
+  await waitFor(() => inspector.innerHTML.includes("held (agent)"), "holder inspector never rendered");
+  out.releaseBefore = inspector.innerHTML;
+  holdState.agents = [];
+  nc.querySelector("[data-refresh]").dispatch("click");
+  await waitFor(() => !navRows(nc).some((c) => c.includes(DID_IDLE)), "released holder never left the tree");
+  out.releaseAfter = { inspector: inspector.innerHTML, notices: nc.querySelector("[data-lifecycle-notices]").innerHTML };
+  nav.destroy();
+}
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -952,5 +1266,14 @@ def test_lifecycle_survives_phoenix_down_and_deep_paging(tmp_path):
     # 3. Turn 1 sits outside the newest 100 summaries, and still shows its outcome;
     # the summaries are read for the loaded roots, at most one batch per read.
     assert out["olderTurn"]["row"] is not None
-    assert "stopped (receipt pending)" in out["olderTurn"]["row"]
+    assert 'data-lifecycle-state="stopped"' in out["olderTurn"]["row"]
     assert out["olderTurn"]["summaryReads"] and max(out["olderTurn"]["summaryReads"]) <= 100
+
+    # 4. A selected holder known only from its latch is released while the
+    # receipt feeds are refused: its node leaves the tree, and the inspector
+    # stops calling it held instead of speaking from the dropped node.
+    assert "held (agent)" in out["releaseBefore"]
+    assert "held" not in out["releaseAfter"]["inspector"]
+    assert "did:key:idle" not in out["releaseAfter"]["inspector"]
+    assert "Select a Turn or Event" in out["releaseAfter"]["inspector"]
+    assert "unavailable" in out["releaseAfter"]["notices"]

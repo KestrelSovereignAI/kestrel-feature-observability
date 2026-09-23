@@ -233,13 +233,19 @@ lifecycle events (#118), through one shared read-model
 same receipt correlation:
 
 - **Sources.** On the same poll as the spans: `GET /api/host/stop/receipts` and
-  `GET /api/host/hold/receipts` (sovereign-gated; paged with the feeds'
-  `cursor` — the last `feed_seq` held — so a receipt committed later can never
+  `GET /api/host/hold/receipts` (sovereign-gated; paged by passing each page's
+  `next_cursor` back verbatim, and a caught-up feed re-reads its tail page from
+  the cursor issued for it, so a receipt committed later is found and can never
   land behind a page already read), plus `GET /api/host/hold` for the current
-  latches. An unreadable or refused feed is shown as a notice, never as "nothing
+  latches. `feed_seq` is opaque: it is never parsed, compared or validated as a
+  number, so a 64-bit position a browser cannot hold exactly still renders as a
+  normal receipt. Receipts are deduplicated by `receipt_id` and ordered by
+  `occurred_at`. An unreadable or refused feed is shown as a notice, never as "nothing
   happened". A poll reads at most five pages per feed; a deeper history keeps
   draining on its own (no Live or Refresh needed) under a "loading older
-  history" notice until it is caught up.
+  history" notice until it is caught up. A page that fails to read keeps that
+  backlog: the feed shows as unavailable and is retried on its own, with a
+  capped doubling delay, until a read succeeds.
 - **Phoenix down.** The receipts and latches are the host's, so they render
   without Phoenix: the "Phoenix is not running" notice sits above the view,
   and a held agent keeps its lane and node while the spans are unavailable.
@@ -247,16 +253,29 @@ same receipt correlation:
   summary` of exactly the roots it has loaded (`parent_id in [...]`), so an
   older Turn paged in with "Load more" shows the same outcome the Timeline does
   before its trace is opened.
-- **Matching.** Receipts decide; spans are matched to them. A turn-scope Stop
-  joins its turn by exact `(trace_id, span_id)` (and every span sharing that
-  turn's `kestrel.turn_id`); an agent- or host-scope Stop joins the agent by DID
-  at `occurred_at` (`target_agent_id` for agent scope, each outcome's own agent
-  for a host fan-out). A receipt with no DID renders as **agent not recorded** —
-  the agent is never inferred.
-- **Turn states.** A `stopped` disposition → **stopped**, receipt inspectable
+- **Matching — exact identity only.** A receipt is attached to a turn only
+  when it names that turn: a turn-scope Stop joins by exact `(trace_id,
+  span_id)` (and every span sharing that turn's `kestrel.turn_id`), and its
+  actor, reason, scope and outcomes are inspectable on the turn. A tool-call
+  Stop may name its tool span, but it stopped that call, not the turn: it never
+  classifies the turn and stays inspectable as an event on its agent. Agent- and
+  host-scope Stops carry only a DID and a time, and are written after the
+  Stop's effects complete — possibly after the turn ended — so they are **lane
+  events**: each sits on its agent's Timeline lane / Navigator node at
+  `occurred_at` (`target_agent_id` for agent scope, each outcome's own agent
+  for a host fan-out) and is never joined to a turn by time. Every Stop keeps
+  its lane mark at `occurred_at`, unconditionally: an exact turn-scope Stop is
+  shown on its turn's bar *and* on the lane — the turn's state and the time of
+  the act are two facts, and nothing else drawn ever hides the mark. Only a `did:`
+  identity is placed; anything else (core's `host` for an empty host Stop,
+  `unresolved`, any future placeholder) or no identity renders as **agent not
+  recorded** — the agent is never inferred.
+- **Turn states.** A turn's stopped state comes from its own span
+  (`kestrel.turn.outcome=stopped`) or an exact receipt whose disposition is
+  `stopped` → **stopped**; the exact receipt, when there is one, is inspectable
   (actor, reason, scope, time, every per-target outcome including
-  `unreachable`). A span that says `stopped` with no receipt yet → **stopped
-  (receipt pending)**, converging when the receipt lands. `already_complete`
+  `unreachable`). A stopped turn with no exact receipt still shows **stopped**;
+  the Stop event on its agent's lane is where the why is. `already_complete`
   keeps the turn's own outcome and adds a "Stop arrived after completion"
   marker. `disconnected`, `interrupted` and `failed` render distinctly; only
   `failed` is error-red.
@@ -266,6 +285,8 @@ same receipt correlation:
   never edits that Hold.
 - **Convergence.** The picture is a pure function of (spans, receipts, latches):
   arrival order, duplicates, late receipts and a reload yield the same model.
+  An open Timeline popover is a view of that model: it is re-rendered for the
+  item it shows after every update, and closes if the item no longer exists.
 - **Unknown data.** A `schema_version` this build does not know renders as
   "unrecognized receipt" and never reclassifies a turn.
 

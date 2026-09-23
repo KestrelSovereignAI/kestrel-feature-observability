@@ -47,11 +47,16 @@ class ObservabilityFeature(Feature):
         return []
 
     async def shutdown(self):
-        """Unsubscribe from turn outcomes, close open spans, drop the hook."""
+        """Unsubscribe from turn outcomes and close open spans.
+
+        The hook reference is kept: the host calls ``shutdown()`` BEFORE it
+        asks ``get_hooks()`` which hooks to unregister, so dropping it here
+        would strand the old hook in the host's HooksManager (a re-enable would
+        then emit every span twice). ``initialize()`` replaces it on re-enable.
+        """
         if self._hook is not None:
             self._hook.unsubscribe_turn_outcomes()
             try:
                 self._hook.close()
             except Exception:  # noqa: BLE001 - teardown must never raise
                 pass
-        self._hook = None

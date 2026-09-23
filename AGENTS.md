@@ -78,10 +78,14 @@ uv run pytest
   a no-op when no OTLP endpoint is configured (exceptions swallowed).
 - Turn outcomes come from core (#118): `ObservabilityFeature.initialize()` registers the hook's
   `on_turn_outcome` through the duck-typed `agent.add_turn_outcome_listener` (and `shutdown()` removes
-  it). While registered, a turn with a canonical `kestrel.turn_id` is closed by that listener — on every
+  it). `shutdown()` keeps `_hook`: the host calls it BEFORE `get_hooks()` to unregister hooks, and
+  `initialize()` replaces it on re-enable. While registered, a turn with a canonical `kestrel.turn_id` is closed by that listener — on every
   exit, stamping `kestrel.turn.outcome` on its summary — not by the SDK `Stop` hook.
 - Lifecycle rendering (#118) lives in `fleet/static/lifecycle.js`, shared by Timeline and Navigator:
-  the Stop/Hold receipts are the only authority for stopped/held/resumed, spans are matched to them, and
-  the render model must stay a pure function of (spans, receipts, latches). Receipt reason/actor are
+  a turn is stopped by its own `kestrel.turn.outcome` or an exact receipt; only a turn-scope receipt joins a turn, by exact
+  `(trace_id, span_id)` (a tool-call Stop naming its tool span never classifies the turn) — agent/host-scope Stops are lane events at `occurred_at`, NEVER time-joined to a turn; every Stop's lane mark is drawn unconditionally (never hidden because its turn's bar or anything else is drawn); an open Timeline popover is re-rendered from the current model after every update (closed if its item is gone);
+  only a `did:` identity is placed (anything else is "agent not recorded"); held/resumed come only from the Hold
+  receipts and latches; `feed_seq` is opaque (paging passes `next_cursor` back verbatim, dedupe is by `receipt_id` — never
+  parse or compare it as a number); and the render model must stay a pure function of (spans, receipts, latches). Receipt reason/actor are
   never copied into spans, view state, URLs or logs; unknown `schema_version`s render as unrecognized.
 - Prometheus metrics use the SDK's shared registry when the optional metrics extra is installed
