@@ -45,7 +45,11 @@
 // history gap, reveal window — is a WALK held in one registry keyed by (project,
 // purpose): capped at MAX_POLL_PAGES per pass, resumed on its own cursor and
 // fixed bounds, and counted as covering its range only once it finishes
-// (#109). Phoenix down → the same friendly notice as the
+// (#109). The Stop/Hold/Resume receipts ride the same poll (./lifecycle.js):
+// a stopped turn paints in the stopped hue (receipt pending: washed + dashed),
+// each agent's home lane carries a lifecycle track of Hold bands and receipt
+// marks, and a held agent with no spans gets its own lane (#118). Phoenix down
+// → the same friendly notice as the
 // Navigator / embed sub-views. Canvas rendering keeps it smooth with thousands
 // of in-window spans.
 
@@ -85,7 +89,24 @@ import {
   renderSpanDetail,
   spanTooltipLines,
   buildNavigatorRevealTarget,
+  phoenixDownNoticeHtml,
 } from "./phoenix.js";
+import {
+  createLifecycleFeed,
+  lifecycleIndex,
+  lifecycleHolders,
+  unplacedEvents,
+  unrecognizedEvents,
+  resolveTurnLifecycles,
+  spanTurnOutcome,
+  renderTurnLifecycleHtml,
+  renderLifecycleEventHtml,
+  renderEpisodeHtml,
+  renderFeedNoticesHtml,
+  lifecycleTooltipLines,
+  holderStateLabel,
+  AGENT_NOT_RECORDED,
+} from "./lifecycle.js";
 
 // ── Tuning ────────────────────────────────────────────────────
 const POLL_MS = 5_000; // live-follow poll cadence
@@ -166,6 +187,32 @@ const HEARTBEAT_LABEL_PX = 56; // a coalesced run at least this wide is labeled
 const VIRTUAL_BAND_ALPHA = 0.07;
 const VIRTUAL_BAND_EDGE_ALPHA = 0.55;
 const VIRTUAL_BAND_DASH = [5, 4];
+
+// Governance lifecycle (#118). The Stop/Hold/Resume receipts (./lifecycle.js)
+// decide these states; the Timeline only paints them. Keyed by the shared
+// lifecycle TONE so the Navigator's pills and these fills name the same state.
+// Only `failed` is error-red: a stop is an operator act, a disconnect a reader
+// walking away, an interruption neither — none of them is a defect.
+const LIFECYCLE_COLORS = {
+  stopped: "#a855f7",
+  pending: "#a855f7",
+  error: ERROR_COLOR,
+  disconnected: "#fb923c",
+  interrupted: "#78716c",
+  unreachable: "#e879f9",
+  refused: "#fda4af",
+  already_complete: "#94a3b8",
+  unrecognized: "#9ca3af",
+  hold: "#60a5fa",
+  resume: "#4ade80",
+};
+const LIFECYCLE_EVENT_PX = 6; // one Stop/Hold/Resume receipt's paint width
+const LIFECYCLE_PENDING_ALPHA = 0.5; // "stopped (receipt pending)" — same hue, not yet witnessed
+const LIFECYCLE_PENDING_DASH = [3, 3];
+// The synthetic group holding lifecycle lanes no span lane can carry: the host
+// latch, held agents with no spans loaded, receipts that name no agent, and
+// unrecognized receipts.
+const LIFECYCLE_GROUP = "Stop · Hold · Resume";
 
 // The marker / tool-outcome contract lives in phoenix.js (imported above), so the
 // Timeline's pairing rules and the shared detail model read the SAME keys:
@@ -432,6 +479,9 @@ function summaryStats(sum) {
   return {
     kind: isSessionSummary(sum) ? "session" : "turn",
     ...shared,
+    // How the turn ENDED, as core computed it (#118) — joined to the receipts
+    // by `annotateLifecycle`, never read as the authority for "stopped".
+    turnOutcome: spanTurnOutcome(sum.attrs),
     end: sum.end,
   };
 }
@@ -779,6 +829,101 @@ export function annotateRenderModel(spanIter, nowMs) {
   }
 
   return list;
+}
+
+// ── Governance lifecycle (#118) ────────────────────────────────
+//
+// Resolve every loaded span's lifecycle against the receipt index — the SAME
+// `resolveTurnLifecycles` the Navigator runs, so both views state one fact. A
+// span's reported outcome is its own `kestrel.turn.outcome`, else the one on its
+// folded `turn <n> summary` (step 1 of `annotateRenderModel`, which must run
+// first). Sets `rLifecycle` (null: nothing to say). Pure + exported for tests.
+export function annotateLifecycle(spanIter, index, nowMs) {
+  const list = [...spanIter];
+  const turns = [];
+  for (const s of list) {
+    s.rLifecycle = null;
+    if (s.rHide) continue;
+    const folded = s.rSummary && s.rSummary.kind === "turn" ? s.rSummary.turnOutcome : null;
+    const turnId = getAttr(s.attrs, "kestrel.turn_id");
+    turns.push({
+      key: s.id,
+      traceId: s.traceId,
+      spanId: s.spanId,
+      turnId: turnId != null && turnId !== "" ? String(turnId) : null,
+      agentDid: s.agentDid,
+      outcome: spanTurnOutcome(s.attrs) ?? folded,
+      startMs: s.start,
+      endMs: s.rOpen ? nowMs : s.rEnd != null ? s.rEnd : s.end,
+    });
+  }
+  const resolved = resolveTurnLifecycles(index, turns);
+  for (const s of list) {
+    if (resolved.has(s.id)) s.rLifecycle = resolved.get(s.id);
+  }
+  return list;
+}
+
+// Which lane carries each lifecycle holder, plus the rows no span lane can
+// carry. An agent's Stop/Hold/Resume receipts land on its HOME lane — its plain
+// (un-orchestrated, worker-less) lane, keyed by the stable `did:` identity the
+// lanes already use — in every project it has one. A holder with no lane gets a
+// synthetic one, so a held agent is visible even with no spans loaded. A Stop
+// joined exactly to a loaded span is shown on that span, not repeated on the
+// lane. Pure + exported for tests: `lanesByProject` is `laneGroups()` output.
+export function lifecycleLaneModel(lanesByProject, index, loadedExactKeys) {
+  const shown = (ev) =>
+    !(
+      ev.kind === "stop" &&
+      ev.exact &&
+      loadedExactKeys.has(`${ev.receipt.traceId} ${ev.receipt.spanId}`)
+    );
+  const homes = new Map(); // lane object → lifecycle
+  const synthetic = [];
+  for (const holder of lifecycleHolders(index)) {
+    const lifecycle = {
+      holder,
+      episodes: holder.episodes,
+      events: holder.events.filter(shown),
+    };
+    let placed = false;
+    if (holder.did != null) {
+      for (const lanes of lanesByProject.values()) {
+        const mine = lanes.filter(
+          (l) => l.worker == null && l.agentIdentity === `did:${holder.did}`,
+        );
+        const home = mine.find((l) => l.orchestrator == null) || mine[0];
+        if (home) {
+          homes.set(home, lifecycle);
+          placed = true;
+        }
+      }
+    }
+    if (!placed) {
+      synthetic.push({
+        key: holder.key,
+        label: holder.did != null ? holder.did : "host (every agent)",
+        lifecycle,
+      });
+    }
+  }
+  const unplaced = unplacedEvents(index).filter(shown);
+  if (unplaced.length) {
+    synthetic.push({
+      key: "unplaced",
+      label: AGENT_NOT_RECORDED,
+      lifecycle: { holder: null, episodes: [], events: unplaced },
+    });
+  }
+  const unrecognized = unrecognizedEvents(index);
+  if (unrecognized.length) {
+    synthetic.push({
+      key: "unrecognized",
+      label: "unrecognized receipts",
+      lifecycle: { holder: null, episodes: [], events: unrecognized },
+    });
+  }
+  return { homes, synthetic };
 }
 
 // Live-poll re-fetch floor per project: the EARLIEST start among still-open
@@ -1479,6 +1624,21 @@ export function mount(container, opts = {}) {
   const viewStart = () => viewEnd - windowMs;
 
   // ── Data ──
+  // Stop/Hold/Resume receipts + current latches (#118), polled on the same tick
+  // as the spans. Only the receipts decide a lifecycle; spans are matched to them.
+  // A receipt history deeper than one poll's page cap keeps draining on its own
+  // and repaints as it lands.
+  const lifecycle = createLifecycleFeed({
+    onUpdate(changed) {
+      if (!changed || destroyed || !booted) return;
+      buildLayout();
+      requestDraw();
+    },
+  });
+  // Phoenix could not be reached at boot: the host-served lifecycle still
+  // renders (a held agent must never vanish with the span store), and the
+  // span walks stay off until a Retry remounts the view.
+  let phoenixDown = false;
   const spans = new Map(); // Phoenix node id → normalized span
   // Incremental parent-link indexes, maintained on every merge/prune so the
   // layout can rebuild the span tree cheaply and tolerate orphans (children
@@ -1523,6 +1683,8 @@ export function mount(container, opts = {}) {
         <button type="button" class="obs-tl__btn" data-zoomin title="Zoom in (shorter window)">+</button>
         <button type="button" class="obs-tl__btn" data-refresh title="Poll now">Refresh</button>
       </div>
+      <div class="obs-tl__notices" data-lifecycle-notices></div>
+      <div class="obs-tl__phoenix" data-phoenix-notice></div>
       <div class="obs-tl__body" data-body>
         <canvas class="obs-tl__canvas" data-canvas></canvas>
         <div class="obs-tl__tip" data-tip hidden></div>
@@ -1538,6 +1700,8 @@ export function mount(container, opts = {}) {
   const revealNoticeEl = container.querySelector("[data-reveal-notice]");
   const liveBtn = container.querySelector("[data-live]");
   const windowEl = container.querySelector("[data-window]");
+  const noticesEl = container.querySelector("[data-lifecycle-notices]");
+  const phoenixNoticeEl = container.querySelector("[data-phoenix-notice]");
   const ctx = canvas.getContext("2d");
 
   let cssW = 0;
@@ -2268,6 +2432,15 @@ export function mount(container, opts = {}) {
   let polling = false;
   async function pollTick(manual) {
     if (destroyed || polling || (!manual && document.hidden)) return;
+    if (phoenixDown) {
+      // No span store to walk — but the receipts and latches are the host's, and
+      // they keep landing (#118).
+      if ((await lifecycle.poll()) && !destroyed) {
+        buildLayout();
+        requestDraw();
+      }
+      return;
+    }
     if (historyPassOwed()) loadHistory();
     // Paused, the timer starts no NEW live walk — but one already truncated
     // mid-backlog (a boot-time fill deeper than MAX_POLL_PAGES, a pause that
@@ -2281,22 +2454,34 @@ export function mount(container, opts = {}) {
       // an owed resolve is spent here too — this early return is the only thing a
       // paused tick runs, and it is exactly the mode this bug is hit in (#108).
       settleAncestorResolve();
+      // Receipts keep arriving while the view is paused — a Stop, Hold or
+      // Resume on history the operator is looking at must still land (#118).
+      if ((await lifecycle.poll()) && !destroyed) {
+        buildLayout();
+        requestDraw();
+      }
       return;
     }
     polling = true;
     let added = 0;
     try {
-      if (revealPending) await continueReveal();
-      for (const p of projects) {
-        if (destroyed) break;
-        // Re-read `live` per project rather than once per tick: a pause landing
-        // mid-tick stops fresh walks from here on, while a pending walk keeps
-        // draining.
-        if (!manual && !live && !pendingWalk(WALK_LIVE, p.id)) continue;
-        added += await pollProject(p.id, p.name);
+      try {
+        if (revealPending) await continueReveal();
+        for (const p of projects) {
+          if (destroyed) break;
+          // Re-read `live` per project rather than once per tick: a pause landing
+          // mid-tick stops fresh walks from here on, while a pending walk keeps
+          // draining.
+          if (!manual && !live && !pendingWalk(WALK_LIVE, p.id)) continue;
+          added += await pollProject(p.id, p.name);
+        }
+      } catch (_e) {
+        /* transient poll errors are non-fatal — next tick retries */
       }
-    } catch (_e) {
-      /* transient poll errors are non-fatal — next tick retries */
+      // The receipts ride the same poll as the spans but not the same fate: a
+      // failed Phoenix page must not also cost the lifecycle. The rebuild below
+      // joins them, so a receipt landing before or after its span converges (#118).
+      if (!destroyed) await lifecycle.poll();
     } finally {
       polling = false;
     }
@@ -2622,7 +2807,9 @@ export function mount(container, opts = {}) {
   // single-span trace is just a plain bar at band level. Sessions stack in
   // start-time order — concurrent sessions own disjoint track ranges and can
   // never interleave (the bug this kills). Lane height = Σ per-session tracks.
-  function laneBands(laneItems, nowMs) {
+  // `baseTracks` reserves the lane's top tracks — the lifecycle track (#118) —
+  // so session bands stack below it.
+  function laneBands(laneItems, nowMs, baseTracks = 0) {
     // Marker↔twin pairing and summary folding are resolved up front in
     // `annotateRenderModel` (rHide spans are already filtered out in buildLayout),
     // so a lane's items are just what should paint.
@@ -2660,7 +2847,7 @@ export function mount(container, opts = {}) {
     const outItems = [];
     const sessionBands = [];
     const envelopes = [];
-    let laneTracks = 0;
+    let laneTracks = baseTracks;
     for (const members of ordered) {
       const band = buildBand(members, nowMs);
       const offset = laneTracks;
@@ -2711,6 +2898,15 @@ export function mount(container, opts = {}) {
     // Bucket by project → agent (nested under its orchestrator) → worker, in
     // render order with each lane's level already assigned (#101).
     const byProject = laneGroups(spans.values());
+    // Join the receipts: each span's lifecycle, then each holder's lane (#118).
+    const index = lifecycleIndex(lifecycle.store);
+    annotateLifecycle(spans.values(), index, nowMs);
+    const loadedExactKeys = new Set();
+    for (const s of spans.values()) {
+      if (s.traceId && s.spanId) loadedExactKeys.add(`${s.traceId} ${s.spanId}`);
+    }
+    const lifecycleLanes = lifecycleLaneModel(byProject, index, loadedExactKeys);
+    if (noticesEl) noticesEl.innerHTML = renderFeedNoticesHtml(lifecycle.store);
 
     // Order projects: known projects first (DEFAULT_PROJECT, then repos), then
     // any leftover names present in spans but not in the projects list.
@@ -2720,6 +2916,37 @@ export function mount(container, opts = {}) {
 
     const rows = [];
     let y = RULER_H;
+    // Lifecycle lanes no span lane can carry come FIRST: a held agent with no
+    // spans, the host latch, and any receipt that names no agent must be seen.
+    if (lifecycleLanes.synthetic.length) {
+      const isCollapsed = collapsed.has(LIFECYCLE_GROUP);
+      rows.push({ type: "project", name: LIFECYCLE_GROUP, projectId: null, collapsed: isCollapsed, y, h: PROJECT_H });
+      y += PROJECT_H;
+      if (!isCollapsed) {
+        for (const lane of lifecycleLanes.synthetic) {
+          const h = TRACK_H + 2 * LANE_VPAD;
+          rows.push({
+            type: "lane",
+            projectName: LIFECYCLE_GROUP,
+            projectId: null,
+            agentIdentity: lane.key,
+            agent: lane.label,
+            orchestrator: null,
+            worker: null,
+            label: lane.label,
+            level: 1,
+            items: [],
+            sessionBands: [],
+            envelopes: [],
+            tracks: 1,
+            lifecycle: lane.lifecycle,
+            y,
+            h,
+          });
+          y += h;
+        }
+      }
+    }
     for (const name of orderedNames) {
       const projId = (projects.find((p) => p.name === name) || {}).id || null;
       const isCollapsed = collapsed.has(name);
@@ -2728,7 +2955,8 @@ export function mount(container, opts = {}) {
       if (isCollapsed) continue;
 
       for (const lane of byProject.get(name)) {
-        const band = laneBands(lane.items, nowMs);
+        const laneLifecycle = lifecycleLanes.homes.get(lane) || null;
+        const band = laneBands(lane.items, nowMs, laneLifecycle ? 1 : 0);
         const h = band.tracks * TRACK_H + 2 * LANE_VPAD;
         rows.push({
           type: "lane",
@@ -2744,6 +2972,7 @@ export function mount(container, opts = {}) {
           sessionBands: band.sessionBands,
           envelopes: band.envelopes,
           tracks: band.tracks,
+          lifecycle: laneLifecycle,
           y,
           h,
         });
@@ -2891,7 +3120,12 @@ export function mount(container, opts = {}) {
     ctx.font = row.level >= 2 ? "11px system-ui, sans-serif" : "12px system-ui, sans-serif";
     ctx.textBaseline = "middle";
     const labelX = 10 + (row.level - 1) * SUBLANE_INDENT;
-    ctx.fillText(truncLabel(row.label, GUTTER_W - labelX - 6), labelX, y + row.h / 2);
+    // A held agent (or host) reads as held from the gutter alone — its resting
+    // state needs no span in the window (#118).
+    const holder = row.lifecycle && row.lifecycle.holder;
+    const label = holder && holder.held ? `⏸ ${row.label}` : row.label;
+    ctx.fillText(truncLabel(label, GUTTER_W - labelX - 6), labelX, y + row.h / 2);
+    if (row.lifecycle) drawn.push({ x: 0, y, w: GUTTER_W, h: row.h, laneLifecycle: row });
 
     // Lane separator.
     ctx.strokeStyle = theme.border;
@@ -2917,6 +3151,45 @@ export function mount(container, opts = {}) {
       return { cx, w, ry, rh };
     };
     const onScreen = (startT, endT, open) => !((open ? rightT : endT) < vs || startT > ve);
+
+    // 0. The lifecycle track (#118): Hold episodes as bands — an open one runs
+    //    to the right edge, the agent's resting state — and every Stop / Hold /
+    //    Resume receipt as its own mark at `occurred_at`. A Resume is a separate
+    //    mark that ends the band; it never repaints the Hold mark.
+    if (row.lifecycle) {
+      const ry = y + LANE_VPAD;
+      const bh = TRACK_H - 2;
+      for (const ep of row.lifecycle.episodes) {
+        if (!Number.isFinite(ep.startMs)) continue;
+        const endT = ep.open ? rightT : Number.isFinite(ep.endMs) ? ep.endMs : ep.startMs;
+        if (!onScreen(ep.startMs, endT, ep.open)) continue;
+        const r = rectFor(ep.startMs, endT, ep.open, 0, 1);
+        const w = Math.max(LIFECYCLE_EVENT_PX, r.w);
+        ctx.fillStyle = LIFECYCLE_COLORS.hold;
+        ctx.globalAlpha = 0.28;
+        ctx.fillRect(r.cx, ry, w, bh);
+        ctx.globalAlpha = 1;
+        ctx.fillRect(r.cx, ry, 2, bh);
+        if (w > 46) {
+          ctx.fillStyle = theme.text;
+          ctx.font = "10px system-ui, sans-serif";
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(r.cx, ry, w, bh);
+          ctx.clip();
+          ctx.fillText(`⏸ held · ${ep.scope}`, r.cx + 4, ry + bh / 2);
+          ctx.restore();
+        }
+        drawn.push({ x: r.cx, y: ry, w, h: bh, episode: ep });
+      }
+      for (const ev of row.lifecycle.events) {
+        if (!Number.isFinite(ev.atMs) || ev.atMs < vs || ev.atMs > ve) continue;
+        const x = Math.max(GUTTER_W, timeToX(ev.atMs) - LIFECYCLE_EVENT_PX / 2);
+        ctx.fillStyle = LIFECYCLE_COLORS[ev.tone] || LIFECYCLE_COLORS.unrecognized;
+        ctx.fillRect(x, ry, LIFECYCLE_EVENT_PX, bh);
+        drawn.push({ x: x - 2, y: ry, w: LIFECYCLE_EVENT_PX + 4, h: bh, lifecycleEvent: ev });
+      }
+    }
 
     // 1. Session bands FIRST — the lightest, outermost envelope. Pushed to
     //    drawn[] before everything so real spans (drawn later) win the topmost
@@ -2973,9 +3246,8 @@ export function mount(container, opts = {}) {
       const r = rectFor(e.start, e.end, e.open, e.trackTop, e.trackCount);
       ctx.fillStyle = e.span.rAbandoned
         ? ABANDONED_FILL
-        : e.span.status === "error"
-          ? ERROR_COLOR
-          : kindColor(e.span.kind);
+        : lifecycleColor(e.span) ||
+          (e.span.status === "error" ? ERROR_COLOR : kindColor(e.span.kind));
       ctx.globalAlpha = 0.14 + Math.min(0.16, e.depth * 0.05);
       ctx.fillRect(r.cx, r.ry, r.w, r.rh);
       ctx.globalAlpha = 1;
@@ -3142,17 +3414,40 @@ export function mount(container, opts = {}) {
         flush();
         if (tick) {
           // Instant event → a 2px tick (track-assigned inside its parent band).
-          ctx.fillStyle = s.status === "error" ? ERROR_COLOR : kindColor(s.kind);
+          ctx.fillStyle =
+            lifecycleColor(s) || (s.status === "error" ? ERROR_COLOR : kindColor(s.kind));
           ctx.fillRect(cx, ry, 2, bh);
           drawHighlightRect(cx - 2, ry, 6, bh, s);
           drawn.push({ x: cx - 2, y: ry, w: 6, h: bh, span: s });
           continue;
         }
-        ctx.fillStyle = kindColor(s.kind);
-        ctx.fillRect(cx, ry, w, bh);
+        const lc = s.rLifecycle;
+        const lcColor = lifecycleColor(s);
+        if (lc && lc.tone === "pending") {
+          // Stopped per the span, not yet witnessed by a receipt: the stopped
+          // hue, washed and dashed, until the receipt lands.
+          ctx.fillStyle = lcColor;
+          ctx.globalAlpha = LIFECYCLE_PENDING_ALPHA;
+          ctx.fillRect(cx, ry, w, bh);
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = lcColor;
+          ctx.lineWidth = 1;
+          ctx.setLineDash(LIFECYCLE_PENDING_DASH);
+          ctx.strokeRect(cx + 0.5, ry + 0.5, Math.max(1, w - 1), Math.max(1, bh - 1));
+          ctx.setLineDash([]);
+        } else {
+          ctx.fillStyle = lcColor || kindColor(s.kind);
+          ctx.fillRect(cx, ry, w, bh);
+        }
         if (s.status === "error") {
           ctx.fillStyle = ERROR_COLOR;
           ctx.fillRect(cx, ry, w, 2);
+        }
+        if (lc && lc.markers.length) {
+          // "Stop arrived after completion" / refused / unreachable: the turn
+          // keeps its own outcome; the Stop is marked, not substituted.
+          ctx.fillStyle = LIFECYCLE_COLORS.stopped;
+          ctx.fillRect(cx, ry + bh - 2, w, 2);
         }
         if (open) {
           // Still-running / provisional: a bright cap at the live right edge.
@@ -3172,13 +3467,32 @@ export function mount(container, opts = {}) {
           ctx.beginPath();
           ctx.rect(cx, ry, w, bh);
           ctx.clip();
-          ctx.fillText(s.rLabel || s.name, cx + 3, ry + bh / 2);
+          ctx.fillText(lifecycleBarLabel(s), cx + 3, ry + bh / 2);
           ctx.restore();
         }
         drawn.push({ x: cx, y: ry, w, h: bh, span: s });
       }
       flush();
     }
+  }
+
+  // The fill a span's lifecycle paints it, else null (keep the kind color). A
+  // plainly completed turn keeps its kind color — only the exits that are NOT a
+  // normal completion recolor the bar.
+  function lifecycleColor(s) {
+    const lc = s.rLifecycle;
+    if (!lc || !lc.tone || lc.tone === "ok") return null;
+    return LIFECYCLE_COLORS[lc.tone] || LIFECYCLE_COLORS.unrecognized;
+  }
+
+  function lifecycleBarLabel(s) {
+    const base = s.rLabel || s.name;
+    const lc = s.rLifecycle;
+    if (!lc) return base;
+    const parts = [base];
+    if (lc.label && lc.tone !== "ok") parts.push(lc.label);
+    for (const m of lc.markers) parts.push(m);
+    return parts.join(" · ");
   }
 
   function drawEmpty() {
@@ -3264,6 +3578,7 @@ export function mount(container, opts = {}) {
     return normalizeSpanDetail(s, {
       sessionId: resolveSessionId(s),
       members: memberRollupCached(s),
+      lifecycle: s.rLifecycle || undefined,
     });
   }
 
@@ -3296,10 +3611,10 @@ export function mount(container, opts = {}) {
     );
   }
 
-  function tipHtml(detail) {
+  function tipHtml(detail, lifecycleState = null) {
     return (
       `<b>${escapeHtml(detail.displayName)}</b>` +
-      spanTooltipLines(detail)
+      [...spanTooltipLines(detail), ...lifecycleTooltipLines(lifecycleState)]
         .map(
           ({ text, tone }) =>
             `<div class="${tone === "warn" ? "obs-tl__tipwarn" : "obs-tl__tipdim"}">` +
@@ -3328,7 +3643,23 @@ export function mount(container, opts = {}) {
       // renders — role/outcome/feature/orchestrator/run/turn, and for a
       // container what it covers — instead of the old generic
       // "<name> / AGENT / instant / ok" (#88).
-      html = tipHtml(spanDetail(d.span));
+      html = tipHtml(spanDetail(d.span), d.span.rLifecycle);
+    } else if (d.lifecycleEvent) {
+      const ev = d.lifecycleEvent;
+      html =
+        `<b>${escapeHtml(ev.label)}</b>` +
+        (Number.isFinite(ev.atMs)
+          ? `<div class="obs-tl__tipdim">${escapeHtml(fmtClock(ev.atMs, true))}</div>`
+          : "");
+    } else if (d.episode) {
+      html =
+        `<b>⏸ held · ${escapeHtml(d.episode.scope)}</b>` +
+        `<div class="obs-tl__tipdim">${escapeHtml(d.episode.open ? "held now" : "released")}</div>`;
+    } else if (d.laneLifecycle) {
+      const holder = d.laneLifecycle.lifecycle.holder;
+      html =
+        `<b>${escapeHtml(d.laneLifecycle.label)}</b>` +
+        (holder ? `<div class="obs-tl__tipdim">${escapeHtml(holderStateLabel(holder))}</div>` : "");
     } else {
       hideTip();
       return;
@@ -3391,7 +3722,7 @@ export function mount(container, opts = {}) {
         <span class="obs-tl__ptitle" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
         <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
       </div>
-      <div class="obs-tl__pbody">${renderSpanDetail(detail, { rawAttributes: false })}</div>
+      <div class="obs-tl__pbody">${renderTurnLifecycleHtml(s.rLifecycle)}${renderSpanDetail(detail, { rawAttributes: false })}</div>
       <div class="obs-tl__pfoot">
         ${canNav ? `<button type="button" class="obs-tl__plink" data-pnav>Open in Navigator</button>` : ""}
         ${canPhx ? `<button type="button" class="obs-tl__plink" data-pphx>Open in Phoenix</button>` : ""}
@@ -3456,6 +3787,39 @@ export function mount(container, opts = {}) {
     popEl.style.top = `${y}px`;
     const closeBtn = popEl.querySelector("[data-pclose]");
     if (closeBtn) closeBtn.addEventListener("click", hidePopover);
+  }
+
+  // A lifecycle popover: one receipt, one hold episode, or a lane's whole
+  // lifecycle (its resting state, then every receipt in order) (#118).
+  function showLifecyclePopover(title, bodyHtml, clientX, clientY) {
+    popEl.innerHTML = `
+      <div class="obs-tl__phead">
+        <span class="obs-tl__ptitle" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+        <button type="button" class="obs-tl__pclose" data-pclose aria-label="Close">✕</button>
+      </div>
+      <div class="obs-tl__pbody" data-lifecycle-popover>${bodyHtml}</div>`;
+    popEl.hidden = false;
+    const rect = bodyEl.getBoundingClientRect();
+    let x = clientX - rect.left + 12;
+    let y = clientY - rect.top + 12;
+    const pw = popEl.offsetWidth;
+    const ph = popEl.offsetHeight;
+    if (x + pw > cssW) x = Math.max(2, cssW - pw - 4);
+    if (y + ph > cssH) y = Math.max(2, cssH - ph - 4);
+    popEl.style.left = `${x}px`;
+    popEl.style.top = `${y}px`;
+    const closeBtn = popEl.querySelector("[data-pclose]");
+    if (closeBtn) closeBtn.addEventListener("click", hidePopover);
+  }
+
+  function laneLifecycleHtml(row) {
+    const lc = row.lifecycle;
+    const holder = lc.holder;
+    const state = holder
+      ? `<div class="obs-lifecycle__head"><span class="obs-lifecycle__pill obs-lifecycle__pill--${holder.held ? "hold" : "ok"}">${escapeHtml(holderStateLabel(holder))}</span></div>`
+      : "";
+    const current = lc.episodes.filter((e) => e.open).map(renderEpisodeHtml).join("");
+    return `<div class="obs-lifecycle">${state}${current}${lc.events.map(renderLifecycleEventHtml).join("")}</div>`;
   }
 
   // ── Interaction ──
@@ -3549,7 +3913,7 @@ export function mount(container, opts = {}) {
     }
     // Hover → tooltip.
     const d = hitTest(e.offsetX, e.offsetY);
-    if (d && (d.span || d.density)) {
+    if (d && (d.span || d.density || d.lifecycleEvent || d.episode || d.laneLifecycle)) {
       canvas.style.cursor = "pointer";
       showTip(d, e.clientX, e.clientY);
     } else if (d && d.band) {
@@ -3595,6 +3959,23 @@ export function mount(container, opts = {}) {
       // Every band opens its session popover: even without folded summary stats
       // it names the session and reports what it covers (#88).
       showBandPopover(d.band, clientX, clientY);
+      return;
+    }
+    if (d.lifecycleEvent) {
+      showLifecyclePopover(
+        d.lifecycleEvent.label,
+        renderLifecycleEventHtml(d.lifecycleEvent),
+        clientX,
+        clientY,
+      );
+      return;
+    }
+    if (d.episode) {
+      showLifecyclePopover(`Hold · ${d.episode.scope}`, renderEpisodeHtml(d.episode), clientX, clientY);
+      return;
+    }
+    if (d.laneLifecycle) {
+      showLifecyclePopover(d.laneLifecycle.label, laneLifecycleHtml(d.laneLifecycle), clientX, clientY);
       return;
     }
     if (d.density) {
@@ -3663,17 +4044,9 @@ export function mount(container, opts = {}) {
   let pollTimer = null;
 
   function renderNotice() {
-    if (destroyed || !bodyEl) return;
-    bodyEl.innerHTML = `
-      <div class="obs-notice">
-        <div class="obs-notice__title">Phoenix is not running on this host</div>
-        <div class="obs-notice__body">
-          Install <code>kestrel-sovereign[phoenix]</code> and restart, or set
-          <code>KESTREL_PHOENIX_ENABLED=1</code>.
-        </div>
-        <button type="button" class="obs-tl__btn" data-retry>Retry</button>
-      </div>`;
-    const retry = bodyEl.querySelector("[data-retry]");
+    if (destroyed || !phoenixNoticeEl) return;
+    phoenixNoticeEl.innerHTML = phoenixDownNoticeHtml("obs-tl__btn");
+    const retry = phoenixNoticeEl.querySelector("[data-retry]");
     if (retry) {
       retry.addEventListener("click", () => {
         if (destroyed) return;
@@ -3689,26 +4062,29 @@ export function mount(container, opts = {}) {
   }
 
   async function boot() {
-    try {
-      await mintPhoenixSession();
-    } catch (_e) {
-      renderNotice();
-      return;
-    }
-    if (destroyed) return;
     readTheme();
     resizeCanvas();
     requestDraw();
     try {
+      await mintPhoenixSession();
+      if (destroyed) return;
       await loadProjects();
     } catch (_e) {
+      // Phoenix down costs the spans, not the lifecycle: the notice goes above
+      // the canvas and the boot carries on with the receipts alone (#118).
+      phoenixDown = true;
       renderNotice();
-      return;
     }
     if (destroyed) return;
     try {
-      if (revealTarget) {
-        await loadRevealWindow();
+      if (phoenixDown) {
+        await lifecycle.poll();
+      } else if (revealTarget) {
+        try {
+          await loadRevealWindow();
+        } finally {
+          await lifecycle.poll();
+        }
       } else {
         await pollTick(true); // initial fill of the visible window
       }
@@ -3718,15 +4094,18 @@ export function mount(container, opts = {}) {
     }
     if (destroyed) return;
     buildLayout();
-    // Only a SETTLED reveal gets to report — a walk the page cap cut short is
-    // still owed, and the poll timer below finishes it and reports then (#109).
-    if (revealTarget && !revealPending) finishReveal();
-    // Whatever the initial load pulled, the run/turn roots above it may have
-    // started before the window and be missing entirely, and there is no gesture
-    // coming to trigger a resolve — opening the panel mid-run is the other way
-    // this bug is hit. So arm the obligation: it is spent here if the fill above
-    // actually settled, and otherwise on whichever tick finishes it (#108).
-    armAncestorResolve();
+    if (!phoenixDown) {
+      // Only a SETTLED reveal gets to report — a walk the page cap cut short is
+      // still owed, and the poll timer below finishes it and reports then (#109).
+      if (revealTarget && !revealPending) finishReveal();
+      // Whatever the initial load pulled, the run/turn roots above it may have
+      // started before the window and be missing entirely, and there is no
+      // gesture coming to trigger a resolve — opening the panel mid-run is the
+      // other way this bug is hit. So arm the obligation: it is spent here if the
+      // fill above actually settled, and otherwise on whichever tick finishes it
+      // (#108).
+      armAncestorResolve();
+    }
     pollTimer = setInterval(() => pollTick(false), POLL_MS);
     booted = true;
     // `live` is `!revealTarget` unless setState() restored a paused window
@@ -3798,6 +4177,7 @@ export function mount(container, opts = {}) {
 
   function teardown() {
     destroyed = true;
+    lifecycle.destroy();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -3838,6 +4218,9 @@ function ensureStyles() {
     .obs-tl__toolbar { display:flex; align-items:center; gap:8px; padding:6px 12px;
                        border-bottom:1px solid var(--color-border,#334155); }
     .obs-tl__title { font-weight:600; }
+    .obs-tl__notices { display:flex; flex-wrap:wrap; gap:4px 12px; padding:3px 12px;
+                       border-bottom:1px solid var(--color-border,#334155); }
+    .obs-tl__notices:empty { display:none; }
     .obs-tl__grow { flex:1; }
     .obs-tl__window { min-width:52px; text-align:center; font-size:12px; font-variant-numeric:tabular-nums;
                       color:var(--color-text-muted,#94a3b8); }
@@ -3897,6 +4280,11 @@ function ensureStyles() {
     .obs-tl .obs-notice__body { max-width:520px; line-height:1.5; }
     .obs-tl .obs-notice code { font-family:ui-monospace,monospace; background:var(--color-surface,#1e293b);
                                border:1px solid var(--color-border,#334155); border-radius:4px; padding:1px 5px; }
+    .obs-tl__phoenix:empty { display:none; }
+    .obs-tl .obs-notice--strip { position:static; flex-direction:row; flex-wrap:wrap; justify-content:flex-start;
+                                 gap:4px 12px; padding:6px 12px; text-align:left;
+                                 border-bottom:1px solid var(--color-border,#334155); }
+    .obs-tl .obs-notice--strip .obs-notice__title { font-size:13px; }
   `;
   document.head.appendChild(style);
   stylesInjected = true;

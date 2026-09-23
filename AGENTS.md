@@ -18,9 +18,12 @@ kestrel-feature-observability/
 │       ├── feature.py           # FleetObservabilityHostFeature (host_features)
 │       └── static/              # observability.js (sub-nav container: Navigator | Phoenix embed)
 │                                # + navigator.js (fleet drill-down over Phoenix GraphQL)
+│                                # + lifecycle.js (Stop/Hold/Resume receipt read-model, #118)
 └── tests/
     ├── test_observability_feature.py   # emitter
     ├── test_tracing.py                 # KestrelTracer
+    ├── test_turn_outcome_listener.py   # core turn outcomes end the turn root (#118)
+    ├── test_lifecycle_render_model.py  # Stop/Hold/Resume render rules, both views (#118)
     └── test_feature.py                 # fleet HostFeature (UI contribution)
 ```
 
@@ -73,4 +76,12 @@ uv run pytest
   kestrel-sovereign#2459).
 - User-message content is never recorded on any span; keep the hook observational, non-blocking, and
   a no-op when no OTLP endpoint is configured (exceptions swallowed).
+- Turn outcomes come from core (#118): `ObservabilityFeature.initialize()` registers the hook's
+  `on_turn_outcome` through the duck-typed `agent.add_turn_outcome_listener` (and `shutdown()` removes
+  it). While registered, a turn with a canonical `kestrel.turn_id` is closed by that listener — on every
+  exit, stamping `kestrel.turn.outcome` on its summary — not by the SDK `Stop` hook.
+- Lifecycle rendering (#118) lives in `fleet/static/lifecycle.js`, shared by Timeline and Navigator:
+  the Stop/Hold receipts are the only authority for stopped/held/resumed, spans are matched to them, and
+  the render model must stay a pure function of (spans, receipts, latches). Receipt reason/actor are
+  never copied into spans, view state, URLs or logs; unknown `schema_version`s render as unrecognized.
 - Prometheus metrics use the SDK's shared registry when the optional metrics extra is installed

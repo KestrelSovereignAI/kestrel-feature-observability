@@ -808,6 +808,31 @@ function ensureStyles() {
                                border-color:var(--color-accent,#818cf8); }
     .obs-content { flex:1; min-height:0; overflow:hidden; }
     .obs-detail { display:flex; flex-direction:column; gap:2px; }
+    .obs-lifecycle { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
+    .obs-lifecycle__head { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+    .obs-lifecycle__title { font-weight:700; font-size:12px; }
+    .obs-lifecycle__sub { margin-top:4px; color:var(--color-text-muted,#94a3b8); font-size:10px;
+                          font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+    .obs-lifecycle__note { color:var(--color-text-muted,#94a3b8); font-size:11px; }
+    .obs-lifecycle__receipt { display:flex; flex-direction:column; gap:2px; padding:6px 8px;
+                              border:1px solid var(--color-border,#334155); border-radius:6px; }
+    .obs-lifecycle__outcomes { margin:0; padding-left:18px; font-size:12px; }
+    .obs-lifecycle__pill, .obs-lifecycle__marker { flex:none; font-size:10px; font-weight:700;
+                          border-radius:999px; padding:0 7px; line-height:16px;
+                          color:var(--color-text-muted,#94a3b8);
+                          background:color-mix(in srgb, currentColor 15%, transparent); }
+    .obs-lifecycle__marker { color:#a855f7; }
+    .obs-lifecycle__pill--stopped, .obs-lifecycle__pill--pending { color:#a855f7; }
+    .obs-lifecycle__pill--pending { border:1px dashed #a855f7; }
+    .obs-lifecycle__pill--ok, .obs-lifecycle__pill--resume { color:var(--color-success,#34d399); }
+    .obs-lifecycle__pill--error { color:var(--color-danger,#f87171); }
+    .obs-lifecycle__pill--disconnected { color:#fb923c; }
+    .obs-lifecycle__pill--interrupted { color:#a8a29e; }
+    .obs-lifecycle__pill--unreachable { color:#e879f9; }
+    .obs-lifecycle__pill--refused { color:#fda4af; }
+    .obs-lifecycle__pill--hold { color:#60a5fa; }
+    .obs-lifecycle__pill--already_complete, .obs-lifecycle__pill--unrecognized { color:#9ca3af; }
+    .obs-lifecycle__notice { font-size:11px; font-weight:600; color:#f59e0b; }
     .obs-detail__row { display:flex; gap:9px; padding:1px 0; font-size:12px; }
     .obs-detail__key { flex:none; width:88px; padding-top:2px;
                        color:var(--color-text-muted,#94a3b8); text-transform:uppercase;

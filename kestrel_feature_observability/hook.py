@@ -56,6 +56,18 @@ no held-open spans; every span exports immediately — #42, #55):
   ``kestrel.denied_count`` / ``kestrel.incomplete_count`` dimensions (a refused
   tool is not an agent error, so it never moves the success ratio). The session is
   NOT popped — it stays stable across turns.
+- How the turn ENDED is core's answer, not the hook's (#118). The SDK ``Stop``
+  hook means "finished responding" and is skipped on the strict-audit cancel
+  paths, so a turn that was stopped, disconnected or failed used to sit open
+  until the Timeline's abandoned cap. When the host exposes
+  ``add_turn_outcome_listener`` (kestrel-sovereign#3159), the feature registers
+  :meth:`ObservabilityHook.on_turn_outcome` at initialization; for a turn with
+  a canonical ``kestrel.turn_id`` the ``Stop`` hook then leaves the turn open
+  and the listener — called once per turn on EVERY exit — closes it, stamping
+  the core-computed ``kestrel.turn.outcome`` (``completed`` / ``failed`` /
+  ``stopped`` / ``disconnected`` / ``interrupted``) on its ``turn <n> summary``.
+  The outcome is the only lifecycle fact a span carries: a Stop receipt's
+  reason and actor are never copied onto any span.
 - A turn interrupted before its ``Stop`` is reconciled at the next
   ``UserPromptSubmit`` (or session close): its still-pending tools become
   ``incomplete`` spans in **their own** (stamped) turn context and that turn gets
@@ -175,6 +187,12 @@ TOOL_OUTCOME_INCOMPLETE = "incomplete"
 KESTREL_DENIED_COUNT = "kestrel.denied_count"
 KESTREL_INCOMPLETE_COUNT = "kestrel.incomplete_count"
 KESTREL_IDLE_COUNT = "kestrel.idle_count"
+
+# How a turn ended, as core computed it once for every span of the turn
+# (kestrel-sovereign#3159 R4) and delivered through the turn-outcome listener.
+# Stamped on the ``turn <n> summary``; the Timeline/Navigator join it to the
+# durable Stop receipts, which stay the only authority for WHY (#118).
+KESTREL_TURN_OUTCOME = "kestrel.turn.outcome"
 
 # Bound on the per-session tombstones for calls reconciliation already
 # terminalized (#84). Each reconciled tool leaves one entry so a LATE
@@ -509,6 +527,11 @@ class ObservabilityHook(Hook):
         # session-marker root (for its SpanContext) plus running totals — no
         # held-open span anywhere, so nothing can arrive orphaned (#42).
         self._sessions: Dict[Optional[str], _SessionState] = {}
+        # The listener this hook registered with the host's turn-outcome seam
+        # (``subscribe_turn_outcomes``), kept so shutdown can remove exactly it.
+        # While registered, a turn with a canonical address is closed by core's
+        # outcome rather than by the SDK ``Stop`` hook (#118).
+        self._outcome_listener: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Identity / lineage
@@ -1189,8 +1212,13 @@ class ObservabilityHook(Hook):
         agent_name: str,
         turn: Optional[_TurnState] = None,
         end_ns: Optional[int] = None,
+        outcome: Optional[str] = None,
     ) -> None:
         """Emit a ``turn <n> summary`` span (parented to the turn root) with per-turn totals.
+
+        ``outcome`` is core's ``kestrel.turn.outcome`` for the turn, when the
+        turn was closed by the host's outcome listener; a turn closed any other
+        way (older host, retroactive reconciliation) carries none.
 
         Defaults to the live turn ending now; reconciliation passes a stranded
         (interrupted) turn explicitly with an ``end_ns`` bounded to the last
@@ -1221,6 +1249,8 @@ class ObservabilityHook(Hook):
             # with existing dashboards / the #62 renderer; drop in a future major.
             "kestrel.turn_duration_ms": duration_ms,
         }
+        if outcome is not None:
+            extra[KESTREL_TURN_OUTCOME] = outcome
         # Session + turn ids on the summary too (every span of the turn carries them).
         attributes = self._turn_attrs(session_id, turn)
 
@@ -1238,7 +1268,12 @@ class ObservabilityHook(Hook):
             attributes=attributes,
         )
 
-    def _close_turn(self, session_id: Optional[str], agent_name: str) -> None:
+    def _close_turn(
+        self,
+        session_id: Optional[str],
+        agent_name: str,
+        outcome: Optional[str] = None,
+    ) -> None:
         """End the turn: reconcile leftovers FIRST, then emit its summary.
 
         Reconciliation runs before the summary so the turn's
@@ -1256,7 +1291,9 @@ class ObservabilityHook(Hook):
             return
         try:
             self._reconcile_pending(session, session_id, agent_name)
-            self._emit_turn_summary(session, session_id, agent_name)
+            self._emit_turn_summary(
+                session, session_id, agent_name, outcome=outcome
+            )
         except Exception as e:  # noqa: BLE001 - never fatal
             logger.debug(
                 "ObservabilityHook turn summary emit failed (non-fatal): %s", e
@@ -1327,6 +1364,74 @@ class ObservabilityHook(Hook):
             logger.debug(
                 "ObservabilityHook summary emit failed (non-fatal): %s", e
             )
+
+    # ------------------------------------------------------------------
+    # Core turn outcomes (kestrel-sovereign#3159 → #118)
+    # ------------------------------------------------------------------
+
+    def subscribe_turn_outcomes(self) -> bool:
+        """Register :meth:`on_turn_outcome` with the host's outcome seam.
+
+        Found duck-typed like ``get_current_turn_id``: the feature never imports
+        core. Returns whether the host offered the seam; without it the SDK
+        ``Stop`` hook keeps closing turns exactly as before.
+        """
+
+        adder = getattr(self.agent, "add_turn_outcome_listener", None)
+        if not callable(adder):
+            return False
+        listener = self.on_turn_outcome
+        adder(listener)
+        self._outcome_listener = listener
+        return True
+
+    def unsubscribe_turn_outcomes(self) -> None:
+        """Remove the listener :meth:`subscribe_turn_outcomes` registered."""
+
+        listener = self._outcome_listener
+        if listener is None:
+            return
+        self._outcome_listener = None
+        remover = getattr(self.agent, "remove_turn_outcome_listener", None)
+        if callable(remover):
+            remover(listener)
+
+    def _awaits_core_outcome(self, session_id: Optional[str]) -> bool:
+        """Whether this session's live turn will be closed by core's outcome.
+
+        Core publishes an outcome only for a turn whose lifecycle minted a
+        canonical address, so a turn without one is still closed by ``Stop``.
+        """
+
+        if self._outcome_listener is None:
+            return False
+        session = self._sessions.get(session_id)
+        turn = session.current_turn if session is not None else None
+        return turn is not None and turn.turn_id is not None
+
+    def on_turn_outcome(self, turn_id: Any, outcome: Any) -> None:
+        """End the feature-owned turn with the outcome core computed.
+
+        Called synchronously by the host exactly once per addressed turn, on
+        EVERY exit — including the strict-audit cancel paths that skip the SDK
+        ``Stop`` hook — so the turn is reconciled and summarized with the same
+        ``kestrel.turn.outcome`` core stamped on its own turn span. ``outcome``
+        is a ``str`` enum; its value is the wire string. A turn this hook never
+        opened, or already closed, is a no-op. Never raises into the turn.
+        """
+
+        try:
+            value = getattr(outcome, "value", outcome)
+            if not isinstance(turn_id, str) or not isinstance(value, str):
+                return
+            agent_name = getattr(self.agent, "agent_name", "unknown")
+            for session_id, session in list(self._sessions.items()):
+                turn = session.current_turn
+                if turn is not None and turn.turn_id == turn_id:
+                    self._close_turn(session_id, agent_name, outcome=value)
+                    return
+        except Exception as e:  # noqa: BLE001 - telemetry must not fail a turn
+            logger.debug("ObservabilityHook turn outcome failed (non-fatal): %s", e)
 
     def close(self) -> None:
         """Emit a summary for every open session — defensive teardown."""
@@ -1408,8 +1513,11 @@ class ObservabilityHook(Hook):
                     )
                 elif event_type == "Stop":
                     # End the turn (reconcile leftovers, then the turn summary) —
-                    # but keep the session live.
-                    self._close_turn(session_id, agent_name)
+                    # but keep the session live. "Finished responding" is not
+                    # how the turn ENDED: when core will deliver that outcome
+                    # (``on_turn_outcome``), the turn is left for it to close.
+                    if not self._awaits_core_outcome(session_id):
+                        self._close_turn(session_id, agent_name)
                 elif event_type == "AgentTerminate":
                     # End the session (true session summary aggregating turns).
                     self._close_session(session_id, agent_name)
