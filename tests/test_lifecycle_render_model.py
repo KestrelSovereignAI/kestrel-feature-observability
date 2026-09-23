@@ -1099,6 +1099,7 @@ globalThis.__requestHost = async (path) => {
 // more Turns than one page really is read a page at a time.
 let spans = [];
 const summaryReads = [];
+let summariesFail = false;
 const project = { id: "p1", name: "kestrel-fleet", traceCount: 1, endTime: new Date(NOW).toISOString() };
 function paged(list, variables) {
   const sorted = [...list].sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime) || (a.id < b.id ? -1 : 1));
@@ -1126,6 +1127,7 @@ globalThis.fetch = async (_url, options) => {
     const f = variables.filter || "";
     const summaries = summariesByParent(spans, f);
     if (summaries) {
+      if (summariesFail) return { status: 500, ok: false, json: async () => ({ errors: [{ message: "summary read failed" }] }) };
       summaryReads.push((f.match(/'[0-9a-f]+'/g) || []).length);
       data = paged(summaries, variables);
     } else if (variables.rootOnly) data = paged(spans.filter((s) => !s.parentId), variables);
@@ -1239,6 +1241,29 @@ function clickRow(container, label, caret) {
   out.releaseAfter = { inspector: inspector.innerHTML, notices: nc.querySelector("[data-lifecycle-notices]").innerHTML };
   nav.destroy();
 }
+
+// ── 5. Navigator: a failed outcome read costs the outcomes, not the Turns ──
+{
+  receiptsRefused = false;
+  holdState.agents = [];
+  spans = [];
+  for (let n = 1; n <= 3; n++) {
+    spans.push(...turnSpans("Claw", DID_CLAW, n, NOW - 20 * MIN + n * MIN, n === 1 ? "stopped" : "completed"));
+  }
+  summariesFail = true;
+  const nc = new FakeElement("div");
+  const nav = mountNavigator(nc, {
+    revealTarget: { projectId: "p1", projectName: "kestrel-fleet", agentName: "Claw", sessionId: "sess-claw", traceId: "trace-Claw-2", spanId: rootId("Claw", 2) },
+  });
+  const turnRow = (n) => navRows(nc).find((c) => c.includes(`>Claw turn ${n}<`)) || null;
+  await waitFor(() => turnRow(1) && turnRow(3), "a failed outcome read hid the loaded Turns");
+  out.outcomeReadFailed = { turn1: turnRow(1), turn3: turnRow(3), tree: nc.querySelector("[data-spacer]").innerHTML };
+  summariesFail = false;
+  nc.querySelector("[data-refresh]").dispatch("click");
+  await waitFor(() => (turnRow(1) || "").includes('data-lifecycle-state="stopped"'), "the outcome read was never retried");
+  out.outcomeReadRetried = { turn1: turnRow(1), tree: nc.querySelector("[data-spacer]").innerHTML };
+  nav.destroy();
+}
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -1277,3 +1302,11 @@ def test_lifecycle_survives_phoenix_down_and_deep_paging(tmp_path):
     assert "did:key:idle" not in out["releaseAfter"]["inspector"]
     assert "Select a Turn or Event" in out["releaseAfter"]["inspector"]
     assert "unavailable" in out["releaseAfter"]["notices"]
+
+    # 5. The Turns a session loaded stay listed when the outcome read fails, and
+    # the unread outcomes are asked for again on the next load.
+    assert out["outcomeReadFailed"]["turn1"] is not None
+    assert out["outcomeReadFailed"]["turn3"] is not None
+    assert "turn outcomes unavailable" in out["outcomeReadFailed"]["tree"]
+    assert 'data-lifecycle-state="stopped"' in out["outcomeReadRetried"]["turn1"]
+    assert "turn outcomes unavailable" not in out["outcomeReadRetried"]["tree"]

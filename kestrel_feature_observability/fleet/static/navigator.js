@@ -316,7 +316,12 @@ export function mount(container, opts = {}) {
           break; // event children are pre-loaded
       }
       node.loaded = true;
-      if (mode !== "refresh") node.error = null;
+      // A level that loaded but could not read everything (`node.partial`)
+      // shows why; a refresh that reads it all clears only that partial error,
+      // never a refresh-era failure it did not produce.
+      const partial = node.partial || null;
+      if (mode !== "refresh" || partial || node.errorIsPartial) node.error = partial;
+      node.errorIsPartial = Boolean(partial);
     } catch (e) {
       if (mode !== "refresh") node.error = (e && e.message) || "query failed";
     } finally {
@@ -554,7 +559,16 @@ export function mount(container, opts = {}) {
     for (const span of spans) {
       if (span && !node.turns.has(span.id)) node.turns.set(span.id, span);
     }
-    await loadTurnOutcomes(node);
+    // The outcomes decorate Turns this load already fetched, so a failed read
+    // must not cost the Turns themselves: the level still loads, and the
+    // failure is reported as a partial load on its error row. Whatever the read
+    // missed stays unread, so the next load (a Refresh included) asks again.
+    let outcomeError = null;
+    try {
+      await loadTurnOutcomes(node);
+    } catch (err) {
+      outcomeError = err;
+    }
     const ordered = [...node.turns.values()].sort(
       (a, b) => (ts(a.startTime) || 0) - (ts(b.startTime) || 0),
     );
@@ -582,6 +596,9 @@ export function mount(container, opts = {}) {
     const first = ordered.length ? ts(ordered[0].startTime) : null;
     const last = ordered.length ? ts(ordered[ordered.length - 1].endTime) : null;
     node.meta = `${plural(ordered.length, "turn")}${last ?? first ? ` · ${relTime(last ?? first)}` : ""}`;
+    node.partial = outcomeError
+      ? `turn outcomes unavailable: ${(outcomeError && outcomeError.message) || "query failed"}`
+      : null;
   }
 
   // The turn summaries of every loaded root still without one: trace id →
