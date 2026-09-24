@@ -14,8 +14,9 @@
 //     session identity, the span-filter DSL builders, formatting).
 //
 // Pure and DOM-free — safe to import under node for the read-model tests. The
-// only host coupling is the console API client (embed-session mint); everything
-// else is plain fetch against the same-origin proxy.
+// only host coupling is the console API client (embed-session mint, host-root
+// reads, the cooperative Stop door); everything else is plain fetch against the
+// same-origin proxy.
 
 import API from "/js/api.js";
 
@@ -65,6 +66,9 @@ export const ATTR_INCOMPLETE_COUNT = "kestrel.incomplete_count";
 export const ATTR_IDLE_COUNT = "kestrel.idle_count";
 export const ATTR_REPO = "kestrel.repo";
 export const ATTR_AGENT_DID = "kestrel.agent_did";
+// Core's own spans (`agent.process_input[_streaming]`) name the same stable DID
+// under this key; both spellings are one identity.
+export const ATTR_CORE_AGENT_DID = "agent.did";
 // How a turn ENDED, computed once by core (kestrel-sovereign#3159) and stamped
 // on its turn span and the feature's `turn <n> summary`. The Stop receipts stay
 // the authority for "stopped"; this is only what the span itself reports (#118).
@@ -92,6 +96,25 @@ export async function mintPhoenixSession() {
 // the console's auth, CSRF and 401 handling apply exactly as for the mint.
 export function requestHost(path, options) {
   return API.requestHost(path, options || {});
+}
+
+// The canonical cooperative Stop door (kestrel-sovereign#3158) — the same one
+// the console's agent-card Stop calls. `API.requestForAgent` routes it to
+// `agentName`'s host-agent prefix; the body's `expected_agent_id` is what makes
+// routing by name safe (the host answers 409 `agent_identity_changed` when the
+// routed agent is not that DID). See ./stop_actions.js.
+export const AGENT_STOP_PATH = "/api/agent/stop";
+
+export function requestAgentStop(agentName, body) {
+  return API.requestForAgent(
+    AGENT_STOP_PATH,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    agentName,
+  );
 }
 
 // `opts.signal` is an optional AbortSignal: a view torn down mid-flight (a
@@ -560,7 +583,7 @@ export function mergeSpansIntoAgg(agg, spans) {
     // The stable DIDs behind a display name — what a Hold latch or a Stop
     // receipt names the agent by (#118). Both producer spellings, as the
     // Timeline reads them.
-    const did = getAttr(attrs, ATTR_AGENT_DID) ?? getAttr(attrs, "agent.did");
+    const did = getAttr(attrs, ATTR_AGENT_DID) ?? getAttr(attrs, ATTR_CORE_AGENT_DID);
     if (did != null && did !== "") {
       const entry = agg.agents.get(agentKey);
       if (!entry.dids) entry.dids = new Set();

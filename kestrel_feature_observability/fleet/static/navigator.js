@@ -58,6 +58,11 @@
 // a tenant-level "Stop · Hold · Resume" group holds the host latch, every held
 // or stopped agent (spans or not), and receipts that name no agent or carry an
 // unrecognized schema.
+//
+// Cooperative Stop (#115, ./stop_actions.js): the inspector of a Turn carries
+// its Stop and a Select toggle, Turn rows carry a selection checkbox, and the
+// selection action bar above the tree stops exactly the selected turns. The
+// target is the turn span's own canonical address, never the tree around it.
 // Styles are console-native (dark/light aware) — kestrel chrome, not Phoenix's.
 
 import {
@@ -93,6 +98,8 @@ import {
   ATTR_TURN_ID,
   parentIdFilter,
   phoenixDownNoticeHtml,
+  spanRoleOf,
+  ROLE_TURN_ROOT,
 } from "./phoenix.js";
 import {
   createLifecycleFeed,
@@ -109,6 +116,16 @@ import {
   holderStateLabel,
   AGENT_NOT_RECORDED,
 } from "./lifecycle.js";
+import {
+  createStopController,
+  isTurnSpan,
+  stopTargetOf,
+  stopAvailability,
+  renderTurnStopHtml,
+  renderStopBarHtml,
+  handleTurnStopClick,
+  handleStopBarClick,
+} from "./stop_actions.js";
 
 // Keep the pure read-model exports available from navigator.js for callers
 // that predate phoenix.js becoming the shared source of truth.
@@ -213,6 +230,18 @@ export function mount(container, opts = {}) {
   });
   let lifecycleIdx = lifecycleIndex(lifecycle.store);
   let heldDids = new Set();
+  // Cooperative Stop (#115): the selection and every request's reply. A reply
+  // never restates a turn — once a Stop settles, the turns and receipts are
+  // re-read at once, and the turn's state comes from them.
+  const stopper = createStopController({
+    onChange() {
+      if (destroyed) return;
+      renderStopBar();
+      renderInspector();
+      scheduleRebuild();
+    },
+    onSettled: refreshNow,
+  });
   let liveFollow = false; // off by default — noise-free
   let pollTimer = null;
   let polling = false;
@@ -264,6 +293,7 @@ export function mount(container, opts = {}) {
         <button type="button" class="obs-nav__btn" data-refresh title="Refresh now">Refresh</button>
       </div>
       <div class="obs-nav__notices" data-lifecycle-notices></div>
+      <div class="obs-nav__stopbar" data-stop-bar></div>
       <div class="obs-nav__phoenix" data-phoenix-notice></div>
       <div class="obs-nav__body" data-body>
         <div class="obs-nav__treepane">
@@ -284,6 +314,7 @@ export function mount(container, opts = {}) {
   const inspectorEl = container.querySelector("[data-inspector]");
   const noticesEl = container.querySelector("[data-lifecycle-notices]");
   const phoenixNoticeEl = container.querySelector("[data-phoenix-notice]");
+  const stopBarEl = container.querySelector("[data-stop-bar]");
 
   // ── Level loaders — one paginated GraphQL query per expand ──
 
@@ -868,6 +899,72 @@ export function mount(container, opts = {}) {
     node.meta = `${plural(spans.length ? spans.length - (rootSpanId && bySpanId.has(rootSpanId) ? 1 : 0) : 0, "event")} · ${fmtDuration(node.data.span && node.data.span.latencyMs)}`;
   }
 
+  // ── Cooperative Stop (#115) ──
+
+  // Every span this tree calls a turn gets a Stop control: a Turn row, and an
+  // Event that is a turn's own span (core's `agent.process_input`).
+  function stopEligible(node) {
+    return Boolean(
+      node &&
+        node.data &&
+        node.data.span &&
+        (node.kind === "turn" || (node.kind === "event" && isTurnSpan(node.data.span))),
+    );
+  }
+
+  function sessionOf(node) {
+    let cur = node;
+    while (cur && cur.kind !== "session") cur = cur.parent;
+    return cur;
+  }
+
+  // Has this turn NOT ended yet? Only the feature's turn root reaches Phoenix at
+  // the turn's START (an instant marker); any other span is exported once it has
+  // ended. A turn root is closed by its `turn <n> summary` (read for every loaded
+  // Turn) or — as on the Timeline — by a later turn in its session.
+  function turnOpen(node) {
+    const span = node.data.span;
+    if (spanRoleOf(span) !== ROLE_TURN_ROOT) return false;
+    if (node.data.summaryEndMs != null) return false;
+    const session = sessionOf(node);
+    if (!session) return false;
+    const traceId = span.context && span.context.traceId;
+    if (traceId && session.outcomes && session.outcomes.has(traceId)) return false;
+    const start = ts(span.startTime);
+    return !session.children.some(
+      (c) =>
+        c !== node &&
+        c.kind === "turn" &&
+        spanRoleOf(c.data.span) === ROLE_TURN_ROOT &&
+        (ts(c.data.span.startTime) ?? -Infinity) > (start ?? Infinity),
+    );
+  }
+
+  function nodeStopAvailability(node, target) {
+    return stopAvailability(target, { open: turnOpen(node), lifecycle: node.data.lifecycle });
+  }
+
+  function stopCheckHtml(node) {
+    if (!stopEligible(node)) return "";
+    const target = stopTargetOf(node.data.span);
+    const selected = stopper.isSelected(target.key);
+    const availability = nodeStopAvailability(node, target);
+    const enabled = selected || availability.enabled;
+    const title = enabled ? "Select for Stop" : `Stop unavailable: ${availability.reason}`;
+    return `<button type="button" class="obs-nav__check" data-stop-check role="checkbox" aria-checked="${selected}" aria-label="Select ${escapeHtml(node.label)} for Stop" title="${escapeHtml(title)}"${enabled ? "" : " disabled"}>${selected ? "☑" : "☐"}</button>`;
+  }
+
+  function toggleStopSelection(node) {
+    const target = stopTargetOf(node.data.span);
+    if (stopper.isSelected(target.key)) stopper.deselect(target.key);
+    else if (nodeStopAvailability(node, target).enabled) stopper.select(target);
+  }
+
+  function renderStopBar() {
+    if (stopBarEl) stopBarEl.innerHTML = renderStopBarHtml(stopper);
+  }
+  if (stopBarEl) stopBarEl.addEventListener("click", (e) => handleStopBarClick(stopper, e));
+
   // ── Virtualized rows ──
   //
   // The whole tree flattens into one row list with per-row offsets; only the
@@ -979,7 +1076,7 @@ export function mount(container, opts = {}) {
         : "";
     return `<div class="obs-nav__row obs-nav__row--node${focused ? " obs-nav__row--focused" : ""}${selected ? " obs-nav__row--selected" : ""}" data-i="${i}" role="treeitem" aria-selected="${selected}" aria-expanded="${node.expandable ? String(node.expanded) : "false"}" style="top:${row.top}px;height:${row.h}px">
       <span class="obs-nav__indent" style="width:${node.depth * 16}px"></span>
-      ${caret}${pill}
+      ${caret}${stopCheckHtml(node)}${pill}
       <span class="obs-nav__label" title="${escapeHtml(node.label)}">${escapeHtml(node.label)}</span>
       ${statusPill}${bar}
       <span class="obs-nav__meta">${escapeHtml(node.meta || "")}</span>
@@ -1127,11 +1224,17 @@ export function mount(container, opts = {}) {
         <span class="obs-nav__inspector-title" title="${escapeHtml(detail.name)}">${escapeHtml(detail.displayName)}</span>
       </div>
       ${fallback}
-      <div class="obs-nav__inspector-body">${renderTurnLifecycleHtml(selectedNode.data.lifecycle)}${renderSpanDetail(detail)}</div>
+      <div class="obs-nav__inspector-body">${inspectorStopHtml(selectedNode)}${renderTurnLifecycleHtml(selectedNode.data.lifecycle)}${renderSpanDetail(detail)}</div>
       <div class="obs-nav__inspector-actions">
         ${canPhx ? `<button type="button" class="obs-nav__action" data-inspector-phoenix>Open in Phoenix</button>` : ""}
         ${canTimeline ? `<button type="button" class="obs-nav__action" data-inspector-timeline>Show in Timeline</button>` : ""}
       </div>`;
+  }
+
+  function inspectorStopHtml(node) {
+    if (!stopEligible(node)) return "";
+    const target = stopTargetOf(node.data.span);
+    return renderTurnStopHtml(stopper, target, nodeStopAvailability(node, target));
   }
 
   function selectSpanNode(node, fallbackMessage = null) {
@@ -1171,6 +1274,12 @@ export function mount(container, opts = {}) {
 
   if (inspectorEl) {
     inspectorEl.addEventListener("click", (e) => {
+      // A Stop control click acts on the inspected turn as the model has it NOW.
+      if (stopEligible(selectedNode)) {
+        const target = stopTargetOf(selectedNode.data.span);
+        const availability = nodeStopAvailability(selectedNode, target);
+        if (handleTurnStopClick(stopper, e, target, availability)) return;
+      }
       const detail = detailForNode(selectedNode);
       if (!detail) return;
       if (e.target.closest("[data-inspector-phoenix]")) {
@@ -1186,6 +1295,10 @@ export function mount(container, opts = {}) {
     if (!rowEl) return;
     const row = rows[Number(rowEl.dataset.i)];
     if (!row) return;
+    if (row.t === "node" && stopEligible(row.node) && e.target.closest("[data-stop-check]")) {
+      toggleStopSelection(row.node);
+      return;
+    }
     if (e.target.closest("[data-open]")) {
       e.preventDefault();
       openTraceFor(row.node);
@@ -1323,6 +1436,24 @@ export function mount(container, opts = {}) {
     } finally {
       polling = false;
     }
+    if (stopRefreshOwed && !destroyed) {
+      stopRefreshOwed = false;
+      pollTick(true);
+    }
+  }
+
+  // Re-read the loaded levels and the receipts now: a Stop just settled, and
+  // the turn's state must come from what they say, not from the reply (#115).
+  // A poll already in flight may have read before the Stop landed, so it owes
+  // one more.
+  let stopRefreshOwed = false;
+  function refreshNow() {
+    if (destroyed) return;
+    if (polling) {
+      stopRefreshOwed = true;
+      return;
+    }
+    pollTick(true);
   }
 
   function setLive(on) {
@@ -1488,6 +1619,7 @@ export function mount(container, opts = {}) {
   function teardown() {
     destroyed = true;
     lifecycle.destroy();
+    stopper.destroy();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -1556,6 +1688,11 @@ function ensureStyles() {
     .obs-nav__notices { display:flex; flex-wrap:wrap; gap:4px 12px; padding:3px 12px;
                         border-bottom:1px solid var(--color-border,#334155); }
     .obs-nav__notices:empty { display:none; }
+    .obs-nav__stopbar { flex:none; border-bottom:1px solid var(--color-border,#334155); }
+    .obs-nav__stopbar:empty { display:none; }
+    .obs-nav__check { flex:none; background:transparent; border:0; padding:0; width:16px;
+                      color:#f472b6; cursor:pointer; font-size:13px; line-height:1; }
+    .obs-nav__check:disabled { color:var(--color-text-muted,#94a3b8); opacity:.45; cursor:default; }
     .obs-nav__grow { flex:1; }
     .obs-nav__btn { background:transparent; color:var(--color-text-muted,#94a3b8);
                     border:1px solid var(--color-border,#334155); border-radius:999px;

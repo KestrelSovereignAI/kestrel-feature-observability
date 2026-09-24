@@ -290,6 +290,45 @@ same receipt correlation:
 - **Unknown data.** A `schema_version` this build does not know renders as
   "unrecognized receipt" and never reclassifies a turn.
 
+## Stopping turns from the fleet views
+
+The Timeline popover and the Navigator inspector carry a visible **Stop turn**
+for the turn they show, and a **Select for Stop** toggle. Navigator Turn rows
+also have a selection checkbox, and a selection action bar above each view
+stops several turns at once (#115, `fleet/static/stop_actions.js`, shared by
+both views):
+
+- **Target.** The turn's canonical address is the `kestrel.turn_id` stamped on
+  the turn's own span: the feature's turn root, or core's
+  `agent.process_input[_streaming]`. Nothing else is used: never a span id,
+  `kestrel.orchestrator` or the tree around the span. A turn with no
+  `kestrel.turn_id`, no `did:` agent DID (`kestrel.agent_did`, else
+  `agent.did`), or no `kestrel.agent_name` gets no Stop. Its control is shown
+  disabled, with the reason.
+- **One door.** `API.requestForAgent('/api/agent/stop', POST {turn_id,
+  expected_agent_id, correlation_id}, agentName)`, the same door the agent
+  card's Stop uses. `expected_agent_id` is the span's DID, so a 409
+  `agent_identity_changed` (the routed agent is not that DID) reads "agent
+  identity changed; not stopped". No authority is decided in the browser.
+- **Retries.** A `correlation_id` is minted once per (gesture, target) and
+  reused on every retry of that target, so the host replays its receipt.
+- **Live turns only.** Stop is enabled while the turn is still open, has no
+  `kestrel.turn.outcome` and has no exact `stopped` receipt. An ended turn shows
+  Stop disabled with its lifecycle still visible. `already_complete` is shown
+  as that, never as a failure.
+- **Selection.** Selected turns are keyed by (agent DID, `turn_id`). The
+  selection survives redraws and polls that reorder turns; on the Timeline,
+  selected turns are outlined. The bar shows the count and asks for
+  confirmation with that count. It then sends exactly the selected targets, one
+  request each, at most four at a time. Each target keeps its own outcome row
+  (`stopped`, `already complete`, `refused`, `unreachable`, identity changed,
+  or an HTTP error). Failed and unreachable rows can be retried. A single Stop
+  from the popover or inspector needs no confirmation.
+- **No optimistic state.** A reply is shown as the reply to the request
+  ("Stop request: stopped"), never as the turn's state. Once a Stop settles,
+  both views re-read spans and receipts at once, and the turn's state comes
+  from them, by the rules above.
+
 ## Claude Code hook emitter
 
 The same package ships a **`kestrel-obs-claude-hook`** console script so that

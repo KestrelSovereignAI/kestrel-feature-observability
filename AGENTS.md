@@ -19,11 +19,13 @@ kestrel-feature-observability/
 │       └── static/              # observability.js (sub-nav container: Navigator | Phoenix embed)
 │                                # + navigator.js (fleet drill-down over Phoenix GraphQL)
 │                                # + lifecycle.js (Stop/Hold/Resume receipt read-model, #118)
+│                                # + stop_actions.js (cooperative Stop actions + selection bar, #115)
 └── tests/
     ├── test_observability_feature.py   # emitter
     ├── test_tracing.py                 # KestrelTracer
     ├── test_turn_outcome_listener.py   # core turn outcomes end the turn root (#118)
     ├── test_lifecycle_render_model.py  # Stop/Hold/Resume render rules, both views (#118)
+    ├── test_stop_actions.py            # Stop door, correlation, selection, both views (#115)
     └── test_feature.py                 # fleet HostFeature (UI contribution)
 ```
 
@@ -88,4 +90,12 @@ uv run pytest
   receipts and latches; `feed_seq` is opaque (paging passes `next_cursor` back verbatim, dedupe is by `receipt_id` — never
   parse or compare it as a number); and the render model must stay a pure function of (spans, receipts, latches). Receipt reason/actor are
   never copied into spans, view state, URLs or logs; unknown `schema_version`s render as unrecognized.
+- Stop actions (#115) live in `fleet/static/stop_actions.js`, shared by the Timeline popover, the Navigator
+  inspector/row checkbox and the selection bar. The target is the turn span's OWN `kestrel.turn_id` + `did:` DID
+  (`kestrel.agent_did`, else `agent.did`) + `kestrel.agent_name`. Never use a span id, `kestrel.orchestrator` or
+  display ancestry, and a missing piece means a disabled control with the reason. There is one door,
+  `requestAgentStop` in `phoenix.js` (`API.requestForAgent('/api/agent/stop')` with `expected_agent_id`). A
+  `correlation_id` is minted per (gesture, target) and reused on retry. Selection is keyed by (DID, `turn_id`).
+  A reply never repaints a turn: after a Stop settles the view re-reads spans and receipts. Every harness that
+  copies static modules must copy `stop_actions.js` too.
 - Prometheus metrics use the SDK's shared registry when the optional metrics extra is installed

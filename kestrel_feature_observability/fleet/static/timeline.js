@@ -48,7 +48,9 @@
 // (#109). The Stop/Hold/Resume receipts ride the same poll (./lifecycle.js):
 // a stopped turn paints in the stopped hue, each agent's home lane carries a
 // lifecycle track of Hold bands and receipt marks, and a held agent with no
-// spans gets its own lane (#118). Phoenix down
+// spans gets its own lane (#118). A turn's popover carries its cooperative Stop
+// and a Select toggle; selected turns are outlined on the canvas and gathered in
+// the selection action bar (./stop_actions.js, #115). Phoenix down
 // → the same friendly notice as the
 // Navigator / embed sub-views. Canvas rendering keeps it smooth with thousands
 // of in-window spans.
@@ -68,6 +70,7 @@ import {
   ATTR_FEATURE_NAME,
   ATTR_ORCHESTRATOR,
   ATTR_AGENT_DID,
+  ATTR_CORE_AGENT_DID,
   OUTCOME_COMPLETED,
   OUTCOME_IDLE,
   mintPhoenixSession,
@@ -107,6 +110,16 @@ import {
   holderStateLabel,
   AGENT_NOT_RECORDED,
 } from "./lifecycle.js";
+import {
+  createStopController,
+  isTurnSpan,
+  stopTargetOf,
+  stopAvailability,
+  renderTurnStopHtml,
+  renderStopBarHtml,
+  handleTurnStopClick,
+  handleStopBarClick,
+} from "./stop_actions.js";
 
 // ── Tuning ────────────────────────────────────────────────────
 const POLL_MS = 5_000; // live-follow poll cadence
@@ -155,6 +168,7 @@ const DENSITY_COLOR = "#94a3b8";
 const SESSION_BAND_COLOR = "#64748b"; // translucent outermost session envelope
 const OPEN_EDGE_COLOR = "#22d3ee"; // live/provisional bar right-edge cap
 const HIGHLIGHT_COLOR = "#facc15"; // exact cross-view reveal
+const SELECTED_COLOR = "#f472b6"; // a turn selected for Stop (#115)
 const ABANDONED_FILL = "#475569"; // SIGKILL'd/never-completed run — muted slate
 const ABANDONED_HATCH = "#94a3b8"; // diagonal hatch over the muted fill
 const ABANDONED_STUB_PX = 24; // childless abandoned marker → fixed stub width (paint-time)
@@ -1625,6 +1639,18 @@ export function mount(container, opts = {}) {
       requestDraw();
     },
   });
+  // Cooperative Stop (#115): the selection and every request's reply. A reply
+  // never repaints a turn — once a Stop settles, spans and receipts are re-read
+  // at once, and the turn's state comes from them.
+  const stopper = createStopController({
+    onChange() {
+      if (destroyed) return;
+      renderStopBar();
+      refreshPopover();
+      requestDraw();
+    },
+    onSettled: refreshNow,
+  });
   // Phoenix could not be reached at boot: the host-served lifecycle still
   // renders (a held agent must never vanish with the span store), and the
   // span walks stay off until a Retry remounts the view.
@@ -1679,6 +1705,7 @@ export function mount(container, opts = {}) {
         <button type="button" class="obs-tl__btn" data-refresh title="Poll now">Refresh</button>
       </div>
       <div class="obs-tl__notices" data-lifecycle-notices></div>
+      <div class="obs-tl__stopbar" data-stop-bar></div>
       <div class="obs-tl__phoenix" data-phoenix-notice></div>
       <div class="obs-tl__body" data-body>
         <canvas class="obs-tl__canvas" data-canvas></canvas>
@@ -1697,6 +1724,7 @@ export function mount(container, opts = {}) {
   const windowEl = container.querySelector("[data-window]");
   const noticesEl = container.querySelector("[data-lifecycle-notices]");
   const phoenixNoticeEl = container.querySelector("[data-phoenix-notice]");
+  const stopBarEl = container.querySelector("[data-stop-bar]");
   const ctx = canvas.getContext("2d");
 
   let cssW = 0;
@@ -1751,7 +1779,7 @@ export function mount(container, opts = {}) {
     // as ``agent.did``. Treat both producer shapes as one identity; otherwise
     // duplicate display names split host spans into a spurious third lane.
     const agentDidRaw =
-      getAttr(attrs, ATTR_AGENT_DID) ?? getAttr(attrs, "agent.did");
+      getAttr(attrs, ATTR_AGENT_DID) ?? getAttr(attrs, ATTR_CORE_AGENT_DID);
     const agent =
       agentRaw != null && agentRaw !== "" ? baseAgentName(agentRaw) : UNKNOWN_AGENT;
     const sess = sessionKeyOf(attrs);
@@ -2504,6 +2532,23 @@ export function mount(container, opts = {}) {
       // the obligation was armed (#108).
       settleAncestorResolve();
     }
+    if (stopRefreshOwed && !destroyed) {
+      stopRefreshOwed = false;
+      pollTick(true);
+    }
+  }
+
+  // Re-read spans and receipts now: a Stop just settled, and the turn's state
+  // must come from what they say, not from the reply (#115). A tick already in
+  // flight may have read before the Stop landed, so it owes one more.
+  let stopRefreshOwed = false;
+  function refreshNow() {
+    if (destroyed) return;
+    if (polling) {
+      stopRefreshOwed = true;
+      return;
+    }
+    pollTick(true);
   }
 
   // Is the ingestion settled — nothing owed, nothing in flight?
@@ -3110,6 +3155,18 @@ export function mount(container, opts = {}) {
     ctx.restore();
   }
 
+  // A turn selected for Stop keeps its outline across every redraw and poll: the
+  // selection is keyed by (agent DID, turn_id), never by position (#115).
+  function drawSelectedRect(x, y, w, h, span) {
+    if (!stopper.selectionSize() || !isTurnSpan(span)) return;
+    if (!stopper.isSelected(stopTargetOf(span).key)) return;
+    ctx.save();
+    ctx.strokeStyle = SELECTED_COLOR;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x - 1, y - 1, Math.max(6, w + 2), h + 2);
+    ctx.restore();
+  }
+
   function drawLane(row, y) {
     // Lane label (left gutter).
     // Anything below the top level (a worker sub-lane, an orchestrator-nested
@@ -3417,6 +3474,7 @@ export function mount(container, opts = {}) {
           ctx.fillStyle =
             lifecycleColor(s) || (s.status === "error" ? ERROR_COLOR : kindColor(s.kind));
           ctx.fillRect(cx, ry, 2, bh);
+          drawSelectedRect(cx - 2, ry, 6, bh, s);
           drawHighlightRect(cx - 2, ry, 6, bh, s);
           drawn.push({ x: cx - 2, y: ry, w: 6, h: bh, span: s });
           continue;
@@ -3441,6 +3499,7 @@ export function mount(container, opts = {}) {
           ctx.fillRect(cx + w - 2, ry, 2, bh);
           ctx.globalAlpha = 1;
         }
+        drawSelectedRect(cx, ry, w, bh, s);
         drawHighlightRect(cx, ry, w, bh, s);
         // Label the block when it's wide enough to read — an informative band
         // label ("turn 16 · 12 tools · 3m 40s") when folded from a summary, else
@@ -3705,7 +3764,19 @@ export function mount(container, opts = {}) {
       <div class="obs-tl__pbody"${bodyAttr}>${bodyHtml}</div>${footHtml}`;
   }
 
-  // A span's popover: its lifecycle, then the shared detail contract.
+  // A turn's cooperative Stop, from the current model (#115): its own span names
+  // the target, and "live" is the render model's own answer — the turn band
+  // still open, no outcome reported, no exact Stop landed.
+  function spanStopAvailability(s) {
+    return stopAvailability(stopTargetOf(s), { open: s.rOpen === true, lifecycle: s.rLifecycle });
+  }
+
+  function spanStopHtml(s) {
+    return isTurnSpan(s) ? renderTurnStopHtml(stopper, stopTargetOf(s), spanStopAvailability(s)) : "";
+  }
+
+  // A span's popover: its Stop control (turns only), its lifecycle, then the
+  // shared detail contract.
   function spanPopoverContent(s) {
     const detail = spanDetail(s);
     const canNav = Boolean(
@@ -3726,7 +3797,7 @@ export function mount(container, opts = {}) {
     return {
       html: popoverShell(
         detail.displayName,
-        `${renderTurnLifecycleHtml(s.rLifecycle)}${renderSpanDetail(detail, { rawAttributes: false })}`,
+        `${spanStopHtml(s)}${renderTurnLifecycleHtml(s.rLifecycle)}${renderSpanDetail(detail, { rawAttributes: false })}`,
         { footHtml: foot, fullTitle: detail.name },
       ),
       // The links act on the span as it is when clicked, not as it was painted.
@@ -3854,6 +3925,20 @@ export function mount(container, opts = {}) {
     popEl.hidden = true;
     popEl.innerHTML = "";
   }
+
+  // A Stop control click acts on the span the popover shows NOW, re-read from
+  // the model — never on what was painted.
+  popEl.addEventListener("click", (e) => {
+    if (!popoverItem || popoverItem.kind !== "span") return;
+    const s = spans.get(popoverItem.id);
+    if (!s || !isTurnSpan(s)) return;
+    handleTurnStopClick(stopper, e, stopTargetOf(s), spanStopAvailability(s));
+  });
+
+  function renderStopBar() {
+    if (stopBarEl) stopBarEl.innerHTML = renderStopBarHtml(stopper);
+  }
+  if (stopBarEl) stopBarEl.addEventListener("click", (e) => handleStopBarClick(stopper, e));
 
   function laneLifecycleHtml(lc) {
     const holder = lc.holder;
@@ -4219,6 +4304,7 @@ export function mount(container, opts = {}) {
   function teardown() {
     destroyed = true;
     lifecycle.destroy();
+    stopper.destroy();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -4262,6 +4348,8 @@ function ensureStyles() {
     .obs-tl__notices { display:flex; flex-wrap:wrap; gap:4px 12px; padding:3px 12px;
                        border-bottom:1px solid var(--color-border,#334155); }
     .obs-tl__notices:empty { display:none; }
+    .obs-tl__stopbar { flex:none; border-bottom:1px solid var(--color-border,#334155); }
+    .obs-tl__stopbar:empty { display:none; }
     .obs-tl__grow { flex:1; }
     .obs-tl__window { min-width:52px; text-align:center; font-size:12px; font-variant-numeric:tabular-nums;
                       color:var(--color-text-muted,#94a3b8); }
