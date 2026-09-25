@@ -59,10 +59,10 @@ def _navigator_module(tmp_path: pathlib.Path) -> pathlib.Path:
     )
     assert "const API" in phoenix, "phoenix.js API import stub failed"
     (pkg / "phoenix.js").write_text(phoenix, encoding="utf-8")
-    # The lifecycle read-model (#118) imports only ./phoenix.js — ships verbatim.
-    (pkg / "lifecycle.js").write_text(
-        (STATIC / "lifecycle.js").read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    # The lifecycle read-model (#118) and the Stop actions (#115) import only
+    # ./phoenix.js — they ship verbatim.
+    for name in ("lifecycle.js", "stop_actions.js"):
+        (pkg / name).write_text((STATIC / name).read_text(encoding="utf-8"), encoding="utf-8")
     module = pkg / "navigator.js"
     module.write_text(_navigator_source(), encoding="utf-8")
     return module

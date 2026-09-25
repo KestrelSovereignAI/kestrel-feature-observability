@@ -832,6 +832,32 @@ function ensureStyles() {
     .obs-lifecycle__pill--hold { color:#60a5fa; }
     .obs-lifecycle__pill--already_complete, .obs-lifecycle__pill--unrecognized { color:#9ca3af; }
     .obs-lifecycle__notice { font-size:11px; font-weight:600; color:#f59e0b; }
+    .obs-stop { display:flex; flex-direction:column; gap:5px; margin-bottom:8px; }
+    .obs-stop__actions { display:flex; flex-wrap:wrap; gap:6px; }
+    .obs-stop__btn { background:transparent; border:1px solid var(--color-border,#334155);
+                     border-radius:999px; color:var(--color-text,#e2e8f0); cursor:pointer;
+                     font-size:11px; font-weight:600; padding:2px 10px; }
+    .obs-stop__btn:hover:not(:disabled) { background:var(--color-surface,#1e293b); }
+    .obs-stop__btn:disabled { opacity:.45; cursor:default; }
+    .obs-stop__btn--stop { color:var(--color-danger,#f87171); }
+    .obs-stop__btn[aria-pressed="true"] { color:#f472b6; border-color:#f472b6; }
+    .obs-stop__btn--icon { padding:0 6px; }
+    .obs-stop__reason { color:var(--color-text-muted,#94a3b8); font-size:11px; }
+    .obs-stop__result { display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:11px; }
+    .obs-stop__result--stopped { color:#a855f7; }
+    .obs-stop__result--complete, .obs-stop__result--pending { color:var(--color-text-muted,#94a3b8); }
+    .obs-stop__result--refused { color:#fda4af; }
+    .obs-stop__result--unreachable { color:#e879f9; }
+    .obs-stop__result--error { color:var(--color-danger,#f87171); }
+    .obs-stop__target { font-weight:700; }
+    .obs-stop__agent { color:var(--color-text-muted,#94a3b8); }
+    .obs-stopbar { display:flex; flex-direction:column; gap:4px; padding:5px 12px; font-size:12px; }
+    .obs-stopbar__row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+    .obs-stopbar__count { font-weight:700; }
+    .obs-stopbar__confirm { font-weight:600; color:#f59e0b; }
+    .obs-stopbar__list { display:flex; flex-wrap:wrap; gap:4px 12px; margin:0; padding:0; list-style:none; }
+    .obs-stopbar__item { display:flex; align-items:center; gap:5px; }
+    .obs-stopbar__results { display:flex; flex-direction:column; gap:3px; }
     .obs-detail__row { display:flex; gap:9px; padding:1px 0; font-size:12px; }
     .obs-detail__key { flex:none; width:88px; padding-top:2px;
                        color:var(--color-text-muted,#94a3b8); text-transform:uppercase;

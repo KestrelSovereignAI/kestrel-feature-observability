@@ -28,10 +28,11 @@ def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     )
     assert "const API" in phoenix
     (pkg / "phoenix.js").write_text(phoenix, encoding="utf-8")
-    (pkg / "lifecycle.js").write_text(
-        (STATIC / "lifecycle.js").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
+    for name in ("lifecycle.js", "stop_actions.js"):
+        (pkg / name).write_text(
+            (STATIC / name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     (pkg / "navigator.js").write_text(
         (STATIC / "navigator.js").read_text(encoding="utf-8"),
         encoding="utf-8",

@@ -48,7 +48,9 @@ def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     """The shipped modules, with the console API client routed to a host double.
 
     ``globalThis.__requestHost(path, options)`` answers every host-root request
-    (the Phoenix embed mint and the three lifecycle reads).
+    (the Phoenix embed mint and the three lifecycle reads), and
+    ``globalThis.__requestForAgent(path, options, agent)`` the agent-routed
+    cooperative Stop door (#115).
     """
     pkg = tmp_path / "lifecycle"
     pkg.mkdir()
@@ -56,11 +58,14 @@ def _module_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     phoenix = (STATIC / "phoenix.js").read_text(encoding="utf-8")
     routed = phoenix.replace(
         'import API from "/js/api.js";',
-        "const API = { requestHost: (path, options) => globalThis.__requestHost(path, options) };",
+        "const API = {"
+        " requestHost: (path, options) => globalThis.__requestHost(path, options),"
+        " requestForAgent: (path, options, agent) => globalThis.__requestForAgent(path, options, agent),"
+        " };",
     )
     assert "globalThis.__requestHost" in routed
     (pkg / "phoenix.js").write_text(routed, encoding="utf-8")
-    for name in ("lifecycle.js", "timeline.js", "navigator.js"):
+    for name in ("lifecycle.js", "stop_actions.js", "timeline.js", "navigator.js"):
         (pkg / name).write_text((STATIC / name).read_text(encoding="utf-8"), encoding="utf-8")
     _write_fake_dom(pkg)
     (pkg / "fixture.mjs").write_text(_FIXTURE, encoding="utf-8")
