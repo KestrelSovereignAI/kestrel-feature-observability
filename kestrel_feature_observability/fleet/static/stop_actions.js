@@ -241,7 +241,9 @@ export function createStopController({
   }
 
   // One gesture's attempt for one target — and with it, the correlation id
-  // every retry of that target reuses.
+  // every retry of that target reuses. It is reserved (`inFlight`) from the
+  // moment it exists, including while it waits for a lane in a batch, so no
+  // second gesture can send the same target under another correlation id.
   function newAttempt(target) {
     const attempt = {
       key: target.key,
@@ -250,10 +252,19 @@ export function createStopController({
       status: "pending",
       detail: null,
       receiptIds: [],
-      inFlight: false,
+      inFlight: true,
     };
     attempts.set(target.key, attempt);
     return attempt;
+  }
+
+  // The attempt a gesture uses for a target: the one already reserved for it
+  // (queued or in flight) when there is one, else a fresh one. `fresh` says
+  // whether this gesture must send it.
+  function attemptFor(target) {
+    const current = attempts.get(target.key);
+    if (current && current.inFlight) return { attempt: current, fresh: false };
+    return { attempt: newAttempt(target), fresh: true };
   }
 
   async function send(attempt) {
@@ -303,17 +314,20 @@ export function createStopController({
   // The confirmed multi-Stop: exactly the targets selected at confirm time.
   function confirmSelected() {
     if (!confirming || !selection.size) return null;
-    const list = [...selection.values()].map(newAttempt);
+    // A target already queued or in flight joins the batch's results under its
+    // existing attempt, and is not sent a second time.
+    const chosen = [...selection.values()].map(attemptFor);
     confirming = false;
     selection.clear();
-    batch = list;
-    return run(list);
+    batch = chosen.map((c) => c.attempt);
+    return run(chosen.filter((c) => c.fresh).map((c) => c.attempt));
   }
 
   // Re-send a failed or unreachable attempt under its own correlation id.
   function retry(key) {
     const attempt = attempts.get(key);
     if (!attempt || attempt.inFlight || !STOP_RESULTS[attempt.status].retryable) return null;
+    attempt.inFlight = true;
     return run([attempt]);
   }
 

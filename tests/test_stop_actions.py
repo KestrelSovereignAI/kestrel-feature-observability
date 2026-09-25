@@ -168,6 +168,28 @@ await new Promise((r) => setTimeout(r, 30));
 out.barRetry = { calls: doorCalls.splice(0).map((c) => [c.agent, c.body.correlation_id]), cidC, status: ctl.attempt(target("C", "t-C").key).status };
 out.identityRetryNoop = ctl.retry(target("D", "t-D").key) === null;
 out.completeRetryNoop = ctl.retry(target("B", "t-B").key) === null;
+// Rule 5: a target already queued or in flight is never sent twice — a new
+// gesture joins the reserved attempt instead of minting a second correlation id.
+const ok = (r) => [{ success: true, stop_outcomes: [outcome("stopped", r)] }];
+globalThis.__stopReplies = { F: ok("rf"), G: ok("rg"), H: ok("rh"), I: ok("ri") };
+const ctl2 = createStopController({ concurrency: 1, mintId: () => `dup-${++n}` });
+const inFlight = ctl2.stopOne(target("F", "t-F"));
+ctl2.select(target("F", "t-F"));
+ctl2.select(target("G", "t-G"));
+ctl2.askConfirm();
+const joined = ctl2.confirmSelected();
+await Promise.all([inFlight, joined]);
+out.dupInFlight = {
+  calls: doorCalls.splice(0).map((c) => [c.agent, c.body.correlation_id]),
+  batch: ctl2.batch().map((a) => [a.target.turnId, a.correlationId, a.status]),
+};
+ctl2.select(target("H", "t-H"));
+ctl2.select(target("I", "t-I"));
+ctl2.askConfirm();
+const queuedRun = ctl2.confirmSelected();
+out.dupQueuedRefused = ctl2.stopOne(target("I", "t-I")) === null;
+await queuedRun;
+out.dupQueuedCalls = doorCalls.splice(0).map((c) => c.agent).sort();
 // The control shows the reason and the reply, escaped.
 out.controlDisabled = renderTurnStopHtml(ctl, target("B", "t-B"), { enabled: false, reason: "turn has ended (<b>completed</b>)" });
 process.stdout.write(JSON.stringify(out));
@@ -238,6 +260,14 @@ def test_stop_target_door_correlation_and_multi_select(tmp_path):
     assert [c["body"]["correlation_id"] for c in out["retry"]["calls"]] == ["cid-1"]
     assert out["retry"]["attempt"]["status"] == "stopped"
     assert out["retryStoppedIsNoop"] is True
+    # A target already in flight joins a batch under its reserved attempt; a
+    # target still queued in a batch refuses a second single Stop.
+    dup = out["dupInFlight"]
+    assert sorted(dup["calls"]) == [["F", dup["batch"][0][1]], ["G", dup["batch"][1][1]]]
+    assert [row[0] for row in dup["batch"]] == ["t-F", "t-G"]
+    assert all(row[2] == "stopped" for row in dup["batch"])
+    assert out["dupQueuedRefused"] is True
+    assert out["dupQueuedCalls"] == ["H", "I"]
     assert out["newGesture"] == ["cid-2"]
 
     # Rule 5: exactly the selected targets, once each, after the confirm step.
